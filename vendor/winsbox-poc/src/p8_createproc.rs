@@ -21,11 +21,14 @@ pub fn run() -> Result<ProbeOutcome> {
     write_remote_bytes(proc, nt_cup, &patch).context("patch NtCreateUserProcess")?;
 
     target.resume();
-    let code = match target.wait_timeout(20_000)? {
-        Some(c) => c,
-        None => { target.terminate(); return Ok(ProbeOutcome::fail("p8-parent hung")); }
+    let mut n: u64 = 0;
+    let code = loop {
+        match target.wait_timeout(100)? {
+            Some(c) => break c,
+            None => { if let Ok(v) = read_remote::<u64>(proc, counter) { n = v; } }
+        }
     };
-    let n: u64 = read_remote::<u64>(proc, counter).unwrap_or(0);
+    if let Ok(v) = read_remote::<u64>(proc, counter) { n = n.max(v); }
 
     if code != 0 {
         return Ok(ProbeOutcome::fail(format!(
@@ -42,6 +45,8 @@ pub fn run() -> Result<ProbeOutcome> {
 pub fn child_parent(_args: &[String]) -> Result<i32> {
     let gc = spawn_plain(&self_exe(), &["child", "p8-grandchild"], false)?;
     let _ = gc.wait()?;
+    // Linger so the broker can sample the counter before our VAS goes.
+    std::thread::sleep(std::time::Duration::from_millis(1500));
     Ok(0)
 }
 

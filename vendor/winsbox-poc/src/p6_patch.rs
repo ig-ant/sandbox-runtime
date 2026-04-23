@@ -46,7 +46,7 @@ pub fn build_count_stub(counter: usize, full_orig: &[u8]) -> Vec<u8> {
 }
 
 pub fn run() -> Result<ProbeOutcome> {
-    let target = spawn_plain(&self_exe(), &["child", "p5-target"], true)
+    let target = spawn_plain(&self_exe(), &["child", "p5-target", "linger"], true)
         .context("spawn suspended target")?;
     let proc = target.pi.hProcess;
 
@@ -61,11 +61,19 @@ pub fn run() -> Result<ProbeOutcome> {
     write_remote_bytes(proc, nt_createfile, &patch).context("patch NtCreateFile")?;
     target.resume();
 
-    let code = match target.wait_timeout(15_000)? {
-        Some(c) => c,
-        None => { target.terminate(); return Ok(ProbeOutcome::fail("target hung after patch")); }
+    // Sample the counter while the child is alive — once it exits the VAS
+    // is torn down and ReadProcessMemory fails.
+    let mut counter: u64 = 0;
+    let code = loop {
+        match target.wait_timeout(100)? {
+            Some(c) => break c,
+            None => {
+                if let Ok(v) = read_remote::<u64>(proc, counter_addr) { counter = v; }
+                if counter > 0 { /* keep sampling until exit */ }
+            }
+        }
     };
-    let counter: u64 = read_remote::<u64>(proc, counter_addr).unwrap_or(0);
+    if let Ok(v) = read_remote::<u64>(proc, counter_addr) { counter = counter.max(v); }
 
     if code != 0 {
         return Ok(ProbeOutcome::fail(format!(

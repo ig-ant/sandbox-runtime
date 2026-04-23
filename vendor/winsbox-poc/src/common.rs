@@ -358,12 +358,19 @@ pub fn make_lockdown_token(base: HANDLE) -> Result<HANDLE> {
                 deny.push(SID_AND_ATTRIBUTES { Sid: g.Sid, Attributes: 0 });
             }
         }
-        // Privileges to delete: everything except SeChangeNotifyPrivilege.
-        let keep_luid = {
-            let mut l = LUID::default();
-            LookupPrivilegeValueW(None, PCWSTR(wstr("SeChangeNotifyPrivilege").as_ptr()), &mut l)?;
-            l
-        };
+        // Privileges to delete: everything except SeChangeNotifyPrivilege
+        // (bypass-traverse) and — for the PoC — SeImpersonatePrivilege so the
+        // child's main thread can actually USE the impersonation token at
+        // SecurityImpersonation level (Chromium drops this later via
+        // LowerToken; the PoC just needs the loader to survive).
+        let keep: Vec<LUID> = ["SeChangeNotifyPrivilege", "SeImpersonatePrivilege"]
+            .iter()
+            .filter_map(|n| {
+                let mut l = LUID::default();
+                LookupPrivilegeValueW(None, PCWSTR(wstr(n).as_ptr()), &mut l).ok()?;
+                Some(l)
+            })
+            .collect();
         let mut plen = 0u32;
         let _ = GetTokenInformation(base, TokenPrivileges, None, 0, &mut plen);
         let mut pbuf = vec![0u8; plen as usize];
@@ -372,7 +379,8 @@ pub fn make_lockdown_token(base: HANDLE) -> Result<HANDLE> {
         let parr = std::slice::from_raw_parts(privs.Privileges.as_ptr(), privs.PrivilegeCount as usize);
         let mut to_delete: Vec<LUID_AND_ATTRIBUTES> = Vec::new();
         for p in parr {
-            if !(p.Luid.LowPart == keep_luid.LowPart && p.Luid.HighPart == keep_luid.HighPart) {
+            let kept = keep.iter().any(|k| k.LowPart == p.Luid.LowPart && k.HighPart == p.Luid.HighPart);
+            if !kept {
                 to_delete.push(LUID_AND_ATTRIBUTES { Luid: p.Luid, Attributes: Default::default() });
             }
         }

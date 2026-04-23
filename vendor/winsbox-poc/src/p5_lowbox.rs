@@ -56,6 +56,7 @@ fn launch_with(primary: HANDLE, initial: HANDLE) -> Result<u32> {
 
 pub fn run() -> Result<ProbeOutcome> {
     let _ = enable_privilege("SeAssignPrimaryTokenPrivilege");
+    let _ = enable_privilege("SeImpersonatePrivilege");
     let base = open_process_token_all()?;
     let lockdown = make_lockdown_token(base).context("make_lockdown_token")?;
     let initial  = make_initial_impersonation(base).context("make_initial_impersonation")?;
@@ -105,8 +106,14 @@ pub fn run() -> Result<ProbeOutcome> {
     })
 }
 
-pub fn child_target(_args: &[String]) -> Result<i32> {
+pub fn child_target(args: &[String]) -> Result<i32> {
     let imp = thread_is_impersonating();
     eprintln!("p5-target: impersonating={imp}");
+    // Touch a file so NtCreateFile definitely fires for P6, then linger so
+    // the broker can read the in-process counter before our VAS is gone.
+    let _ = std::fs::metadata(self_exe());
+    if args.first().map(|s| s.as_str()) == Some("linger") {
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+    }
     Ok(0)
 }
