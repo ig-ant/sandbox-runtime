@@ -1,9 +1,52 @@
 # winsbox-poc
 
-Throwaway probes that empirically validate the OS-behaviour assumptions
-behind the Windows sandbox design before any of it is built. Each probe
-answers one binary question; `cargo run -- all` runs the lot and writes
-`RESULTS.md`.
+## What this is
+
+`sandbox-runtime` confines arbitrary commands by shelling out to a
+platform-native sandbox CLI: `sandbox-exec` (seatbelt) on macOS and
+`bwrap` + a seccomp helper on Linux. Windows has no equivalent CLI, so
+the proposed design ships a Rust broker (`sbox-exec.exe`) that fills
+the same slot using the Chromium sandbox primitives — AppContainer,
+restricted tokens, Job objects, integrity levels, ntdll interception —
+in two phases:
+
+- **Phase 1**: AppContainer + Job + Low IL + alternate desktop +
+  mitigation policies. Filesystem allow/deny via temporary ACL grants
+  to the AppContainer SID; network blocked by AppContainer (no
+  `internetClient` capability) with an AF_UNIX bridge to the existing
+  HTTP/SOCKS proxy. Roughly macOS-equivalent guarantees.
+- **Phase 2**: Chromium-style lockdown — `CreateRestrictedToken`
+  (deny-only groups, NULL restricting SID, Untrusted IL) wrapped in a
+  LowBox token, with the broker inline-hooking `ntdll!Nt{Create,Open}File`
+  / `NtCreateUserProcess` in the suspended target so file access and
+  child-process creation are policy-checked over IPC and handles are
+  duplicated back. The token is the security boundary; the hooks are
+  for compatibility.
+
+This crate is the de-risking spike for that design: nine standalone
+probes that empirically test the OS-behaviour assumptions each phase
+depends on, *before* any of it is built. Each probe answers one binary
+question; `cargo run -- all` runs the lot and writes `RESULTS.md`.
+
+## How the proposed Windows design maps to the existing platforms
+
+| Guarantee | macOS (`sandbox-exec`) | Linux (`bwrap` + seccomp) | Windows Phase 1 | Windows Phase 2 | Validated by |
+|---|---|---|---|---|---|
+| Filesystem write allow-list | Seatbelt `(allow file-write* (subpath …))` | `--ro-bind /` + `--bind <allow>` | ACL grant `(OI)(CI)M` to AppContainer SID on each `allowWrite` path | Broker policy engine: open-then-`GetFinalPathNameByHandleW`-then-verify, `DuplicateHandle` on allow | P3, P9 |
+| Filesystem read deny-list | Seatbelt `(deny file-read* …)` | `--ro-bind /dev/null <deny>` over the path | Explicit deny ACE for AC SID | Broker policy engine (same path check, deny → `STATUS_ACCESS_DENIED`) | P3, P9 |
+| Confused-deputy (symlink/junction/hardlink) defence | Seatbelt resolves paths kernel-side; `isSymlinkOutsideBoundary` pre-check | bind-mounts pin inodes; `isSymlinkOutsideBoundary` pre-check | Kernel ACL check is on the resolved object | `GetFinalPathNameByHandleW` re-check + `nNumberOfLinks`/`FindFirstFileNameW` fan-in check + dir handles never get `FILE_ADD_FILE` | P9 |
+| Network default-deny | Seatbelt `(deny network*)` | `bwrap --unshare-net` | AppContainer with empty capability list | LowBox token with empty capability list | P1 |
+| Allowed-domain egress via SRT proxy | Seatbelt allows `localhost:<proxy>`; `HTTP_PROXY` env | `socat` Unix-socket bridge into the netns; `HTTP_PROXY` env | AF_UNIX bridge between AC child and broker, TCP relay inside the AC; `HTTP_PROXY` env | Same bridge (AppContainer layer is kept for network) | P1, P2 |
+| Loopback to other host services blocked | Seatbelt `network-outbound` rules | netns isolates loopback entirely | AppContainer blocks cross-IL loopback; bridge exposes only the proxy socket (no `LoopbackExempt`) | Same | P1, P2 |
+| Child processes inherit the boundary | Seatbelt is per-process-tree | Mount/PID/net namespaces are inherited | AppContainer + Job inherited by `CreateProcess` | Restricted token + Job inherited; broker hooks `NtCreateUserProcess` to re-apply ntdll patches to grandchildren | P4, P8 |
+| Kill whole tree on broker exit | Caller's process group | `bwrap --die-with-parent` | `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` | Same | — |
+| Privilege floor of confined code | Seatbelt profile | unprivileged userns + seccomp `EPERM` | Low IL + Job UI restrictions + mitigation policies | Untrusted IL + deny-only SIDs + NULL restricting SID + no privileges | P5 |
+| Bootstrap (let the target's runtime initialise before lockdown bites) | n/a — seatbelt rules apply from `exec` | n/a — bind mounts apply from `exec` | n/a — AC + ACLs apply from `CreateProcess` | Two-token: lockdown primary + restricted-same-access impersonation on the main thread for loader init, reverted by a thread-context trampoline before `main()` | P5, P7 |
+| Runtime DLL / `LoadLibrary` after lockdown | n/a | n/a | AC can read anything ACL'd `ALL APPLICATION PACKAGES` | `NtCreateFile` hook → broker opens + `DuplicateHandle` back; `\KnownDlls` section objects load regardless | P6 |
+| Admin / setuid required | No | No (unprivileged userns) | No | No | — |
+| External runtime deps | none (`sandbox-exec` is in base OS) | `bwrap`, `socat` | none (Rust static binary; `AF_UNIX` is in-box ≥ Win10 1803) | none | — |
+
+## Probes
 
 | Probe | Question |
 |---|---|
@@ -16,6 +59,9 @@ answers one binary question; `cargo run -- all` runs the lot and writes
 | P7 | Can a thread-context-redirect stub revert impersonation after the loader APC but before `main()`? |
 | P8 | Does the P6 hook on `NtCreateUserProcess` fire when the target spawns a child? |
 | P9 | Does `GetFinalPathNameByHandleW` *not* canonicalize hardlinks, and can `nNumberOfLinks`+`FindFirstFileNameW` detect the fan-in? |
+
+P1–P4 gate Phase 1; P5–P8 gate Phase 2; P9 gates the broker's
+confused-deputy defence in Phase 2.
 
 A `FAIL` verdict is data, not a CI failure — it triggers the documented
 pivot for that probe. Only an `ERROR` (probe crashed) returns non-zero.
