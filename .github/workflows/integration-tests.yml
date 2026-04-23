@@ -90,7 +90,16 @@ jobs:
 
       - name: Build sbox-exec (Windows)
         if: matrix.os == 'windows'
-        run: bun vendor/winsbox/build.ts
+        # Don't go through bun: on windows-11-arm bun runs under x64
+        # emulation, so process.arch lies. RUNNER_ARCH is authoritative.
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cargo build --release --manifest-path vendor/winsbox-src/Cargo.toml
+          arch=$([ "$RUNNER_ARCH" = "ARM64" ] && echo arm64 || echo x64)
+          mkdir -p "vendor/winsbox/$arch"
+          cp vendor/winsbox-src/target/release/sbox-exec.exe "vendor/winsbox/$arch/"
+          echo "SBOX_EXEC_PATH=$PWD/vendor/winsbox/$arch/sbox-exec.exe" >> "$GITHUB_ENV"
 
       - name: Build project
         run: npm run build
