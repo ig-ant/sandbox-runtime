@@ -129,7 +129,9 @@ export async function runSandboxed(
 export async function withHostListener<T>(
   fn: (port: number) => Promise<T>,
 ): Promise<T> {
-  const srv = net.createServer(s => s.end('LEAK'))
+  const srv = net.createServer(s =>
+    s.end('HTTP/1.0 200 OK\r\nContent-Length: 4\r\n\r\nLEAK'),
+  )
   await new Promise<void>(r => srv.listen(0, '127.0.0.1', r))
   const port = (srv.address() as net.AddressInfo).port
   try {
