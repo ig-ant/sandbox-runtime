@@ -99,7 +99,9 @@ jobs:
           arch=$([ "$RUNNER_ARCH" = "ARM64" ] && echo arm64 || echo x64)
           mkdir -p "vendor/winsbox/$arch"
           cp vendor/winsbox-src/target/release/sbox-exec.exe "vendor/winsbox/$arch/"
-          echo "SBOX_EXEC_PATH=$PWD/vendor/winsbox/$arch/sbox-exec.exe" >> "$GITHUB_ENV"
+          # Native Windows path so Node's fs.existsSync can find it.
+          winpath=$(cygpath -w "$PWD/vendor/winsbox/$arch/sbox-exec.exe")
+          echo "SBOX_EXEC_PATH=$winpath" >> "$GITHUB_ENV"
 
       - name: Build project
         run: npm run build
