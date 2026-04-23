@@ -335,10 +335,15 @@ pub fn enable_privilege(name: &str) -> Result<()> {
 }
 
 /// Build a Chromium-style lockdown primary token: every group deny-only
-/// except the Logon SID, restricting SID = NULL SID, all privileges removed.
+/// except the Logon SID, restricting SID = NULL SID, all privileges removed
+/// EXCEPT SeChangeNotifyPrivilege (bypass-traverse — without it the loader
+/// cannot even reach KnownDlls). The integrity level is set to Low here;
+/// Untrusted is applied post-launch (Chromium's "delayed IL").
 pub fn make_lockdown_token(base: HANDLE) -> Result<HANDLE> {
-    use windows::Win32::Security::{DISABLE_MAX_PRIVILEGE, AllocateAndInitializeSid};
-    use windows::Win32::Security::SID_IDENTIFIER_AUTHORITY;
+    use windows::Win32::Security::{
+        AllocateAndInitializeSid, TokenPrivileges, SID_IDENTIFIER_AUTHORITY,
+        CREATE_RESTRICTED_TOKEN_FLAGS,
+    };
     unsafe {
         // Enumerate groups; mark all non-logon as deny-only.
         let mut len = 0u32;
@@ -353,6 +358,24 @@ pub fn make_lockdown_token(base: HANDLE) -> Result<HANDLE> {
                 deny.push(SID_AND_ATTRIBUTES { Sid: g.Sid, Attributes: 0 });
             }
         }
+        // Privileges to delete: everything except SeChangeNotifyPrivilege.
+        let keep_luid = {
+            let mut l = LUID::default();
+            LookupPrivilegeValueW(None, PCWSTR(wstr("SeChangeNotifyPrivilege").as_ptr()), &mut l)?;
+            l
+        };
+        let mut plen = 0u32;
+        let _ = GetTokenInformation(base, TokenPrivileges, None, 0, &mut plen);
+        let mut pbuf = vec![0u8; plen as usize];
+        GetTokenInformation(base, TokenPrivileges, Some(pbuf.as_mut_ptr() as *mut c_void), plen, &mut plen)?;
+        let privs = &*(pbuf.as_ptr() as *const TOKEN_PRIVILEGES);
+        let parr = std::slice::from_raw_parts(privs.Privileges.as_ptr(), privs.PrivilegeCount as usize);
+        let mut to_delete: Vec<LUID_AND_ATTRIBUTES> = Vec::new();
+        for p in parr {
+            if !(p.Luid.LowPart == keep_luid.LowPart && p.Luid.HighPart == keep_luid.HighPart) {
+                to_delete.push(LUID_AND_ATTRIBUTES { Luid: p.Luid, Attributes: Default::default() });
+            }
+        }
         // Restricting SID = S-1-0-0 (NULL SID).
         let null_auth = SID_IDENTIFIER_AUTHORITY { Value: [0,0,0,0,0,0] };
         let mut null_sid = PSID::default();
@@ -362,16 +385,16 @@ pub fn make_lockdown_token(base: HANDLE) -> Result<HANDLE> {
         let mut out = HANDLE::default();
         CreateRestrictedToken(
             base,
-            DISABLE_MAX_PRIVILEGE,
+            CREATE_RESTRICTED_TOKEN_FLAGS(0),
             Some(&deny),
-            None,
+            if to_delete.is_empty() { None } else { Some(&to_delete) },
             Some(&restrict),
             &mut out,
         ).context("CreateRestrictedToken")?;
         let _ = FreeSid(null_sid);
 
-        // Untrusted integrity level: S-1-16-0
-        set_token_il(out, 0x0000)?;
+        // Low IL for launch; Untrusted is applied post-launch.
+        set_token_il(out, 0x1000)?;
         Ok(out)
     }
 }

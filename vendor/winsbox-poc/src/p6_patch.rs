@@ -8,54 +8,40 @@
 use crate::common::*;
 use anyhow::{Context, Result};
 
-#[cfg(target_arch = "x86_64")]
-pub const PROLOGUE_LEN: usize = 12;
-#[cfg(target_arch = "aarch64")]
-pub const PROLOGUE_LEN: usize = 16;
+/// ntdll syscall stubs are ~24 bytes on x64 and ~16 on arm64, self-
+/// contained (end in `ret`) and contain only PC-relative branches that
+/// stay inside the stub. Copying the whole thing means we never split an
+/// instruction and never need to jump back.
+pub const SYSCALL_STUB_LEN: usize = 32;
 
 #[cfg(target_arch = "x86_64")]
-fn build_stub(counter_addr: usize, orig_bytes: &[u8], cont_addr: usize) -> Vec<u8> {
-    // lock inc qword [counter]; <orig prologue>; mov r11, cont; jmp r11
-    let mut s = Vec::new();
-    s.extend_from_slice(&[0xF0, 0x48, 0xFF, 0x04, 0x25]);          // lock inc qword ptr [imm32]
-    // RIP-relative is awkward without knowing stub VA up front; instead use
-    // mov rax, imm64; lock inc qword ptr [rax]
-    s.clear();
+pub fn build_count_stub(counter: usize, full_orig: &[u8]) -> Vec<u8> {
+    let mut s = Vec::with_capacity(20 + full_orig.len());
     s.extend_from_slice(&[0x50]);                                   // push rax
-    s.extend_from_slice(&[0x48, 0xB8]); s.extend_from_slice(&counter_addr.to_le_bytes()); // mov rax, imm64
-    s.extend_from_slice(&[0xF0, 0x48, 0xFF, 0x00]);                 // lock inc qword ptr [rax]
+    s.extend_from_slice(&[0x48, 0xB8]); s.extend_from_slice(&counter.to_le_bytes()); // mov rax, imm64
+    s.extend_from_slice(&[0xF0, 0x48, 0xFF, 0x00]);                 // lock inc qword [rax]
     s.extend_from_slice(&[0x58]);                                   // pop rax
-    s.extend_from_slice(orig_bytes);                                // re-execute stolen prologue
-    s.extend_from_slice(&[0x49, 0xBB]); s.extend_from_slice(&cont_addr.to_le_bytes()); // mov r11, imm64
-    s.extend_from_slice(&[0x41, 0xFF, 0xE3]);                       // jmp r11
+    s.extend_from_slice(full_orig);                                 // entire original stub → syscall → ret
     s
 }
 
 #[cfg(target_arch = "aarch64")]
-fn build_stub(counter_addr: usize, orig_bytes: &[u8], cont_addr: usize) -> Vec<u8> {
-    // ldr x16,#counter_lit; ldaddal x17,x17,[x16] (overkill) — keep simple:
-    // we just store 1 to the counter; lossless count not required for the probe.
+pub fn build_count_stub(counter: usize, full_orig: &[u8]) -> Vec<u8> {
+    // x16/x17 are intra-procedure scratch; safe to clobber pre-call.
+    // ldr x16,#lit ; mov x17,#1 ; str x17,[x16] ; <orig stub incl. ret>
+    // ; .align 8 ; .quad counter
     let mut s = Vec::<u8>::new();
-    let emit = |s: &mut Vec<u8>, w: u32| s.extend_from_slice(&w.to_le_bytes());
-    // ldr x16, #lit_counter
-    let lit_off_counter = 7 * 4; // 7 insns ahead
-    emit(&mut s, 0x58000010 | (((lit_off_counter as u32) >> 2) << 5)); // ldr x16, #off
-    emit(&mut s, 0xD2800031);                                          // mov x17, #1
-    emit(&mut s, 0xF9000211);                                          // str x17, [x16]
-    // ldr x16, #lit_cont
-    let lit_off_cont = 5 * 4;
-    emit(&mut s, 0x58000010 | (((lit_off_cont as u32) >> 2) << 5));
-    // re-exec stolen prologue (4 insns) before branch — append below
-    // We'll branch first, so just place stolen bytes in a trampoline:
-    // Actually simplest: br x16 to a second region containing orig_bytes + br to cont.
-    // For PoC, we accept clobbering x16/x17 (callee-saved? x16/x17 are IP0/IP1, scratch).
-    // Append stolen prologue then br x16.
-    s.extend_from_slice(orig_bytes);
-    emit(&mut s, 0xD61F0200);                                          // br x16
-    // literal pool (must be 8-aligned; pad)
-    while s.len() % 8 != 0 { emit(&mut s, 0xD503201F); }               // nop
-    s.extend_from_slice(&counter_addr.to_le_bytes());
-    s.extend_from_slice(&cont_addr.to_le_bytes());
+    let e = |s: &mut Vec<u8>, w: u32| s.extend_from_slice(&w.to_le_bytes());
+    let body_insns: usize = 3;
+    let lit_off = (body_insns * 4 + full_orig.len()) as u32; // bytes from ldr to literal
+    let lit_off_padded = (lit_off + 7) & !7;
+    let imm19 = (lit_off_padded / 4) << 5;
+    e(&mut s, 0x58000010 | imm19);          // ldr x16, #lit_off_padded
+    e(&mut s, 0xD2800031);                  // mov x17, #1
+    e(&mut s, 0xF9000211);                  // str x17, [x16]
+    s.extend_from_slice(full_orig);         // entire original stub (ends in ret)
+    while (s.len() as u32) < lit_off_padded { e(&mut s, 0xD503201F); } // nop pad
+    s.extend_from_slice(&counter.to_le_bytes());
     s
 }
 
@@ -65,20 +51,13 @@ pub fn run() -> Result<ProbeOutcome> {
     let proc = target.pi.hProcess;
 
     let nt_createfile = ntdll_export("NtCreateFile")?;
-    let orig = read_remote_bytes(proc, nt_createfile, PROLOGUE_LEN)?;
-    let cont_addr = nt_createfile + PROLOGUE_LEN;
-
+    let orig = read_remote_bytes(proc, nt_createfile, SYSCALL_STUB_LEN)?;
     let counter_addr = alloc_remote_rw(proc, 16)?;
-    let stub = build_stub(counter_addr, &orig, cont_addr);
+    let stub = build_count_stub(counter_addr, &orig);
     let stub_addr = alloc_remote_rx(proc, &stub)?;
 
     let mut patch = enc_abs_jmp(stub_addr);
-    if patch.len() > PROLOGUE_LEN {
-        target.terminate();
-        return Ok(ProbeOutcome::fail(format!(
-            "jmp encoding {}B > prologue {}B", patch.len(), PROLOGUE_LEN)));
-    }
-    pad_nops(&mut patch, PROLOGUE_LEN);
+    pad_nops(&mut patch, ABS_JMP_LEN);
     write_remote_bytes(proc, nt_createfile, &patch).context("patch NtCreateFile")?;
     target.resume();
 
