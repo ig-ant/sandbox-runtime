@@ -407,17 +407,65 @@ pub fn make_lockdown_token(base: HANDLE) -> Result<HANDLE> {
     }
 }
 
-pub fn make_initial_impersonation(base: HANDLE) -> Result<HANDLE> {
+/// Build the *initial* impersonation token. It must be flagged restricted
+/// and at the same IL as the lockdown token, otherwise the kernel's
+/// SeTokenCanImpersonate check silently downgrades it to Identification
+/// when a restricted process tries to use it (→ STATUS_BAD_IMPERSONATION_
+/// LEVEL in the loader). Chromium's USER_RESTRICTED_SAME_ACCESS does this
+/// by putting every group SID + the user SID into the *restricting* list:
+/// the token then satisfies "is restricted" while granting the same
+/// effective access as the unrestricted base.
+pub fn make_initial_impersonation(base: HANDLE, lockdown_il_rid: u32) -> Result<HANDLE> {
+    use windows::Win32::Security::{TokenUser, TOKEN_USER, CREATE_RESTRICTED_TOKEN_FLAGS};
     unsafe {
+        // Restricting list = user SID + every group SID.
+        let mut ulen = 0u32;
+        let _ = GetTokenInformation(base, TokenUser, None, 0, &mut ulen);
+        let mut ubuf = vec![0u8; ulen as usize];
+        GetTokenInformation(base, TokenUser, Some(ubuf.as_mut_ptr() as *mut c_void), ulen, &mut ulen)?;
+        let user = &*(ubuf.as_ptr() as *const TOKEN_USER);
+
+        let mut glen = 0u32;
+        let _ = GetTokenInformation(base, TokenGroups, None, 0, &mut glen);
+        let mut gbuf = vec![0u8; glen as usize];
+        GetTokenInformation(base, TokenGroups, Some(gbuf.as_mut_ptr() as *mut c_void), glen, &mut glen)?;
+        let groups = &*(gbuf.as_ptr() as *const TOKEN_GROUPS);
+        let garr = std::slice::from_raw_parts(groups.Groups.as_ptr(), groups.GroupCount as usize);
+
+        let mut restrict: Vec<SID_AND_ATTRIBUTES> = Vec::with_capacity(garr.len() + 1);
+        restrict.push(SID_AND_ATTRIBUTES { Sid: user.User.Sid, Attributes: 0 });
+        for g in garr {
+            // Skip integrity-label and deny-only groups; everything else
+            // goes into the restricting list so the token is "restricted"
+            // but with unchanged effective access.
+            if g.Attributes & 0x20 /*SE_GROUP_INTEGRITY*/ != 0 { continue; }
+            if g.Attributes & 0x10 /*SE_GROUP_USE_FOR_DENY_ONLY*/ != 0 { continue; }
+            restrict.push(SID_AND_ATTRIBUTES { Sid: g.Sid, Attributes: 0 });
+        }
+
+        let mut restricted = HANDLE::default();
+        CreateRestrictedToken(
+            base,
+            CREATE_RESTRICTED_TOKEN_FLAGS(0),
+            None,
+            None,
+            Some(&restrict),
+            &mut restricted,
+        ).context("CreateRestrictedToken(initial)")?;
+
+        // Match the lockdown IL so SeTokenCanImpersonate doesn't downgrade.
+        set_token_il(restricted, lockdown_il_rid)?;
+
         let mut out = HANDLE::default();
         DuplicateTokenEx(
-            base,
-            TOKEN_ACCESS_MASK(0xF01FF), // TOKEN_ALL_ACCESS without ACCESS_SYSTEM_SECURITY
+            restricted,
+            TOKEN_ALL_ACCESS,
             None,
             SecurityImpersonation,
             TokenImpersonation,
             &mut out,
         ).context("DuplicateTokenEx initial")?;
+        let _ = CloseHandle(restricted);
         Ok(out)
     }
 }

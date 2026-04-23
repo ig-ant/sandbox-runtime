@@ -59,7 +59,9 @@ pub fn run() -> Result<ProbeOutcome> {
     let _ = enable_privilege("SeImpersonatePrivilege");
     let base = open_process_token_all()?;
     let lockdown = make_lockdown_token(base).context("make_lockdown_token")?;
-    let initial  = make_initial_impersonation(base).context("make_initial_impersonation")?;
+    // Initial must be restricted + same IL as lockdown (Low = 0x1000).
+    let initial  = make_initial_impersonation(base, 0x1000)
+        .context("make_initial_impersonation")?;
     unsafe { let _ = CloseHandle(base); }
 
     // P5a: pure restricted token.

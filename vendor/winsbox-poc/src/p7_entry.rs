@@ -79,7 +79,9 @@ pub fn run() -> Result<ProbeOutcome> {
     let thread = target.pi.hThread;
 
     let base_tok = open_process_token_all()?;
-    let imp = make_initial_impersonation(base_tok)?;
+    // P7's primary token is unrestricted (we're testing the trampoline,
+    // not the lockdown), so any IL ≤ the broker's works; use Medium.
+    let imp = make_initial_impersonation(base_tok, 0x2000)?;
     unsafe {
         SetThreadToken(Some(&thread), imp).context("SetThreadToken")?;
         let _ = CloseHandle(base_tok);
