@@ -4,3 +4,5 @@ dist
 .DS_Store
 vendor/seccomp/x64/
 vendor/seccomp/arm64/
+vendor/winsbox/x64/
+vendor/winsbox/arm64/

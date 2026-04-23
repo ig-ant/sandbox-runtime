@@ -2,7 +2,7 @@ name: Tests
 
 on:
   push:
-    branches: ['main']
+    branches: ['main', 'windows-*']
   pull_request:
     branches: ['**']
 
@@ -27,6 +27,12 @@ jobs:
           - arch: arm64
             runner: macos-14
             os: macos
+          - arch: x86-64
+            runner: windows-latest
+            os: windows
+          - arch: arm64
+            runner: windows-11-arm
+            os: windows
 
     steps:
       - name: Checkout code
@@ -67,6 +73,10 @@ jobs:
         run: |
           brew install ripgrep zsh
 
+      - name: Setup Rust toolchain (Windows)
+        if: matrix.os == 'windows'
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Install Node dependencies
         run: npm install
 
@@ -74,13 +84,20 @@ jobs:
         if: matrix.os == 'linux'
         run: npm run build:seccomp
 
+      - name: Build sbox-exec (Windows)
+        if: matrix.os == 'windows'
+        run: bun vendor/winsbox/build.ts
+
       - name: Build project
         run: npm run build
 
       - name: Run tests
         run: npm test
+        env:
+          WINSBOX_PHASE: stub
 
       - name: Run Node.js fallback tests
+        if: matrix.os != 'windows'
         run: node test/utils/which-node-test.mjs
 
       - name: Upload test results

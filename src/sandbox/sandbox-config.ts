@@ -240,6 +240,24 @@ export const SeccompConfigSchema = z.object({
 })
 
 /**
+ * Windows-specific configuration (sbox-exec.exe path, launch mode).
+ */
+export const WindowsConfigSchema = z.object({
+  sboxExecPath: z
+    .string()
+    .optional()
+    .describe('Override path to sbox-exec.exe'),
+  mode: z
+    .enum(['stub', 'app-container', 'broker'])
+    .optional()
+    .describe(
+      'Launch mode. Defaults from WINSBOX_PHASE env (stub|1|2). ' +
+        'stub = no confinement (test scaffold); app-container = Phase 1; broker = Phase 2.',
+    ),
+  useAlternateDesktop: z.boolean().optional(),
+})
+
+/**
  * Main configuration schema for Sandbox Runtime validation
  */
 export const SandboxRuntimeConfigSchema = z.object({
@@ -283,6 +301,9 @@ export const SandboxRuntimeConfigSchema = z.object({
   seccomp: SeccompConfigSchema.optional().describe(
     'Custom seccomp binary paths (Linux only).',
   ),
+  windows: WindowsConfigSchema.optional().describe(
+    'Windows-specific launcher configuration.',
+  ),
 })
 
 // Export inferred types
@@ -295,4 +316,5 @@ export type IgnoreViolationsConfig = z.infer<
 >
 export type RipgrepConfig = z.infer<typeof RipgrepConfigSchema>
 export type SeccompConfig = z.infer<typeof SeccompConfigSchema>
+export type WindowsConfig = z.infer<typeof WindowsConfigSchema>
 export type SandboxRuntimeConfig = z.infer<typeof SandboxRuntimeConfigSchema>

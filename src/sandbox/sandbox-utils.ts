@@ -277,6 +277,16 @@ export function normalizePathForSandbox(pathPattern: string): string {
  */
 export function getDefaultWritePaths(): string[] {
   const homeDir = homedir()
+  if (getPlatform() === 'windows') {
+    const tmp = process.env.TEMP || process.env.TMP || homeDir
+    return [
+      path.join(tmp, 'claude'),
+      path.join(homeDir, '.claude', 'debug'),
+      path.join(homeDir, '.npm', '_logs'),
+      'NUL',
+      'CON',
+    ]
+  }
   const recommendedPaths = [
     '/dev/stdout',
     '/dev/stderr',

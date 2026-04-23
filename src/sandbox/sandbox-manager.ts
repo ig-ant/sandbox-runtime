@@ -25,6 +25,11 @@ import {
   startMacOSSandboxLogMonitor,
 } from './macos-sandbox-utils.js'
 import {
+  wrapCommandWithSandboxWindows,
+  checkWindowsDependencies,
+  cleanupWindows,
+} from './windows-sandbox-utils.js'
+import {
   getDefaultWritePaths,
   containsGlobChars,
   removeTrailingGlobSuffix,
@@ -360,7 +365,7 @@ function isSupportedPlatform(): boolean {
     // WSL1 doesn't support bubblewrap
     return getWslVersion() !== '1'
   }
-  return platform === 'macos'
+  return platform === 'macos' || platform === 'windows'
 }
 
 function isSandboxingEnabled(): boolean {
@@ -384,17 +389,24 @@ function checkDependencies(ripgrepConfig?: {
   const errors: string[] = []
   const warnings: string[] = []
 
-  // Check ripgrep - use provided config, then initialized config, then default 'rg'
-  const rgToCheck = ripgrepConfig ?? config?.ripgrep ?? { command: 'rg' }
-  if (whichSync(rgToCheck.command) === null) {
-    errors.push(`ripgrep (${rgToCheck.command}) not found`)
+  const platform = getPlatform()
+  // Check ripgrep - used by Linux mandatory-deny scan and macOS log
+  // monitor; Windows uses neither so don't require it there.
+  if (platform !== 'windows') {
+    const rgToCheck = ripgrepConfig ?? config?.ripgrep ?? { command: 'rg' }
+    if (whichSync(rgToCheck.command) === null) {
+      errors.push(`ripgrep (${rgToCheck.command}) not found`)
+    }
   }
 
-  const platform = getPlatform()
   if (platform === 'linux') {
     const linuxDeps = checkLinuxDependencies(config?.seccomp)
     errors.push(...linuxDeps.errors)
     warnings.push(...linuxDeps.warnings)
+  } else if (platform === 'windows') {
+    const winDeps = checkWindowsDependencies(config?.windows)
+    errors.push(...winDeps.errors)
+    warnings.push(...winDeps.warnings)
   }
 
   return { errors, warnings }
@@ -682,6 +694,18 @@ async function wrapWithSandbox(
         binShell,
       })
 
+    case 'windows':
+      return wrapCommandWithSandboxWindows({
+        command,
+        needsNetworkRestriction,
+        httpProxyPort: needsNetworkProxy ? getProxyPort() : undefined,
+        socksProxyPort: needsNetworkProxy ? getSocksProxyPort() : undefined,
+        readConfig,
+        writeConfig,
+        binShell,
+        windowsConfig: config?.windows,
+      })
+
     case 'linux':
       return wrapCommandWithSandboxLinux({
         command,
@@ -754,6 +778,7 @@ function updateConfig(newConfig: SandboxRuntimeConfig): void {
  */
 function cleanupAfterCommand(): void {
   cleanupBwrapMountPoints()
+  if (getPlatform() === 'windows') cleanupWindows()
 }
 
 async function reset(): Promise<void> {
