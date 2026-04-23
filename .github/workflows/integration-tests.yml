@@ -39,6 +39,10 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup Node.js
+        # Windows runners ship Node 22 preinstalled; setup-node has no
+        # Node 18 build for win-arm64, and the version isn't load-bearing
+        # for the Windows test path.
+        if: matrix.os != 'windows'
         uses: actions/setup-node@v4
         with:
           node-version: '18'
@@ -92,7 +96,15 @@ jobs:
         run: npm run build
 
       - name: Run tests
+        if: matrix.os != 'windows'
         run: npm test
+
+      - name: Run tests (Windows)
+        # The full suite has POSIX-shell assumptions and a Bun-on-Windows
+        # crash in parent-proxy-tunnel.test.ts; scope to the Windows suite
+        # for now. Porting the rest is tracked separately.
+        if: matrix.os == 'windows'
+        run: bun test test/sandbox/windows.test.ts
         env:
           WINSBOX_PHASE: stub
 
