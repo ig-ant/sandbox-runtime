@@ -3,6 +3,7 @@ name = "winsbox-poc"
 version = "0.0.0"
 edition = "2021"
 publish = false
+default-run = "winsbox-poc"
 
 [[bin]]
 name = "winsbox-poc"
