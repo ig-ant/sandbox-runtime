@@ -173,17 +173,28 @@ fn run_confined(pol: &Policy) -> Result<u32> {
     }
 
     // Filesystem policy → ACEs (Phase-1 mechanism). When the FS
-    // broker is active, the allowRead/allowWrite *grants* are
-    // redundant — the broker opens those paths under its own
-    // token and dup's the handle — and at ~2×N icacls spawns
-    // they dominate startup. The denyRead/denyWrite *denies*
-    // stay regardless: under USER_LIMITED a raw `NtCreateFile`
-    // (bypassing the hook) would otherwise succeed via the
-    // token's enabled `Users` group, so the on-disk ACE is the
-    // security boundary there.
+    // broker is active:
+    //  - allowRead grants are skipped — the broker opens read
+    //    paths under its own token, and reads always go via
+    //    NtCreateFile/NtOpenFile (hooked).
+    //  - allowWrite still gets the AC-SID grant: libuv issues
+    //    RootDirectory-relative writes that the broker can't
+    //    path-resolve and passes through; without the on-disk
+    //    ACE the target's lowbox token can't complete those
+    //    (npm cacache copyfile, 460f267). The RESTRICTED grant
+    //    is dropped — the broker covers the restricting check
+    //    and the persistent S-1-5-12 ACE was undesirable
+    //    anyway. Halves the icacls count.
+    //  - denyRead/denyWrite stay regardless: under
+    //    USER_LIMITED a raw NtCreateFile bypassing the hook
+    //    would otherwise succeed via the enabled `Users`
+    //    group, so the on-disk ACE is the security boundary.
     const RESTRICTED_SID: &str = "S-1-5-12";
-    let mut acl_op = |op: &str, p: &str, perm: &str, deny: bool| {
-        for sid in [&ac.sid_string, RESTRICTED_SID] {
+    let ac_sid = ac.sid_string.clone();
+    let both = [ac_sid.as_str(), RESTRICTED_SID];
+    let grant_sids: &[&str] = if pol.broker_fs { &both[..1] } else { &both };
+    let mut acl_op = |op: &str, p: &str, perm: &str, deny: bool, sids: &[&str]| {
+        for sid in sids {
             let r = if deny { acls.deny(p, sid, perm) }
                     else    { acls.grant(p, sid, perm) };
             if let Err(e) = r { log!("ACL {op} {p} ({sid}): {e:#}"); }
@@ -192,7 +203,7 @@ fn run_confined(pol: &Policy) -> Result<u32> {
     if !pol.broker_fs {
         for p in &pol.allow_read {
             if std::path::Path::new(p).exists() {
-                acl_op("allow-read", p, READ_EXECUTE, false);
+                acl_op("allow-read", p, READ_EXECUTE, false, grant_sids);
             }
         }
     }
@@ -201,14 +212,16 @@ fn run_confined(pol: &Policy) -> Result<u32> {
             .map(|f| f.to_string_lossy().to_ascii_uppercase()).unwrap_or_default();
         if matches!(leaf.as_str(), "NUL" | "CON" | "PRN" | "AUX") { continue; }
         std::fs::create_dir_all(p).ok();
-        if !pol.broker_fs { acl_op("allow-write", p, MODIFY, false); }
+        acl_op("allow-write", p, MODIFY, false, grant_sids);
     }
     for p in &pol.deny_write {
-        if std::path::Path::new(p).exists() { acl_op("deny-write", p, MODIFY, true); }
+        if std::path::Path::new(p).exists() {
+            acl_op("deny-write", p, MODIFY, true, grant_sids);
+        }
     }
     for p in &pol.deny_read {
         if std::path::Path::new(p).exists() {
-            acl_op("deny-read", p, FULL, true);
+            acl_op("deny-read", p, FULL, true, grant_sids);
             log!("icacls {p}:\n{}", crate::acl::dump(p).trim_end());
         }
     }
