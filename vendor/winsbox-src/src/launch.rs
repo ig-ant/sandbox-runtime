@@ -641,20 +641,28 @@ fn broker_open(
 fn handle_reg(
     ch: &ipc::Channel, target: HANDLE, req: &ipc::Wire, ctx: &Arc<SpawnCtx>,
 ) {
-    let (tag, write_bits): (&str, u32) = match req.op {
+    const MAXIMUM_ALLOWED: u32 = 0x02000000;
+    // KEY_READ | KEY_WOW64_64KEY|32KEY (preserve view bits if set).
+    const KEY_READ: u32 = 0x20019;
+    const KEY_WOW64: u32 = 0x0100 | 0x0200;
+    // SECTION_QUERY | MAP_READ | MAP_EXECUTE.
+    const SEC_READ: u32 = 0x0001 | 0x0004 | 0x0008;
+    let (tag, write_bits, read_mask): (&str, u32, u32) = match req.op {
         ipc::OP_NTOPENSECTION => ("sec",
             0x0002 /* SECTION_MAP_WRITE */ |
             0x0010 /* SECTION_EXTEND_SIZE */ |
             0x00010000 | 0x00040000 | 0x00080000 |
-            0x40000000 | 0x10000000 | 0x02000000),
+            0x40000000 | 0x10000000,
+            SEC_READ),
         _ => ("reg",
             0x0002 /* KEY_SET_VALUE */ |
             0x0004 /* KEY_CREATE_SUB_KEY */ |
             0x0020 /* KEY_CREATE_LINK */ |
             0x00010000 | 0x00040000 | 0x00080000 |
-            0x40000000 | 0x10000000 | 0x02000000),
+            0x40000000 | 0x10000000,
+            KEY_READ),
     };
-    let access = req.args[1] as u32;
+    let req_access = req.args[1] as u32;
     let (root_raw, leaf) = match read_target_oa_raw(target, req.args[2] as usize) {
         Ok(r) => r,
         Err(e) => {
@@ -665,13 +673,22 @@ fn handle_reg(
             return;
         }
     };
-    if access & write_bits != 0 {
+    if req_access & write_bits != 0 {
         if ctx.trace {
-            eprintln!("[sbox-exec] {tag}: passthrough write access={access:#x} {leaf}");
+            eprintln!("[sbox-exec] {tag}: passthrough write access={req_access:#x} {leaf}");
         }
         ch.reply_fs(0, 0, ipc::FS_PASSTHROUGH);
         return;
     }
+    // MAXIMUM_ALLOWED under the broker's token would resolve to
+    // write — substitute the read mask so the dup'd handle is
+    // read-only. kernelbase opens the HKLM/HKCU roots this way
+    // and every subsequent relative open hangs off the result,
+    // so passthrough (which fails under NULL restricting) breaks
+    // the whole chain.
+    let access = if req_access & MAXIMUM_ALLOWED != 0 {
+        read_mask | (req_access & KEY_WOW64)
+    } else { req_access };
     let root_h = if root_raw != 0 {
         match dup_from_target(target, root_raw) {
             Ok(h) => h,
