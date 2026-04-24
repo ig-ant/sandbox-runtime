@@ -102,19 +102,19 @@ d(`windows sandbox [WINSBOX_PHASE=${PHASE}]`, () => {
   // re-opens LSA without re-opening network, or the test is
   // reshaped to avoid LSA.
   const LOCKDOWN_LSA_OK = false
-  const lsaCompat =
-    PHASE !== '2' || LOCKDOWN_LSA_OK
-      ? extCompat
-      : (n: string, _p: Phase, f: () => Promise<void>) => {
-          skipped.push(`${n} [lowbox blocks LSA RPC]`)
-          test.skip(`${n} [lowbox blocks LSA RPC]`, f)
-        }
   const extCompat =
     PHASE !== '2' || BROKER_PROC_HOOK_LANDED
       ? compat
       : (n: string, _p: Phase, f: () => Promise<void>) => {
           skipped.push(`${n} [needs broker NtCreateUserProcess hook]`)
           test.skip(`${n} [needs broker NtCreateUserProcess hook]`, f)
+        }
+  const lsaCompat =
+    PHASE !== '2' || LOCKDOWN_LSA_OK
+      ? extCompat
+      : (n: string, _p: Phase, f: () => Promise<void>) => {
+          skipped.push(`${n} [lowbox blocks LSA RPC]`)
+          test.skip(`${n} [lowbox blocks LSA RPC]`, f)
         }
 
   const toolCompat =
