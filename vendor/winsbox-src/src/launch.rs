@@ -112,6 +112,11 @@ fn run_appcontainer(pol: &Policy) -> Result<u32> {
         std::fs::create_dir_all(p).ok();
         acl_op("allow-write", p, MODIFY, false);
     }
+    // Re-apply denies after allow propagation so the explicit deny
+    // ACE definitely sits ahead of any inherited allow on the object.
+    for p in &pol.deny_read {
+        if std::path::Path::new(p).exists() { acl_op("deny-read-2", p, 0x1F01FF, true); }
+    }
 
     log!("ACLs applied: {} grants/denies", pol.allow_read.len() + pol.allow_write.len() + pol.deny_read.len() + pol.deny_write.len());
 

@@ -6,7 +6,7 @@ use windows::core::PWSTR;
 use windows::Win32::Foundation::{LocalFree, HLOCAL};
 use windows::Win32::Security::Authorization::{
     GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
-    NO_MULTIPLE_TRUSTEE, SET_ACCESS, DENY_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID,
+    NO_MULTIPLE_TRUSTEE, GRANT_ACCESS, DENY_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID,
     TRUSTEE_IS_GROUP, TRUSTEE_W, ACCESS_MODE,
 };
 use windows::Win32::Security::{
@@ -26,7 +26,10 @@ pub struct AclJournal {
 
 impl AclJournal {
     pub fn grant(&mut self, path: &str, sid: PSID, sid_str: &str, mask: u32) -> Result<()> {
-        apply_ace(path, sid, mask, SET_ACCESS)?;
+        // GRANT_ACCESS (additive) — SET_ACCESS would discard any
+        // existing deny ACE for this trustee when propagation reaches
+        // a denyRead subtree.
+        apply_ace(path, sid, mask, GRANT_ACCESS)?;
         self.entries.push((path.to_string(), sid_str.to_string()));
         Ok(())
     }
