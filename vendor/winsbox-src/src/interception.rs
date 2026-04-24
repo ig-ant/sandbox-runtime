@@ -39,9 +39,10 @@ pub fn install_cpw(_target: HANDLE, _a: &StubAddrs, _cpw: usize) -> Result<()> {
 fn stub_env(a: &StubAddrs) -> Result<StubEnv> {
     Ok(StubEnv {
         section: a.section as u64,
-        ev_req: a.ev_req, ev_resp: a.ev_resp,
+        ev_req: a.ev_req, ev_resp: a.ev_resp, mutex: a.mutex,
         nt_set_event: ntdll_export("NtSetEvent")? as u64,
         nt_wait: ntdll_export("NtWaitForSingleObject")? as u64,
+        nt_release_mutant: ntdll_export("NtReleaseMutant")? as u64,
     })
 }
 
@@ -132,86 +133,108 @@ fn patch_with_stub(target: HANDLE, name: &str, va: usize, stub: &[u8]) -> Result
 
 #[cfg(target_arch = "x86_64")]
 struct StubEnv {
-    section: u64, ev_req: u64, ev_resp: u64,
-    nt_set_event: u64, nt_wait: u64,
+    section: u64, ev_req: u64, ev_resp: u64, mutex: u64,
+    nt_set_event: u64, nt_wait: u64, nt_release_mutant: u64,
 }
 
-/// Spinlock word inside the section, past `Wire` (0x88). The
-/// channel is single-slot; with the FS hooks active during the
-/// loader, parallel-loader worker threads issue concurrent
-/// `NtOpenFile`s and would otherwise overwrite each other's
-/// spilled args / steal each other's reply. Section is
-/// zero-initialised in `Channel::create`, so the lock starts
-/// released.
-const LOCK_OFF: u32 = 0x90;
-
-/// Acquire `[r10+LOCK_OFF]`. Clobbers eax, r11d. r10 must
-/// already hold the section base.
+/// `NtReleaseMutant(mutex, NULL)` preserving eax across the
+/// call. 34 bytes. r10 and rcx/rdx/r8/r9 are clobbered. Stack
+/// alignment: stub entry is rsp%16==8; push rax → 0; sub 0x20
+/// → 0; call sees aligned-then-pushed.
 #[cfg(target_arch = "x86_64")]
-fn emit_lock_acquire(s: &mut Vec<u8>) {
-    // mov r11d, 1
-    s.extend_from_slice(&[0x41, 0xBB, 0x01, 0x00, 0x00, 0x00]);
-    // spin:
-    //   xor eax, eax
-    s.extend_from_slice(&[0x31, 0xC0]);
-    //   lock cmpxchg [r10+LOCK_OFF], r11d
-    s.extend_from_slice(&[0xF0, 0x45, 0x0F, 0xB1, 0x9A]);
-    s.extend_from_slice(&LOCK_OFF.to_le_bytes());
-    //   je acquired (+4 over pause+jmp)
-    s.extend_from_slice(&[0x74, 0x04]);
-    //   pause
-    s.extend_from_slice(&[0xF3, 0x90]);
-    //   jmp spin (-17)
-    s.extend_from_slice(&[0xEB, 0xEF]);
-    // acquired:
+fn emit_release_keep_eax(s: &mut Vec<u8>, e: &StubEnv) {
+    s.push(0x50);                                    // push rax
+    s.extend_from_slice(&[0x48, 0x83, 0xEC, 0x20]);  // sub rsp,0x20
+    s.extend_from_slice(&[0x48, 0xB9]);              // mov rcx, mutex
+    s.extend_from_slice(&e.mutex.to_le_bytes());
+    s.extend_from_slice(&[0x31, 0xD2]);              // xor edx,edx
+    s.extend_from_slice(&[0x48, 0xB8]);              // mov rax, NtReleaseMutant
+    s.extend_from_slice(&e.nt_release_mutant.to_le_bytes());
+    s.extend_from_slice(&[0xFF, 0xD0]);              // call rax
+    s.extend_from_slice(&[0x48, 0x83, 0xC4, 0x20]);  // add rsp,0x20
+    s.push(0x58);                                    // pop rax
 }
 
-/// Release `[r10+LOCK_OFF]`. Clobbers nothing. 11 bytes.
+/// Release the mutant, restore rcx/rdx/r8/r9 from the caller's
+/// shadow space (per-thread, immune to section reuse), and
+/// tail-jmp the saved original syscall stub. 64 bytes.
 #[cfg(target_arch = "x86_64")]
-fn emit_lock_release(s: &mut Vec<u8>) {
-    // mov dword [r10+LOCK_OFF], 0
-    s.extend_from_slice(&[0x41, 0xC7, 0x82]);
-    s.extend_from_slice(&LOCK_OFF.to_le_bytes());
-    s.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+fn emit_passthrough(s: &mut Vec<u8>, e: &StubEnv, saved_orig: u64) {
+    s.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);  // sub rsp,0x28
+    s.extend_from_slice(&[0x48, 0xB9]);              // mov rcx, mutex
+    s.extend_from_slice(&e.mutex.to_le_bytes());
+    s.extend_from_slice(&[0x31, 0xD2]);              // xor edx,edx
+    s.extend_from_slice(&[0x48, 0xB8]);              // mov rax, NtReleaseMutant
+    s.extend_from_slice(&e.nt_release_mutant.to_le_bytes());
+    s.extend_from_slice(&[0xFF, 0xD0]);              // call rax
+    s.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);  // add rsp,0x28
+    // restore from shadow space
+    s.extend_from_slice(&[0x48, 0x8B, 0x4C, 0x24, 0x08]); // mov rcx,[rsp+8]
+    s.extend_from_slice(&[0x48, 0x8B, 0x54, 0x24, 0x10]); // mov rdx,[rsp+0x10]
+    s.extend_from_slice(&[0x4C, 0x8B, 0x44, 0x24, 0x18]); // mov r8, [rsp+0x18]
+    s.extend_from_slice(&[0x4C, 0x8B, 0x4C, 0x24, 0x20]); // mov r9, [rsp+0x20]
+    s.extend_from_slice(&[0x48, 0xB8]);              // mov rax, saved_orig
+    s.extend_from_slice(&saved_orig.to_le_bytes());
+    s.extend_from_slice(&[0xFF, 0xE0]);              // jmp rax
 }
+const PASSTHROUGH_LEN: u8 = 64;
 
-/// Phase A (load r10=section; acquire lock; write op; spill
-/// `n_args` from rcx,rdx,r8,r9,[rsp+0x28..]) + Phase B (signal
-/// req, wait resp) + reload r10. The caller appends Phase C
-/// and is responsible for `emit_lock_release` on every exit.
+/// Phase A: save rcx/rdx/r8/r9 to caller's shadow space
+/// (per-thread; survives the mutex/event calls below);
+/// `NtWaitForSingleObject(mutex, FALSE, NULL)` — abandoned
+/// returns `STATUS_ABANDONED` and ownership is granted, so no
+/// status check; load r10=section; write op; spill shadow-
+/// space + stack args to section. Phase B: signal req, wait
+/// resp. Reload r10. The caller appends Phase C and is
+/// responsible for `emit_release_keep_eax` on every exit.
 #[cfg(target_arch = "x86_64")]
 fn emit_prologue(s: &mut Vec<u8>, e: &StubEnv, op: u64, n_args: usize) {
-    // mov r10, section
-    s.extend_from_slice(&[0x49, 0xBA]); s.extend_from_slice(&e.section.to_le_bytes());
-    emit_lock_acquire(s);
-    // mov rax, op; mov [r10+0], rax
+    // ── save args to caller's shadow space
+    s.extend_from_slice(&[0x48, 0x89, 0x4C, 0x24, 0x08]); // [rsp+8]  = rcx
+    s.extend_from_slice(&[0x48, 0x89, 0x54, 0x24, 0x10]); // [rsp+10] = rdx
+    s.extend_from_slice(&[0x4C, 0x89, 0x44, 0x24, 0x18]); // [rsp+18] = r8
+    s.extend_from_slice(&[0x4C, 0x89, 0x4C, 0x24, 0x20]); // [rsp+20] = r9
+    // ── acquire mutex (clobbers volatiles; args saved above)
+    s.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);       // sub rsp,0x28
+    s.extend_from_slice(&[0x48, 0xB9]);                   // mov rcx, mutex
+    s.extend_from_slice(&e.mutex.to_le_bytes());
+    s.extend_from_slice(&[0x31, 0xD2]);                   // xor edx,edx (Alertable)
+    s.extend_from_slice(&[0x45, 0x31, 0xC0]);             // xor r8d,r8d (Timeout)
+    s.extend_from_slice(&[0x48, 0xB8]);                   // mov rax, NtWaitForSingleObject
+    s.extend_from_slice(&e.nt_wait.to_le_bytes());
+    s.extend_from_slice(&[0xFF, 0xD0]);                   // call rax
+    s.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);       // add rsp,0x28
+    // ── load section base
+    s.extend_from_slice(&[0x49, 0xBA]);                   // mov r10, section
+    s.extend_from_slice(&e.section.to_le_bytes());
+    // ── op
     s.extend_from_slice(&[0x48, 0xB8]); s.extend_from_slice(&op.to_le_bytes());
-    s.extend_from_slice(&[0x49, 0x89, 0x02]);
-    // [r10+0x08]=rcx, +0x10=rdx, +0x18=r8, +0x20=r9
-    s.extend_from_slice(&[0x49, 0x89, 0x4A, 0x08]);
-    s.extend_from_slice(&[0x49, 0x89, 0x52, 0x10]);
-    s.extend_from_slice(&[0x4D, 0x89, 0x42, 0x18]);
-    s.extend_from_slice(&[0x4D, 0x89, 0x4A, 0x20]);
-    // stack args 5..n at [rsp+0x28..]
+    s.extend_from_slice(&[0x49, 0x89, 0x02]);             // mov [r10], rax
+    // ── spill shadow-space args to section
+    for (sp, dst) in [(0x08u8, 0x08u8), (0x10, 0x10), (0x18, 0x18), (0x20, 0x20)] {
+        s.extend_from_slice(&[0x48, 0x8B, 0x44, 0x24, sp]); // mov rax,[rsp+sp]
+        s.extend_from_slice(&[0x49, 0x89, 0x42, dst]);      // mov [r10+dst],rax
+    }
+    // ── stack args 5..n at [rsp+0x28..]
     for i in 4..n_args {
         let sp_off = 0x28 + (i - 4) * 8;
         let dst = 0x08 + i * 8;
-        s.extend_from_slice(&[0x48, 0x8B, 0x44, 0x24, sp_off as u8]); // mov rax,[rsp+off]
-        s.extend_from_slice(&[0x49, 0x89, 0x42, dst as u8]);          // mov [r10+dst],rax
+        s.extend_from_slice(&[0x48, 0x8B, 0x44, 0x24, sp_off as u8]);
+        s.extend_from_slice(&[0x49, 0x89, 0x42, dst as u8]);
     }
     // ── Phase B
     s.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp,0x28
-    s.extend_from_slice(&[0x48, 0xB9]); s.extend_from_slice(&e.ev_req.to_le_bytes()); // mov rcx,ev_req
-    s.extend_from_slice(&[0x31, 0xD2]); // xor edx,edx
-    s.extend_from_slice(&[0x48, 0xB8]); s.extend_from_slice(&e.nt_set_event.to_le_bytes());
-    s.extend_from_slice(&[0xFF, 0xD0]); // call rax
-    s.extend_from_slice(&[0x48, 0xB9]); s.extend_from_slice(&e.ev_resp.to_le_bytes()); // mov rcx,ev_resp
+    s.extend_from_slice(&[0x48, 0xB9]); s.extend_from_slice(&e.ev_req.to_le_bytes());
     s.extend_from_slice(&[0x31, 0xD2]);
-    s.extend_from_slice(&[0x4D, 0x31, 0xC0]); // xor r8,r8
+    s.extend_from_slice(&[0x48, 0xB8]); s.extend_from_slice(&e.nt_set_event.to_le_bytes());
+    s.extend_from_slice(&[0xFF, 0xD0]);
+    s.extend_from_slice(&[0x48, 0xB9]); s.extend_from_slice(&e.ev_resp.to_le_bytes());
+    s.extend_from_slice(&[0x31, 0xD2]);
+    s.extend_from_slice(&[0x45, 0x31, 0xC0]);
     s.extend_from_slice(&[0x48, 0xB8]); s.extend_from_slice(&e.nt_wait.to_le_bytes());
     s.extend_from_slice(&[0xFF, 0xD0]);
     s.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp,0x28
-    // reload r10 for Phase C
+    // ── reload r10 for Phase C
     s.extend_from_slice(&[0x49, 0xBA]); s.extend_from_slice(&e.section.to_le_bytes());
 }
 
@@ -240,7 +263,7 @@ fn emit_cpw_stub(e: &StubEnv) -> Vec<u8> {
     s.extend_from_slice(&[0x65, 0x89, 0x04, 0x25, 0x68, 0x00, 0x00, 0x00]);
     // eax = r_status @ +0x80 (BOOL)
     s.extend_from_slice(&[0x41, 0x8B, 0x82, 0x80, 0x00, 0x00, 0x00]);
-    emit_lock_release(&mut s);
+    emit_release_keep_eax(&mut s, e);
     s.push(0xC3);
     s
 }
@@ -253,75 +276,56 @@ fn emit_cpw_stub(e: &StubEnv) -> Vec<u8> {
 // FS_PASSTHROUGH and have the stub tail-jmp the saved original.
 #[cfg(target_arch = "x86_64")]
 fn emit_fs_stub(e: &StubEnv, op: u64, n_args: usize, saved_orig: u64) -> Vec<u8> {
-    let mut s = Vec::<u8>::with_capacity(320);
+    let mut s = Vec::<u8>::with_capacity(512);
     emit_prologue(&mut s, e, op, n_args);
-    // r10 = section (reloaded by emit_prologue's tail).
-    // ── Passthrough check: if r_status == FS_PASSTHROUGH,
-    // reload rcx/rdx/r8/r9 from section (stack args at
-    // [rsp+0x28..] are unchanged — emit_prologue's sub/add
-    // cancelled) and tail-jmp the saved original syscall stub.
-    // Its `ret` returns to *our* caller; out-params are written
-    // by the kernel.
+    // r10 = section. Passthrough check: r_status ==
+    // FS_PASSTHROUGH → release mutex, restore args from
+    // shadow space (per-thread), tail-jmp saved original
+    // (its `ret` returns to *our* caller; out-params are
+    // written by the kernel; stack args at [rsp+0x28..] are
+    // unchanged — every sub/add cancelled).
     s.extend_from_slice(&[0x41, 0x8B, 0x82, 0x80, 0x00, 0x00, 0x00]); // mov eax,[r10+0x80]
     s.extend_from_slice(&[0x3D]);                                      // cmp eax, FS_PASSTHROUGH
     s.extend_from_slice(&(crate::ipc::FS_PASSTHROUGH as u32).to_le_bytes().as_slice());
-    s.extend_from_slice(&[0x75, 0x27]);                                // jne broker_reply (+39)
-    // reload rcx/rdx/r8/r9 from section while we still hold the
-    // lock (release would let another thread overwrite them)
-    s.extend_from_slice(&[0x49, 0x8B, 0x4A, 0x08]); // mov rcx,[r10+0x08]
-    s.extend_from_slice(&[0x49, 0x8B, 0x52, 0x10]); // mov rdx,[r10+0x10]
-    s.extend_from_slice(&[0x4D, 0x8B, 0x42, 0x18]); // mov r8, [r10+0x18]
-    s.extend_from_slice(&[0x4D, 0x8B, 0x4A, 0x20]); // mov r9, [r10+0x20]
-    emit_lock_release(&mut s);
-    // mov rax, saved_orig; jmp rax — the saved stub's `ret`
-    // goes to NtCreateFile's caller (our [rsp] is untouched).
-    s.extend_from_slice(&[0x48, 0xB8]); s.extend_from_slice(&saved_orig.to_le_bytes());
-    s.extend_from_slice(&[0xFF, 0xE0]);
-    // ↑ 4×4 + 11 + 10 + 2 = 39 = 0x27.
-    // broker_reply:
-    // rcx = args[0] = PHANDLE FileHandle @ +0x08; *rcx = r0 @ +0x68
-    s.extend_from_slice(&[0x49, 0x8B, 0x4A, 0x08]);
+    s.extend_from_slice(&[0x75, PASSTHROUGH_LEN]);                     // jne broker_reply (+64)
+    emit_passthrough(&mut s, e, saved_orig);
+    // broker_reply: out-params from section (mutex still
+    // held), then release, then ret. Pointer args come from
+    // shadow space — same value as section, but per-thread.
+    // *args[0] = r0 (FileHandle)
+    s.extend_from_slice(&[0x48, 0x8B, 0x4C, 0x24, 0x08]);              // mov rcx,[rsp+8]
     s.extend_from_slice(&[0x49, 0x8B, 0x42, 0x68, 0x48, 0x89, 0x01]);
-    // rcx = args[3] = PIO_STATUS_BLOCK @ +0x20
-    s.extend_from_slice(&[0x49, 0x8B, 0x4A, 0x20]);
-    s.extend_from_slice(&[0x48, 0x85, 0xC9, 0x74, 0x12]);             // jz +0x12
-    s.extend_from_slice(&[0x49, 0x63, 0x82, 0x80, 0x00, 0x00, 0x00]); // movsxd rax,[r10+0x80]
+    // *args[3] = {r_status, r1} (IO_STATUS_BLOCK)
+    s.extend_from_slice(&[0x48, 0x8B, 0x4C, 0x24, 0x20]);              // mov rcx,[rsp+0x20]
+    s.extend_from_slice(&[0x48, 0x85, 0xC9, 0x74, 0x12]);              // jz +0x12
+    s.extend_from_slice(&[0x49, 0x63, 0x82, 0x80, 0x00, 0x00, 0x00]);  // movsxd rax,[r10+0x80]
     s.extend_from_slice(&[0x48, 0x89, 0x01]);
     s.extend_from_slice(&[0x49, 0x8B, 0x42, 0x70, 0x48, 0x89, 0x41, 0x08]);
-    // eax = r_status @ +0x80 (NTSTATUS)
+    // eax = r_status (NTSTATUS)
     s.extend_from_slice(&[0x41, 0x8B, 0x82, 0x80, 0x00, 0x00, 0x00]);
-    emit_lock_release(&mut s);
+    emit_release_keep_eax(&mut s, e);
     s.push(0xC3);
     s
 }
 
 /// Stub for syscalls whose only out-param is `*args[0] = HANDLE`
-/// — `NtOpenKey`, `NtOpenKeyEx`, (later) `NtOpenSection`. Same
-/// prologue + passthrough as `emit_fs_stub`; Phase C writes
-/// `r0` to `*args[0]` and returns `r_status`.
+/// — `NtOpenKey`, `NtOpenKeyEx`, `NtOpenSection`. Same prologue
+/// + passthrough as `emit_fs_stub`; Phase C writes `r0` to
+/// `*args[0]` and returns `r_status`.
 #[cfg(target_arch = "x86_64")]
 fn emit_handle_stub(e: &StubEnv, op: u64, n_args: usize, saved_orig: u64) -> Vec<u8> {
-    let mut s = Vec::<u8>::with_capacity(256);
+    let mut s = Vec::<u8>::with_capacity(384);
     emit_prologue(&mut s, e, op, n_args);
-    // r10 = section.
-    // Passthrough check (identical to emit_fs_stub).
     s.extend_from_slice(&[0x41, 0x8B, 0x82, 0x80, 0x00, 0x00, 0x00]); // mov eax,[r10+0x80]
     s.extend_from_slice(&[0x3D]);
     s.extend_from_slice(&(crate::ipc::FS_PASSTHROUGH as u32).to_le_bytes().as_slice());
-    s.extend_from_slice(&[0x75, 0x27]);                                // jne broker_reply (+39)
-    s.extend_from_slice(&[0x49, 0x8B, 0x4A, 0x08]); // mov rcx,[r10+0x08]
-    s.extend_from_slice(&[0x49, 0x8B, 0x52, 0x10]); // mov rdx,[r10+0x10]
-    s.extend_from_slice(&[0x4D, 0x8B, 0x42, 0x18]); // mov r8, [r10+0x18]
-    s.extend_from_slice(&[0x4D, 0x8B, 0x4A, 0x20]); // mov r9, [r10+0x20]
-    emit_lock_release(&mut s);
-    s.extend_from_slice(&[0x48, 0xB8]); s.extend_from_slice(&saved_orig.to_le_bytes());
-    s.extend_from_slice(&[0xFF, 0xE0]);
-    // broker_reply: rcx = args[0] = PHANDLE @ +0x08; *rcx = r0 @ +0x68
-    s.extend_from_slice(&[0x49, 0x8B, 0x4A, 0x08]);
+    s.extend_from_slice(&[0x75, PASSTHROUGH_LEN]);                     // jne broker_reply (+64)
+    emit_passthrough(&mut s, e, saved_orig);
+    // broker_reply: *args[0] = r0
+    s.extend_from_slice(&[0x48, 0x8B, 0x4C, 0x24, 0x08]);              // mov rcx,[rsp+8]
     s.extend_from_slice(&[0x49, 0x8B, 0x42, 0x68, 0x48, 0x89, 0x01]);
-    // eax = r_status @ +0x80
-    s.extend_from_slice(&[0x41, 0x8B, 0x82, 0x80, 0x00, 0x00, 0x00]);
-    emit_lock_release(&mut s);
+    s.extend_from_slice(&[0x41, 0x8B, 0x82, 0x80, 0x00, 0x00, 0x00]);  // mov eax,[r10+0x80]
+    emit_release_keep_eax(&mut s, e);
     s.push(0xC3);
     s
 }

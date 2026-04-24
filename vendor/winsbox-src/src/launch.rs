@@ -172,13 +172,15 @@ fn run_confined(pol: &Policy) -> Result<u32> {
         }
     }
 
-    // Filesystem policy → ACEs. Allow first (icacls /grant), then
-    // /deny on the deny paths — icacls always orders explicit deny
-    // before allow on the same object, and deny ACEs are evaluated
-    // first regardless. Each grant goes to BOTH the AC package SID
-    // (satisfies the lowbox normal-SID check) and RESTRICTED
-    // S-1-5-12 (satisfies the restricting-SID check on the
-    // lockdown primary after RevertToSelf).
+    // Filesystem policy → ACEs (Phase-1 mechanism). When the FS
+    // broker is active, the allowRead/allowWrite *grants* are
+    // redundant — the broker opens those paths under its own
+    // token and dup's the handle — and at ~2×N icacls spawns
+    // they dominate startup. The denyRead/denyWrite *denies*
+    // stay regardless: under USER_LIMITED a raw `NtCreateFile`
+    // (bypassing the hook) would otherwise succeed via the
+    // token's enabled `Users` group, so the on-disk ACE is the
+    // security boundary there.
     const RESTRICTED_SID: &str = "S-1-5-12";
     let mut acl_op = |op: &str, p: &str, perm: &str, deny: bool| {
         for sid in [&ac.sid_string, RESTRICTED_SID] {
@@ -187,16 +189,19 @@ fn run_confined(pol: &Policy) -> Result<u32> {
             if let Err(e) = r { log!("ACL {op} {p} ({sid}): {e:#}"); }
         }
     };
-    for p in &pol.allow_read {
-        if std::path::Path::new(p).exists() { acl_op("allow-read", p, READ_EXECUTE, false); }
+    if !pol.broker_fs {
+        for p in &pol.allow_read {
+            if std::path::Path::new(p).exists() {
+                acl_op("allow-read", p, READ_EXECUTE, false);
+            }
+        }
     }
     for p in &pol.allow_write {
-        // Skip device names (NUL, CON, …) — not real filesystem objects.
         let leaf = std::path::Path::new(p).file_name()
             .map(|f| f.to_string_lossy().to_ascii_uppercase()).unwrap_or_default();
         if matches!(leaf.as_str(), "NUL" | "CON" | "PRN" | "AUX") { continue; }
         std::fs::create_dir_all(p).ok();
-        acl_op("allow-write", p, MODIFY, false);
+        if !pol.broker_fs { acl_op("allow-write", p, MODIFY, false); }
     }
     for p in &pol.deny_write {
         if std::path::Path::new(p).exists() { acl_op("deny-write", p, MODIFY, true); }
@@ -207,8 +212,12 @@ fn run_confined(pol: &Policy) -> Result<u32> {
             log!("icacls {p}:\n{}", crate::acl::dump(p).trim_end());
         }
     }
-
-    log!("ACLs applied: {} grants/denies", pol.allow_read.len() + pol.allow_write.len() + pol.deny_read.len() + pol.deny_write.len());
+    log!(
+        "ACLs: {} allow-grants {} {} denies",
+        if pol.broker_fs { "skipped (broker_fs)," } else { "applied," },
+        pol.allow_read.len() + pol.allow_write.len(),
+        pol.deny_read.len() + pol.deny_write.len(),
+    );
 
     // Network bridge: only if the policy carries proxy ports. Failures
     // here are logged but non-fatal — the AC simply has no network,

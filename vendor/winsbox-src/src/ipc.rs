@@ -7,12 +7,16 @@
 //! the spawn under its own token, `DuplicateHandle`s the results
 //! into the target, and replies.
 //!
-//! Concurrency: the section holds one request at a time. The FS
-//! stubs are now active during the loader, whose parallel worker
-//! threads issue concurrent `NtOpenFile`s, so every stub spins on
-//! `[section+LOCK_OFF]` (a word past `Wire`) before writing args
-//! and releases after reading the reply. See
-//! `interception::emit_lock_acquire`.
+//! Concurrency: the section holds one request at a time. Each
+//! stub `NtWaitForSingleObject(mutex)` before writing args and
+//! `NtReleaseMutant(mutex)` after reading the reply. A spinlock
+//! is unsafe here — `ExitProcess` terminates threads at
+//! arbitrary points, so a thread killed mid-stub leaves a
+//! spinlock held forever and any `DLL_PROCESS_DETACH` callback
+//! that hits a hooked syscall spins (observed at 12e3d0d). A
+//! mutant is abandoned on owner-thread death and the next
+//! waiter's `NtWaitForSingleObject` returns `STATUS_ABANDONED`,
+//! which the stub treats as acquired.
 
 use anyhow::{bail, Context, Result};
 use std::ffi::c_void;
@@ -27,7 +31,7 @@ use windows::Win32::System::Memory::{
     MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE,
 };
 use windows::Win32::System::Threading::{
-    CreateEventW, GetCurrentProcess, SetEvent, WaitForSingleObject,
+    CreateEventW, CreateMutexW, GetCurrentProcess, SetEvent, WaitForSingleObject,
 };
 
 pub const OP_CPW: u64 = 0;
@@ -79,6 +83,7 @@ pub struct StubAddrs {
     pub section: usize,
     pub ev_req: u64,
     pub ev_resp: u64,
+    pub mutex: u64,
 }
 
 pub struct Channel {
@@ -93,6 +98,10 @@ pub struct Channel {
     /// Target-side handle values for the same events (post-DuplicateHandle).
     pub t_ev_req: u64,
     pub t_ev_resp: u64,
+    /// Per-channel mutant. Broker side never waits on it; only
+    /// the target-side stubs do (target-side handle below).
+    pub mutex: HANDLE,
+    pub t_mutex: u64,
     /// The target process this channel is bound to.
     pub target: HANDLE,
 }
@@ -125,8 +134,11 @@ impl Channel {
                 .context("CreateEventW(req)")?;
             let ev_resp = CreateEventW(Some(&sa), false, false, None)
                 .context("CreateEventW(resp)")?;
+            let mutex = CreateMutexW(Some(&sa), false, None)
+                .context("CreateMutexW")?;
             let t_ev_req = dup_into(target, ev_req)?;
             let t_ev_resp = dup_into(target, ev_resp)?;
+            let t_mutex = dup_into(target, mutex)?;
 
             Ok(Self {
                 section,
@@ -134,6 +146,7 @@ impl Channel {
                 target_view,
                 ev_req, ev_resp,
                 t_ev_req, t_ev_resp,
+                mutex, t_mutex,
                 target,
             })
         }
@@ -190,6 +203,7 @@ impl Channel {
             section: self.target_view,
             ev_req: self.t_ev_req,
             ev_resp: self.t_ev_resp,
+            mutex: self.t_mutex,
         }
     }
 }
@@ -201,6 +215,7 @@ impl Drop for Channel {
             let _ = CloseHandle(self.section);
             let _ = CloseHandle(self.ev_req);
             let _ = CloseHandle(self.ev_resp);
+            let _ = CloseHandle(self.mutex);
         }
     }
 }
