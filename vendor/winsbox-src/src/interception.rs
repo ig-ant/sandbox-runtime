@@ -189,6 +189,18 @@ pub fn read_remote<T: Copy>(proc: HANDLE, addr: usize) -> Result<T> {
     }
 }
 
+pub fn write_remote<T: Copy>(proc: HANDLE, addr: usize, val: &T) -> Result<()> {
+    unsafe {
+        let mut n = 0usize;
+        WriteProcessMemory(proc, addr as *const c_void,
+                           val as *const _ as *const c_void,
+                           size_of::<T>(), Some(&mut n))
+            .with_context(|| format!("WriteProcessMemory<{}> @ {addr:#x}",
+                                      std::any::type_name::<T>()))?;
+        Ok(())
+    }
+}
+
 pub fn read_remote_wstr(proc: HANDLE, addr: usize, byte_len: usize) -> Result<String> {
     unsafe {
         let mut buf = vec![0u16; byte_len / 2];

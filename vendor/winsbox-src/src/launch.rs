@@ -425,6 +425,15 @@ fn serve_ipc(ch: ipc::Channel, target_raw: isize, ctx: Arc<SpawnCtx>) {
                 unsafe { ResumeThread(child.hThread); }
                 let p = ch.dup_to_target(child.hProcess).unwrap_or(0);
                 let t = ch.dup_to_target(child.hThread).unwrap_or(0);
+                // kernel32!CreateProcessInternalW reads PS_CREATE_INFO
+                // and the PS_ATTRIBUTE_CLIENT_ID/IMAGE_INFO out-attrs
+                // after NtCreateUserProcess returns; populate them so
+                // it doesn't fail post-processing.
+                if let Err(e) = fill_create_outparams(
+                    target, &req, &child, p, t,
+                ) {
+                    eprintln!("[sbox-exec] ipc: fill outparams: {e:#}");
+                }
                 ch.reply(p, t, 0 /*STATUS_SUCCESS*/, child.dwProcessId);
                 // Keep child.hProcess open: the recursive Channel
                 // holds it for future dup_to_target calls (great-
@@ -466,6 +475,94 @@ fn broker_spawn(ctx: &SpawnCtx, cmdline: &str) -> Result<PROCESS_INFORMATION> {
             .context("AssignProcessToJobObject(brokered)")?;
         let _ = ctx.ac_sid; // kept for future SECURITY_CAPABILITIES use
         Ok(pi)
+    }
+}
+
+/// Populate the caller's `PS_CREATE_INFO` (arg10) and the
+/// `PS_ATTRIBUTE_CLIENT_ID` / `PS_ATTRIBUTE_IMAGE_INFO` entries in
+/// `PS_ATTRIBUTE_LIST` (arg11) so `CreateProcessInternalW`'s
+/// post-`NtCreateUserProcess` path sees a coherent success state.
+fn fill_create_outparams(
+    target: HANDLE,
+    req: &ipc::Wire,
+    child: &PROCESS_INFORMATION,
+    target_hproc: u64,
+    target_hthread: u64,
+) -> Result<()> {
+    let _ = (target_hproc, target_hthread);
+    // ── PS_CREATE_INFO @ args[9]
+    // Layout (x64): Size:u64 @0x00, State:u32 @0x08, then a union.
+    // For State=PsCreateSuccess(6), SuccessState starts @0x10:
+    //   OutputFlags:u32 @0x10, FileHandle @0x18, SectionHandle @0x20,
+    //   UserProcessParametersNative @0x28, ... PebAddressNative @0x38.
+    let ci = req.args[9] as usize;
+    if ci != 0 {
+        // Get the new process's PEB so kernel32 can read it.
+        let peb = remote_peb(child.hProcess).unwrap_or(0);
+        interception::write_remote::<u32>(target, ci + 0x08, &6)?;            // State = PsCreateSuccess
+        interception::write_remote::<u32>(target, ci + 0x10, &0)?;            // OutputFlags = 0
+        interception::write_remote::<u64>(target, ci + 0x18, &0)?;            // FileHandle = NULL
+        interception::write_remote::<u64>(target, ci + 0x20, &0)?;            // SectionHandle = NULL
+        interception::write_remote::<u64>(target, ci + 0x28, &0)?;            // UserProcessParametersNative
+        interception::write_remote::<u64>(target, ci + 0x38, &(peb as u64))?; // PebAddressNative
+        interception::write_remote::<u64>(target, ci + 0x48, &0)?;            // ManifestAddress
+        interception::write_remote::<u32>(target, ci + 0x50, &0)?;            // ManifestSize
+    }
+    // ── PS_ATTRIBUTE_LIST @ args[10]
+    // { TotalLength:u64; Attributes[]: { Attr:u64, Size:u64, ValuePtr:u64, ReturnLength:*u64 } }
+    let al = req.args[10] as usize;
+    if al != 0 {
+        let total: u64 = interception::read_remote(target, al)?;
+        let mut off = 8usize;
+        while off + 0x20 <= total as usize {
+            let attr: u64 = interception::read_remote(target, al + off)?;
+            let size: u64 = interception::read_remote(target, al + off + 8)?;
+            let valp: u64 = interception::read_remote(target, al + off + 16)?;
+            let attr_num = (attr & 0xFFFF) as u32;
+            match attr_num {
+                // PsAttributeClientId = 3 → CLIENT_ID { pid, tid }
+                3 if valp != 0 && size >= 16 => {
+                    interception::write_remote::<u64>(target, valp as usize,
+                        &(child.dwProcessId as u64))?;
+                    interception::write_remote::<u64>(target, valp as usize + 8,
+                        &(child.dwThreadId as u64))?;
+                }
+                // PsAttributeImageInfo = 6 → SECTION_IMAGE_INFORMATION
+                // (~0x40 bytes). Zero it; CreateProcessInternalW reads
+                // SubSystemType/Machine but zero is tolerated for
+                // console apps.
+                6 if valp != 0 && size > 0 => {
+                    let zeros = vec![0u8; size.min(0x80) as usize];
+                    let mut n = 0usize;
+                    unsafe {
+                        let _ = windows::Win32::System::Diagnostics::Debug::WriteProcessMemory(
+                            target, valp as *const c_void,
+                            zeros.as_ptr() as *const c_void,
+                            zeros.len(), Some(&mut n),
+                        );
+                    }
+                }
+                _ => {}
+            }
+            off += 0x20;
+        }
+    }
+    Ok(())
+}
+
+fn remote_peb(proc: HANDLE) -> Result<usize> {
+    use windows::Wdk::System::Threading::{NtQueryInformationProcess, PROCESSINFOCLASS};
+    use windows::Win32::System::Threading::PROCESS_BASIC_INFORMATION;
+    unsafe {
+        let mut pbi: PROCESS_BASIC_INFORMATION = zeroed();
+        let mut len = 0u32;
+        let st = NtQueryInformationProcess(
+            proc, PROCESSINFOCLASS(0),
+            &mut pbi as *mut _ as *mut c_void,
+            size_of::<PROCESS_BASIC_INFORMATION>() as u32, &mut len,
+        );
+        anyhow::ensure!(st.0 >= 0, "NtQueryInformationProcess: {:#x}", st.0);
+        Ok(pbi.PebBaseAddress as usize)
     }
 }
 
