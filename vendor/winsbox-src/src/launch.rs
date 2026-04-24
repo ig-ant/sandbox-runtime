@@ -16,7 +16,7 @@ use windows::Win32::System::Threading::{
     PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTUPINFOEXW, STARTUPINFOW,
 };
 
-use crate::acl::{AclJournal, MODIFY, READ_EXECUTE};
+use crate::acl::{AclJournal, FULL, MODIFY, READ_EXECUTE};
 use crate::appcontainer::AppContainer;
 use crate::desktop::AltDesktop;
 use crate::job::Job;
@@ -83,28 +83,24 @@ fn run_appcontainer(pol: &Policy) -> Result<u32> {
     } else { None };
     let mut acls = AclJournal::default();
 
-    // The AC needs to read+execute this binary (for the inside relay)
-    // and the directories of whatever the user's command will load.
+    // The AC needs to read+execute this binary (for the inside relay).
     let self_exe = std::env::current_exe()?;
-    acls.grant(self_exe.to_str().unwrap(), ac.sid, &ac.sid_string, READ_EXECUTE)?;
+    acls.grant(self_exe.to_str().unwrap(), &ac.sid_string, READ_EXECUTE)?;
     if let Some(dir) = self_exe.parent() {
-        acls.grant(dir.to_str().unwrap(), ac.sid, &ac.sid_string, READ_EXECUTE).ok();
+        if let Err(e) = acls.grant(dir.to_str().unwrap(), &ac.sid_string, READ_EXECUTE) {
+            log!("ACL grant self-dir: {e:#}");
+        }
     }
 
-    // Filesystem policy → ACEs. Deny first so the explicit deny ACE is
-    // already on the object when the allow propagation reaches it
-    // (SetEntriesInAclW merges, keeping deny ahead of allow).
-    let mut acl_op = |op: &str, p: &str, mask: u32, deny: bool| {
-        let r = if deny { acls.deny(p, ac.sid, &ac.sid_string, mask) }
-                else    { acls.grant(p, ac.sid, &ac.sid_string, mask) };
+    // Filesystem policy → ACEs. Allow first (icacls /grant), then
+    // /deny on the deny paths — icacls always orders explicit deny
+    // before allow on the same object, and deny ACEs are evaluated
+    // first regardless.
+    let mut acl_op = |op: &str, p: &str, perm: &str, deny: bool| {
+        let r = if deny { acls.deny(p, &ac.sid_string, perm) }
+                else    { acls.grant(p, &ac.sid_string, perm) };
         if let Err(e) = r { log!("ACL {op} {p}: {e:#}"); }
     };
-    for p in &pol.deny_read {
-        if std::path::Path::new(p).exists() { acl_op("deny-read", p, 0x1F01FF /*FILE_ALL_ACCESS*/, true); }
-    }
-    for p in &pol.deny_write {
-        if std::path::Path::new(p).exists() { acl_op("deny-write", p, MODIFY, true); }
-    }
     for p in &pol.allow_read {
         if std::path::Path::new(p).exists() { acl_op("allow-read", p, READ_EXECUTE, false); }
     }
@@ -112,11 +108,12 @@ fn run_appcontainer(pol: &Policy) -> Result<u32> {
         std::fs::create_dir_all(p).ok();
         acl_op("allow-write", p, MODIFY, false);
     }
-    // Re-apply denies after allow propagation so the explicit deny
-    // ACE definitely sits ahead of any inherited allow on the object.
+    for p in &pol.deny_write {
+        if std::path::Path::new(p).exists() { acl_op("deny-write", p, MODIFY, true); }
+    }
     for p in &pol.deny_read {
         if std::path::Path::new(p).exists() {
-            acl_op("deny-read-2", p, 0x1F01FF, true);
+            acl_op("deny-read", p, FULL, true);
             log!("icacls {p}:\n{}", crate::acl::dump(p).trim_end());
         }
     }
@@ -325,7 +322,7 @@ fn setup_bridge(
 ) -> Result<(PROCESS_INFORMATION, Vec<u16>)> {
     let (sock_dir, needs_acl) = netbridge::socket_dir(&ac.folder);
     if needs_acl {
-        acls.grant(sock_dir.to_str().unwrap(), ac.sid, &ac.sid_string, MODIFY)?;
+        acls.grant(sock_dir.to_str().unwrap(), &ac.sid_string, MODIFY)?;
     }
     let http_sock = sock_dir.join("h.sock");
     let socks_sock = sock_dir.join("s.sock");
