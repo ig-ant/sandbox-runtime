@@ -121,12 +121,20 @@ pub fn make_initial(base: HANDLE, il_rid: u32) -> Result<HANDLE> {
         ).context("CreateRestrictedToken(initial)")?;
         set_il(restricted, il_rid)?;
 
+        // Return the PRIMARY restricted token; the caller lowbox-wraps
+        // it (NtCreateLowBoxToken needs a primary input) and then dups
+        // the lowbox result to impersonation for SetThreadToken.
+        Ok(restricted)
+    }
+}
+
+pub fn to_impersonation(token: HANDLE) -> Result<HANDLE> {
+    unsafe {
         let mut out = HANDLE::default();
         DuplicateTokenEx(
-            restricted, TOKEN_ALL_ACCESS, None,
+            token, TOKEN_ALL_ACCESS, None,
             SecurityImpersonation, TokenImpersonation, &mut out,
-        ).context("DuplicateTokenEx(initial)")?;
-        let _ = CloseHandle(restricted);
+        ).context("DuplicateTokenEx(impersonation)")?;
         Ok(out)
     }
 }

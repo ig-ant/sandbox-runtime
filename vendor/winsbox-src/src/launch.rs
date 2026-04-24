@@ -91,17 +91,17 @@ fn build_broker_tokens(ac: &AppContainer) -> Result<BrokerTokens> {
     let initial_r = token::make_initial(base, il)?;
     unsafe { let _ = CloseHandle(base); }
 
+    // NtCreateLowBoxToken needs a primary input and yields a primary;
+    // dup the initial-side result to impersonation for SetThreadToken.
     let lock_lb = token::make_lowbox(lockdown, ac.sid)?;
     let init_lb = token::make_lowbox(initial_r, ac.sid)?;
     unsafe { let _ = CloseHandle(lockdown); let _ = CloseHandle(initial_r); }
 
     let primary = token::to_primary(lock_lb)?;
-    // The initial token must be an impersonation token; lowbox-wrap
-    // produced one of the same type as its input (impersonation), so
-    // use it directly.
-    unsafe { let _ = CloseHandle(lock_lb); }
-    log!("broker tokens built (lockdown+lowbox primary, USER_RESTRICTED_SAME_ACCESS+lowbox initial, IL=Low)");
-    Ok(BrokerTokens { primary, initial: init_lb })
+    let initial = token::to_impersonation(init_lb)?;
+    unsafe { let _ = CloseHandle(lock_lb); let _ = CloseHandle(init_lb); }
+    log!("broker tokens built (lockdown+lowbox primary, USER_RESTRICTED_SAME_ACCESS+lowbox impersonation, IL=Low)");
+    Ok(BrokerTokens { primary, initial })
 }
 
 fn run_confined(pol: &Policy) -> Result<u32> {
