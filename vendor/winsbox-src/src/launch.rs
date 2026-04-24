@@ -325,7 +325,7 @@ fn run_confined(pol: &Policy) -> Result<u32> {
         fs: crate::policy_engine::FsPolicy::from_policy(pol),
         hook_fs: pol.broker_fs,
         trace: std::env::var("SBOX_TRACE").is_ok(),
-        lockdown: token::spec_from_env().0.keep_enabled.is_empty(),
+        lockdown: std::env::var("WINSBOX_TOKEN").as_deref() == Ok("lockdown"),
         threads: Mutex::new(Vec::new()),
     }));
     if let Some(ctx) = ctx.as_ref() {

@@ -100,10 +100,22 @@ pub fn spec_from_env() -> (LockdownSpec, u32) {
             _ => IL_LOW,
         },
     };
-    match std::env::var("WINSBOX_TOKEN").as_deref() {
-        Ok("lockdown") => (USER_LOCKDOWN, il),
-        _ => (USER_LIMITED, il),
+    let mut spec = match std::env::var("WINSBOX_TOKEN").as_deref() {
+        Ok("lockdown") => USER_LOCKDOWN,
+        _ => USER_LIMITED,
+    };
+    // WINSBOX_KEEP=<sid>[,<sid>...] overrides keep_enabled —
+    // bisects which deny-only group is what WFP's
+    // intra-AC-loopback check keys on. Leaks the Vec; runs
+    // once per process.
+    if let Ok(k) = std::env::var("WINSBOX_KEEP") {
+        let v: Vec<&'static str> = k.split(',')
+            .map(|s| Box::leak(s.trim().to_string().into_boxed_str()) as &str)
+            .filter(|s| !s.is_empty())
+            .collect();
+        spec.keep_enabled = Box::leak(v.into_boxed_slice());
     }
+    (spec, il)
 }
 
 #[link(name = "ntdll")]
