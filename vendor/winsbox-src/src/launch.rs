@@ -429,7 +429,7 @@ fn serve_ipc(ch: ipc::Channel, target_raw: isize, ctx: Arc<SpawnCtx>) {
                 // after NtCreateUserProcess returns; populate them so
                 // it doesn't fail post-processing.
                 if let Err(e) = fill_create_outparams(
-                    target, &req, &child, p, t,
+                    &ch, target, &req, &child, p, t,
                 ) {
                     eprintln!("[sbox-exec] ipc: fill outparams: {e:#}");
                 }
@@ -487,6 +487,7 @@ fn broker_spawn(ctx: &SpawnCtx, cmdline: &str) -> Result<PROCESS_INFORMATION> {
 /// `PS_ATTRIBUTE_LIST` (arg11) so `CreateProcessInternalW`'s
 /// post-`NtCreateUserProcess` path sees a coherent success state.
 fn fill_create_outparams(
+    ch: &ipc::Channel,
     target: HANDLE,
     req: &ipc::Wire,
     child: &PROCESS_INFORMATION,
@@ -498,17 +499,41 @@ fn fill_create_outparams(
     // Layout (x64): Size:u64 @0x00, State:u32 @0x08, then a union.
     // For State=PsCreateSuccess(6), SuccessState starts @0x10:
     //   OutputFlags:u32 @0x10, FileHandle @0x18, SectionHandle @0x20,
-    //   UserProcessParametersNative @0x28, ... PebAddressNative @0x38.
+    //   UserProcessParametersNative @0x28, UserProcessParametersWow64 @0x30,
+    //   CurrentParameterFlags @0x34, PebAddressNative @0x38,
+    //   PebAddressWow64 @0x40, ManifestAddress @0x48, ManifestSize @0x50.
     let ci = req.args[9] as usize;
     if ci != 0 {
-        // Get the new process's PEB so kernel32 can read it.
         let peb = remote_peb(child.hProcess).unwrap_or(0);
+        // PEB+0x20 = ProcessParameters; PEB+0x20+0x08 = its Flags.
+        let upp: u64 = if peb != 0 {
+            interception::read_remote(child.hProcess, peb + 0x20).unwrap_or(0)
+        } else { 0 };
+        let upp_flags: u32 = if upp != 0 {
+            interception::read_remote(child.hProcess, upp as usize + 0x08).unwrap_or(0)
+        } else { 0 };
+        // Reopen the child's image file + SEC_IMAGE section so the
+        // caller's CreateProcessInternalW can run AppCompat / Safer
+        // checks (BasepCheckWinSaferRestrictions reads FileHandle)
+        // and close them on the success path.
+        let (t_file, t_sect) = open_child_image(ch, child.hProcess)
+            .unwrap_or_else(|e| {
+                eprintln!("[sbox-exec] ipc: open_child_image: {e:#}");
+                (0, 0)
+            });
+        eprintln!(
+            "[sbox-exec] ipc: ci peb={:#x} upp={:#x} flags={:#x} file={:#x} sect={:#x}",
+            peb, upp, upp_flags, t_file, t_sect,
+        );
         interception::write_remote::<u32>(target, ci + 0x08, &6)?;            // State = PsCreateSuccess
         interception::write_remote::<u32>(target, ci + 0x10, &0)?;            // OutputFlags = 0
-        interception::write_remote::<u64>(target, ci + 0x18, &0)?;            // FileHandle = NULL
-        interception::write_remote::<u64>(target, ci + 0x20, &0)?;            // SectionHandle = NULL
-        interception::write_remote::<u64>(target, ci + 0x28, &0)?;            // UserProcessParametersNative
+        interception::write_remote::<u64>(target, ci + 0x18, &t_file)?;       // FileHandle
+        interception::write_remote::<u64>(target, ci + 0x20, &t_sect)?;       // SectionHandle
+        interception::write_remote::<u64>(target, ci + 0x28, &upp)?;          // UserProcessParametersNative
+        interception::write_remote::<u32>(target, ci + 0x30, &0)?;            // UserProcessParametersWow64
+        interception::write_remote::<u32>(target, ci + 0x34, &upp_flags)?;    // CurrentParameterFlags
         interception::write_remote::<u64>(target, ci + 0x38, &(peb as u64))?; // PebAddressNative
+        interception::write_remote::<u32>(target, ci + 0x40, &0)?;            // PebAddressWow64
         interception::write_remote::<u64>(target, ci + 0x48, &0)?;            // ManifestAddress
         interception::write_remote::<u32>(target, ci + 0x50, &0)?;            // ManifestSize
     }
@@ -595,6 +620,63 @@ fn query_image_info(proc: HANDLE) -> Result<[u8; 0x40]> {
         anyhow::ensure!(st.0 >= 0,
             "NtQueryInformationProcess(ProcessImageInformation): {:#x}", st.0);
         Ok(buf)
+    }
+}
+
+/// Reopen `child`'s image file + SEC_IMAGE section, duplicate both
+/// into the requesting process via `ch`, and return the *target-side*
+/// handle values for `PS_CREATE_INFO.SuccessState.{FileHandle,SectionHandle}`.
+fn open_child_image(ch: &ipc::Channel, child: HANDLE) -> Result<(u64, u64)> {
+    use windows::Wdk::Foundation::OBJECT_ATTRIBUTES;
+    use windows::Wdk::System::Threading::{NtQueryInformationProcess, PROCESSINFOCLASS};
+    use windows::Win32::Foundation::{NTSTATUS, UNICODE_STRING};
+    use windows::Win32::System::Memory::SEC_IMAGE;
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtOpenFile(h: *mut HANDLE, access: u32, oa: *const OBJECT_ATTRIBUTES,
+            iosb: *mut [usize; 2], share: u32, options: u32) -> NTSTATUS;
+        fn NtCreateSection(h: *mut HANDLE, access: u32,
+            oa: *const OBJECT_ATTRIBUTES, max: *const u64, prot: u32,
+            attrs: u32, file: HANDLE) -> NTSTATUS;
+    }
+    unsafe {
+        // ProcessImageFileName (27) → UNICODE_STRING NT path.
+        let mut buf = vec![0u8; 1024];
+        let mut len = 0u32;
+        let st = NtQueryInformationProcess(
+            child, PROCESSINFOCLASS(27),
+            buf.as_mut_ptr() as *mut c_void, buf.len() as u32, &mut len,
+        );
+        anyhow::ensure!(st.0 >= 0, "NtQueryInformationProcess(ImageFileName): {:#x}", st.0);
+        let us = &*(buf.as_ptr() as *const UNICODE_STRING);
+        let oa = OBJECT_ATTRIBUTES {
+            Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: HANDLE::default(),
+            ObjectName: us as *const _ as *mut _,
+            Attributes: 0x40, // OBJ_CASE_INSENSITIVE
+            SecurityDescriptor: std::ptr::null_mut(),
+            SecurityQualityOfService: std::ptr::null_mut(),
+        };
+        let mut file = HANDLE::default();
+        let mut iosb = [0usize; 2];
+        // SYNCHRONIZE | FILE_READ_DATA | FILE_EXECUTE | FILE_READ_ATTRIBUTES
+        let st = NtOpenFile(&mut file, 0x00100000 | 0x0001 | 0x0020 | 0x0080,
+            &oa, &mut iosb,
+            0x07, /* FILE_SHARE_READ|WRITE|DELETE */
+            0x20  /* FILE_SYNCHRONOUS_IO_NONALERT */);
+        anyhow::ensure!(st.0 >= 0, "NtOpenFile({}): {:#x}",
+            String::from_utf16_lossy(std::slice::from_raw_parts(
+                us.Buffer.0, us.Length as usize / 2)), st.0);
+        let mut sect = HANDLE::default();
+        let st = NtCreateSection(&mut sect, 0x000F001F /* SECTION_ALL_ACCESS */,
+            std::ptr::null(), std::ptr::null(),
+            0x10 /* PAGE_EXECUTE */, SEC_IMAGE.0, file);
+        anyhow::ensure!(st.0 >= 0, "NtCreateSection: {:#x}", st.0);
+        let t_file = ch.dup_to_target(file)?;
+        let t_sect = ch.dup_to_target(sect)?;
+        let _ = CloseHandle(file);
+        let _ = CloseHandle(sect);
+        Ok((t_file, t_sect))
     }
 }
 
