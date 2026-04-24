@@ -50,6 +50,16 @@ pub fn open_self_token() -> Result<HANDLE> {
     }
 }
 
+// TODO(phase-2b): cmd /c <ext.exe> under this primary still fails
+// "Access is denied" even with jobwatch re-impersonation and the
+// default DACL below. ProcMon on a real box is needed to isolate
+// which object/access fails; candidates are conhost ALPC port,
+// BaseNamedObjects, or csrss section. Chromium's recipe additionally
+// (a) creates an alternate-window-station/desktop whose DACL grants
+// the restricted SID, and (b) sets the lowbox token's saved-handle
+// list so the AC directory objects are pre-created — one of those
+// is likely the missing piece.
+
 /// Phase-2a primary token: USER_LIMITED. Deny-only on
 /// admin/elevated groups, keep Users/Everyone/Authenticated Users
 /// (so child processes that inherit this token can still read
