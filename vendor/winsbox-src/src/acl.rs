@@ -44,7 +44,16 @@ impl AclJournal {
         // second-pass access check then finds no grant → denied.
         // Avoids the icacls /deny display ambiguity entirely.
         run_icacls(&[path, "/inheritance:d"])?;
-        for s in [sid_str, "S-1-15-2-1", "S-1-15-2-2" /* ALL RESTRICTED APP PACKAGES */] {
+        // Strip every SID the lowbox/lockdown token could
+        // satisfy on a raw-syscall bypass: AC SIDs (lowbox
+        // normal-check) + Everyone (USER_LOCKDOWN keeps it
+        // enabled for WFP intra-AC loopback) + Users/
+        // AuthUsers (USER_LIMITED keeps them enabled).
+        for s in [
+            sid_str,
+            "S-1-15-2-1", "S-1-15-2-2",      // ALL [RESTRICTED] APP PACKAGES
+            "S-1-1-0", "S-1-5-11", "S-1-5-32-545",
+        ] {
             let _ = run_icacls(&[path, "/remove", &format!("*{s}"), "/T", "/C"]);
         }
         // Journal so revert_all re-enables inheritance.

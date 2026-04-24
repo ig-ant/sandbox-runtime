@@ -77,8 +77,21 @@ pub const USER_LIMITED: LockdownSpec = LockdownSpec {
     keep_enabled: &["S-1-1-0", "S-1-5-11", "S-1-5-32-545"],
     restricting: Restricting::Keep,
 };
+/// WFP's intra-AC-loopback exemption (which lets a lowbox
+/// process connect to a same-AC listener despite no
+/// `internetClient` capability) keys on `Everyone` being
+/// enabled in the connecting token — bisected at 7847a77:
+/// keep_enabled=[Everyone] → curl-http+npm pass (17/0);
+/// [AuthUsers] or [Users] alone → still refused. With
+/// Users/AuthUsers deny-only, raw-syscall bypass can read
+/// only objects whose DACL grants `Everyone` (system
+/// files, `C:\Users\Public`) — user data (`~/.ssh`,
+/// `%APPDATA%`, app installs ACL'd to `Users`) is still
+/// blocked at the *normal*-SID check. `acl::deny()` strips
+/// `Everyone` from denyRead paths so an inherited
+/// `Everyone:R` doesn't leak through.
 pub const USER_LOCKDOWN: LockdownSpec = LockdownSpec {
-    keep_enabled: &[],
+    keep_enabled: &["S-1-1-0"],
     restricting: Restricting::Lockdown,
 };
 

@@ -241,30 +241,8 @@ fn run_confined(pol: &Policy) -> Result<u32> {
         let sp = pol.network.socks_proxy_port;
         match setup_bridge(&ac, &job, desktop.as_ref(), &mut acls, &self_exe, hp, sp) {
             Ok((pi, ports)) => {
-                // Probe: broker (full token) connects to the
-                // relay's port to confirm it's actually
-                // accepting. If this fails, the relay
-                // bound+printed but isn't listening; if it
-                // succeeds and the target's connect later
-                // fails, the issue is in the target's
-                // lockdown-token connect path (WFP/AFD).
-                let mut relay_exit = 0u32;
-                let alive = unsafe {
-                    GetExitCodeProcess(pi.hProcess, &mut relay_exit).is_ok()
-                        && relay_exit == 259 /* STILL_ACTIVE */
-                };
-                let probe = ports.first().and_then(|p|
-                    std::net::TcpStream::connect_timeout(
-                        &format!("127.0.0.1:{p}").parse().unwrap(),
-                        std::time::Duration::from_millis(500),
-                    ).err());
-                log!(
-                    "bridge up: ports={:?} relay-alive={} probe={}",
-                    ports, alive,
-                    match &probe { None => "ok".into(),
-                                   Some(e) => format!("FAIL({e})") },
-                );
                 relay_pi = Some(pi);
+                log!("bridge up: ports={:?}", ports);
                 if let Some(p) = ports.first() {
                     for k in ["HTTP_PROXY","HTTPS_PROXY","http_proxy","https_proxy"] {
                         extra_env.push((k.into(), format!("http://127.0.0.1:{p}")));
