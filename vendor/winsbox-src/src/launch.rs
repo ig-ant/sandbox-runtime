@@ -111,7 +111,7 @@ fn build_broker_tokens(ac: &AppContainer) -> Result<BrokerTokens> {
     // at the same IL and lowbox-wrapped or SeTokenCanImpersonate
     // downgrades the impersonation to Identification (PoC P5).
     let il = token::IL_LOW;
-    let lockdown = token::make_lockdown(base, il)?;
+    let lockdown = token::make_lockdown(base, il, ac.sid)?;
     let initial_r = token::make_initial(base, il)?;
     unsafe { let _ = CloseHandle(base); }
 
