@@ -651,12 +651,20 @@ fn broker_open(
         let mut iosb = [0usize; 2];
         let access = req.args[1] as u32;
         let st = if req.op == ipc::OP_NTCREATEFILE {
+            // FILE_CONTAINS_EXTENDED_CREATE_INFORMATION (0x10000000,
+            // Win11 22H2+) means EaBuffer carries an
+            // EXTENDED_CREATE_INFORMATION struct; CopyFile2 sets
+            // it. Stripping EaBuffer while leaving the flag set →
+            // STATUS_INVALID_PARAMETER. Strip the flag too.
+            const FILE_CONTAINS_EXTENDED_CREATE_INFORMATION: u32 = 0x10000000;
+            let opts = req.args[8] as u32
+                & !FILE_CONTAINS_EXTENDED_CREATE_INFORMATION;
             NtCreateFile(&mut h, access, &oa, &mut iosb,
                 std::ptr::null(),               // AllocationSize: ignore
                 req.args[5] as u32,             // FileAttributes
                 req.args[6] as u32,             // ShareAccess
                 req.args[7] as u32,             // CreateDisposition
-                req.args[8] as u32,             // CreateOptions
+                opts,                           // CreateOptions
                 std::ptr::null(), 0)            // EaBuffer/Length: drop
         } else {
             NtOpenFile(&mut h, access, &oa, &mut iosb,
