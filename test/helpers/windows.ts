@@ -65,9 +65,12 @@ export async function makeFixture(): Promise<Fixture> {
         process.env['ProgramFiles'] || 'C:\\Program Files',
         process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)',
         process.env['ProgramData'] || 'C:\\ProgramData',
+        // GH runner installs node/python/etc. under the tool cache.
+        process.env['RUNNER_TOOL_CACHE'] || 'C:\\hostedtoolcache',
+        process.env['SystemRoot'] || 'C:\\Windows',
         allowWrite,
         base,
-      ],
+      ].filter(p => p),
       denyRead: [denyRead],
       allowWrite: [allowWrite],
       denyWrite: [],

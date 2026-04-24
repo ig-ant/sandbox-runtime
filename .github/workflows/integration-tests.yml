@@ -50,10 +50,10 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
-          # Pin 1.3.1 on macOS/Linux for reproducibility; use latest on
-          # Windows where 1.3.1 lacks native arm64 builds and crashes
-          # under emulation.
-          bun-version: ${{ matrix.os == 'windows' && 'latest' || '1.3.1' }}
+          # 1.3.1 lacks native win-arm64 builds; 1.3.13 has them. Keep
+          # macOS/Linux on 1.3.1 to match the existing pin until that's
+          # bumped repo-wide.
+          bun-version: ${{ matrix.os == 'windows' && '1.3.13' || '1.3.1' }}
 
       - name: Install system dependencies (Linux)
         if: matrix.os == 'linux'
@@ -120,10 +120,7 @@ jobs:
         if: matrix.os == 'windows'
         run: bun test --timeout 60000 test/sandbox/windows.test.ts
         env:
-          WINSBOX_PHASE: stub
-        # arm64 runs bun under x64 emulation and is flaky; treat as
-        # advisory until bun ships native win-arm64.
-        continue-on-error: ${{ matrix.arch == 'arm64' }}
+          WINSBOX_PHASE: '1'
 
       - name: Run Node.js fallback tests
         if: matrix.os != 'windows'

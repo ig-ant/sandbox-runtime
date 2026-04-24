@@ -1,6 +1,11 @@
 mod policy;
-#[cfg(windows)]
-mod launch;
+#[cfg(windows)] mod util;
+#[cfg(windows)] mod appcontainer;
+#[cfg(windows)] mod acl;
+#[cfg(windows)] mod job;
+#[cfg(windows)] mod desktop;
+#[cfg(windows)] mod netbridge;
+#[cfg(windows)] mod launch;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -9,15 +14,17 @@ use std::io::Read;
 #[derive(Parser)]
 #[command(name = "sbox-exec", version)]
 struct Cli {
-    /// Path to a JSON policy file.
     #[arg(long, conflicts_with = "policy_stdin")]
     policy: Option<std::path::PathBuf>,
-    /// Read JSON policy from stdin.
     #[arg(long)]
     policy_stdin: bool,
-    /// Revert any leaked per-instance state (no-op in stub mode).
+    /// Revert any leaked per-instance ACL grants.
     #[arg(long)]
     cleanup: bool,
+    /// Internal: run as the inside-AC TCP→AF_UNIX relay. Args are the
+    /// AF_UNIX socket paths (http, then optional socks).
+    #[arg(long, num_args = 1..=2)]
+    relay_inside: Vec<String>,
 }
 
 fn load_policy(cli: &Cli) -> Result<policy::Policy> {
@@ -36,8 +43,12 @@ fn load_policy(cli: &Cli) -> Result<policy::Policy> {
 #[cfg(windows)]
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if !cli.relay_inside.is_empty() {
+        return netbridge::run_inside_relay(&cli.relay_inside);
+    }
     if cli.cleanup {
-        // Phase 0.5: nothing persistent to revert. Phase 1 wires acl::revert_all here.
+        // Phase 1: ACLs are reverted by the broker on exit; a separate
+        // crash-recovery journal is a Phase-1 follow-up.
         return Ok(());
     }
     let pol = load_policy(&cli)?;
@@ -47,7 +58,6 @@ fn main() -> Result<()> {
 
 #[cfg(not(windows))]
 fn main() {
-    // Allow `cargo check` on non-Windows dev hosts.
     let _ = Cli::parse();
     eprintln!("sbox-exec: Windows only");
     std::process::exit(2);
