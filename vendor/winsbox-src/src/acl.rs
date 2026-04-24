@@ -25,20 +25,27 @@ impl AclJournal {
         self.entries.push((path.to_string(), sid_str.to_string()));
         Ok(())
     }
-    pub fn deny(&mut self, path: &str, sid_str: &str, perm: &str) -> Result<()> {
-        // Deny both the package SID and ALL APPLICATION PACKAGES
-        // (S-1-15-2-1) — the AC token carries both. (OI)(CI) so new
-        // children inherit; /T to also stamp existing children.
-        let inh = if std::path::Path::new(path).is_dir() { "(OI)(CI)" } else { "" };
-        for s in [sid_str, "S-1-15-2-1"] {
-            run_icacls(&[path, "/deny", &format!("*{s}:{inh}{perm}"), "/T", "/C"])?;
-            self.entries.push((path.to_string(), s.to_string()));
+    pub fn deny(&mut self, path: &str, sid_str: &str, _perm: &str) -> Result<()> {
+        // Break inheritance (copying existing ACEs as explicit) so the
+        // allow-RX inherited from the allowRead parent stops flowing
+        // here, then strip every AppContainer-related ACE. The AC's
+        // second-pass access check then finds no grant → denied.
+        // Avoids the icacls /deny display ambiguity entirely.
+        run_icacls(&[path, "/inheritance:d"])?;
+        for s in [sid_str, "S-1-15-2-1", "S-1-15-2-2" /* ALL RESTRICTED APP PACKAGES */] {
+            let _ = run_icacls(&[path, "/remove", &format!("*{s}"), "/T", "/C"]);
         }
+        // Journal so revert_all re-enables inheritance.
+        self.entries.push((path.to_string(), format!("inheritance:{sid_str}")));
         Ok(())
     }
     pub fn revert_all(&mut self) {
         for (path, sid_str) in self.entries.drain(..) {
-            let _ = run_icacls(&[&path, "/remove", &format!("*{sid_str}"), "/T", "/C"]);
+            if let Some(_) = sid_str.strip_prefix("inheritance:") {
+                let _ = run_icacls(&[&path, "/inheritance:e"]);
+            } else {
+                let _ = run_icacls(&[&path, "/remove", &format!("*{sid_str}"), "/T", "/C"]);
+            }
         }
     }
 }
