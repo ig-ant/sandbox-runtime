@@ -53,15 +53,27 @@ impl FsPolicy {
     /// `nt_path` is the broker-side path string as read from the
     /// caller's `OBJECT_ATTRIBUTES.ObjectName` (already UTF-16→UTF-8).
     pub fn evaluate(&self, nt_path: &str, desired_access: u32) -> Decision {
-        // Anything that isn't a `\??\<drive>:\…` filesystem
-        // path — devices, pipes, UNC, object directories — is
-        // passed through to the target's own syscall. The
+        // DOS device aliases: lowbox can't open \Device\Null
+        // etc. without an ALL APPLICATION PACKAGES ACE, so
+        // passthrough fails; broker opens these (no policy —
+        // they're not filesystem objects).
+        let lower = canon_dos(nt_path);
+        if let Some(rest) = lower.strip_prefix(r"\??\") {
+            if matches!(rest,
+                "nul" | "con" | "conin$" | "conout$" | "aux" | "prn"
+            ) {
+                return Decision::Allow;
+            }
+        }
+        // Anything else that isn't a `\??\<drive>:\…`
+        // filesystem path — \Device\*, pipes, UNC, object dirs
+        // — is passed through to the target's own syscall. The
         // lockdown+lowbox token is the boundary there (AFD
         // checks network capability at IOCTL time, named-pipe
         // servers' DACLs are checked against the lockdown,
         // PhysicalDrive needs admin). The broker only mediates
         // filesystem paths, where it is *granting* access the
-        // lockdown token doesn't have and so must apply policy.
+        // lockdown doesn't have and so must apply policy.
         let dos = match nt_to_dos(nt_path) {
             Some(d) => d,
             None => return Decision::AllowAsTarget,

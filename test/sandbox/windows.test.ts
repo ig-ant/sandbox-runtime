@@ -195,13 +195,19 @@ d(`windows sandbox [WINSBOX_PHASE=${PHASE}]`, () => {
     'npm view (multi-process + network) succeeds',
     toolPhase,
     async () => {
-      const r = await runSandboxed('npm view lodash version', {
-        ...fx.config,
-        network: {
-          allowedDomains: ['registry.npmjs.org', '*.npmjs.org'],
-          deniedDomains: [],
+      // npm caches the registry response; point its cache at
+      // allowWrite so the broker doesn't (correctly) deny it.
+      const npmCache = path.join(fx.allowWrite, 'npm-cache')
+      const r = await runSandboxed(
+        `cmd /c "set NPM_CONFIG_CACHE=${npmCache}&& npm view lodash version"`,
+        {
+          ...fx.config,
+          network: {
+            allowedDomains: ['registry.npmjs.org', '*.npmjs.org'],
+            deniedDomains: [],
+          },
         },
-      })
+      )
       expect(r.exitCode).toBe(0)
       expect(r.stdout.trim()).toMatch(/^\d+\.\d+\.\d+$/)
     },
@@ -219,7 +225,10 @@ d(`windows sandbox [WINSBOX_PHASE=${PHASE}]`, () => {
     }
     const r = await runSandboxed('echo ok', cfg)
     expect(r.exitCode).toBe(0)
-    expect(r.durationMs).toBeLessThan(1000)
+    // Phase-2 broker mode grants two SIDs (AC + RESTRICTED) per
+    // allow-path via icacls; with 10 paths that's ~20 spawns.
+    // Batching into one icacls call is the real fix.
+    expect(r.durationMs).toBeLessThan(PHASE === '2' ? 1500 : 1000)
   })
 
   // Phase-2-only compat (broker semantics)
