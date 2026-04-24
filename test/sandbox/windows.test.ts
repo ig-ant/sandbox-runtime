@@ -81,8 +81,10 @@ d(`windows sandbox [WINSBOX_PHASE=${PHASE}]`, () => {
   // this branch). Until then, skip under both confined modes.
   const needsBrokerFs = PHASE !== 'stub'
   const toolPhase: Phase = needsBrokerFs ? '2' : 'stub'
-  // Mark interception-dependent since:'2' tests as TODO until 2b.
-  const BROKER_FS_LANDED = false
+  // NtCreateFile/NtOpenFile are now hooked and brokered through
+  // policy_engine.rs (default-allow read, deny write outside
+  // allowWrite, deny under denyRead).
+  const BROKER_FS_LANDED = true
   // In Phase-2a (restricted token, no NtCreateUserProcess hook),
   // any command that spawns a subprocess via cmd.exe inherits the
   // lockdown primary without re-impersonation and fails. Tests that

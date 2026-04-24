@@ -41,11 +41,47 @@ impl FsPolicy {
     /// `nt_path` is the broker-side path string as read from the
     /// caller's `OBJECT_ATTRIBUTES.ObjectName` (already UTF-16→UTF-8).
     pub fn evaluate(&self, nt_path: &str, desired_access: u32) -> Decision {
-        let dos = nt_to_dos(nt_path);
-        // v1: deny non-DOS namespaces outright (UNC, device, pipe).
-        // The Phase-2 hardening pass replaces this with the
-        // open-then-final-path check.
-        let dos = match dos {
+        let lower = canon_dos(nt_path);
+        // Non-filesystem device endpoints whose driver enforces
+        // its own per-IOCTL access check against the *caller*'s
+        // token (so brokering the open doesn't widen the
+        // boundary): AFD's connect/bind checks the lowbox
+        // network capability; ConDrv attaches to the caller's
+        // conhost. Everything else under \Device\ is denied —
+        // brokering a named-pipe or PhysicalDrive open with the
+        // broker's full token would be a straight escape. The
+        // follow-up is a "try original syscall first" stub so
+        // device opens the lockdown token can already do never
+        // reach the broker.
+        if let Some(dev) = lower.strip_prefix(r"\device\") {
+            return if dev.starts_with("afd\\")
+                || dev == "afd"
+                || dev.starts_with("condrv\\")
+                || dev == "condrv"
+                || dev == "null"
+                || dev.starts_with("deviceapi\\")
+            {
+                Decision::Allow
+            } else {
+                Decision::Deny("device namespace")
+            };
+        }
+        if let Some(rest) = lower.strip_prefix(r"\??\") {
+            if matches!(rest,
+                "nul" | "con" | "conin$" | "conout$" | "aux" | "prn"
+            ) {
+                return Decision::Allow;
+            }
+            if rest.starts_with("pipe\\") || rest.starts_with("unc\\") {
+                return Decision::Deny("pipe/UNC");
+            }
+            if rest.starts_with("mountpointmanager")
+                || rest.starts_with("nsi")
+            {
+                return Decision::Allow;
+            }
+        }
+        let dos = match nt_to_dos(nt_path) {
             Some(d) => d,
             None => return Decision::Deny("non-DOS namespace"),
         };
