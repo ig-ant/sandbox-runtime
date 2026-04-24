@@ -276,13 +276,24 @@ fn spawn_in_ac(
         let mut pi: PROCESS_INFORMATION = zeroed();
         match tokens {
             Some(t) => {
+                // The lowbox primary already encodes the AppContainer
+                // SID, so DON'T also set SECURITY_CAPABILITIES — doing
+                // both makes children inherit a token whose AC doesn't
+                // match the proc-thread attribute and CreateProcess
+                // for grandchildren fails ERROR_ACCESS_DENIED.
+                let mut si_plain: STARTUPINFOW = zeroed();
+                si_plain.cb = size_of::<STARTUPINFOW>() as u32;
+                if let Some(d) = desktop {
+                    let dw = wstr(&d.qualified_name());
+                    si_plain.lpDesktop = PWSTR(dw.as_ptr() as *mut u16);
+                    std::mem::forget(dw);
+                }
                 CreateProcessAsUserW(
                     t.primary, None, PWSTR(cmd.as_mut_ptr()), None, None, true,
-                    flags, Some(envb.as_mut_ptr() as *mut c_void), cwd_p,
-                    &si.StartupInfo, &mut pi,
+                    CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
+                    Some(envb.as_mut_ptr() as *mut c_void), cwd_p,
+                    &si_plain, &mut pi,
                 ).with_context(|| format!("CreateProcessAsUserW(broker, {command_line})"))?;
-                // Initial impersonation on the main thread so the
-                // loader can read DLLs under the lockdown primary.
                 if let Err(e) = SetThreadToken(Some(&pi.hThread), t.initial) {
                     log!("SetThreadToken(initial) failed: {e}; loader may fail under lockdown");
                 }
@@ -296,6 +307,7 @@ fn spawn_in_ac(
             }
         }
         DeleteProcThreadAttributeList(attrs);
+        let _ = &caps;
 
         job.assign(pi.hProcess)?;
         ResumeThread(pi.hThread);
