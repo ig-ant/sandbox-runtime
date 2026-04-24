@@ -76,6 +76,36 @@ pub fn install_fs(target: HANDLE, a: &StubAddrs) -> Result<()> {
     Ok(())
 }
 
+/// Patch `ntdll!{NtOpenKey,NtOpenKeyEx}` in `target`. Installed
+/// alongside the FS hooks (pre-resume) so post-`RevertToSelf`
+/// registry reads work under USER_LOCKDOWN — `BCryptGenRandom`'s
+/// lazy init reads `HKLM\…\Cryptography\Configuration` and
+/// `WSAStartup` reads `HKLM\…\WinSock2\Parameters`; both fail
+/// under NULL restricting otherwise. v1: default-allow-read,
+/// deny any write bit. `NtCreateKey` is left unhooked — it
+/// fails under the lockdown token, which is the desired write
+/// policy.
+#[cfg(target_arch = "x86_64")]
+pub fn install_reg(target: HANDLE, a: &StubAddrs) -> Result<()> {
+    let env = stub_env(a)?;
+    for (name, op, n_args) in [
+        ("NtOpenKey",   crate::ipc::OP_NTOPENKEY,   3usize),
+        ("NtOpenKeyEx", crate::ipc::OP_NTOPENKEYEX, 4usize),
+    ] {
+        let va = ntdll_export(name)?;
+        let mut orig = [0u8; 32];
+        read_remote_bytes(target, va, &mut orig)?;
+        let saved = alloc_remote_rx(target, &orig)?;
+        patch_with_stub(target, name, va,
+                        &emit_handle_stub(&env, op, n_args, saved as u64))?;
+    }
+    Ok(())
+}
+#[cfg(not(target_arch = "x86_64"))]
+pub fn install_reg(_target: HANDLE, _a: &StubAddrs) -> Result<()> {
+    Ok(())
+}
+
 /// Patch `kernelbase!CreateProcessInternalW` in `target`. Must run
 /// after the loader has mapped kernelbase — i.e. after the
 /// entry-trampoline rendezvous.
@@ -258,6 +288,37 @@ fn emit_fs_stub(e: &StubEnv, op: u64, n_args: usize, saved_orig: u64) -> Vec<u8>
     s.extend_from_slice(&[0x48, 0x89, 0x01]);
     s.extend_from_slice(&[0x49, 0x8B, 0x42, 0x70, 0x48, 0x89, 0x41, 0x08]);
     // eax = r_status @ +0x80 (NTSTATUS)
+    s.extend_from_slice(&[0x41, 0x8B, 0x82, 0x80, 0x00, 0x00, 0x00]);
+    emit_lock_release(&mut s);
+    s.push(0xC3);
+    s
+}
+
+/// Stub for syscalls whose only out-param is `*args[0] = HANDLE`
+/// — `NtOpenKey`, `NtOpenKeyEx`, (later) `NtOpenSection`. Same
+/// prologue + passthrough as `emit_fs_stub`; Phase C writes
+/// `r0` to `*args[0]` and returns `r_status`.
+#[cfg(target_arch = "x86_64")]
+fn emit_handle_stub(e: &StubEnv, op: u64, n_args: usize, saved_orig: u64) -> Vec<u8> {
+    let mut s = Vec::<u8>::with_capacity(256);
+    emit_prologue(&mut s, e, op, n_args);
+    // r10 = section.
+    // Passthrough check (identical to emit_fs_stub).
+    s.extend_from_slice(&[0x41, 0x8B, 0x82, 0x80, 0x00, 0x00, 0x00]); // mov eax,[r10+0x80]
+    s.extend_from_slice(&[0x3D]);
+    s.extend_from_slice(&(crate::ipc::FS_PASSTHROUGH as u32).to_le_bytes().as_slice());
+    s.extend_from_slice(&[0x75, 0x27]);                                // jne broker_reply (+39)
+    s.extend_from_slice(&[0x49, 0x8B, 0x4A, 0x08]); // mov rcx,[r10+0x08]
+    s.extend_from_slice(&[0x49, 0x8B, 0x52, 0x10]); // mov rdx,[r10+0x10]
+    s.extend_from_slice(&[0x4D, 0x8B, 0x42, 0x18]); // mov r8, [r10+0x18]
+    s.extend_from_slice(&[0x4D, 0x8B, 0x4A, 0x20]); // mov r9, [r10+0x20]
+    emit_lock_release(&mut s);
+    s.extend_from_slice(&[0x48, 0xB8]); s.extend_from_slice(&saved_orig.to_le_bytes());
+    s.extend_from_slice(&[0xFF, 0xE0]);
+    // broker_reply: rcx = args[0] = PHANDLE @ +0x08; *rcx = r0 @ +0x68
+    s.extend_from_slice(&[0x49, 0x8B, 0x4A, 0x08]);
+    s.extend_from_slice(&[0x49, 0x8B, 0x42, 0x68, 0x48, 0x89, 0x01]);
+    // eax = r_status @ +0x80
     s.extend_from_slice(&[0x41, 0x8B, 0x82, 0x80, 0x00, 0x00, 0x00]);
     emit_lock_release(&mut s);
     s.push(0xC3);

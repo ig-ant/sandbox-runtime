@@ -417,6 +417,7 @@ fn install_broker_hook(
     let sync = crate::entry_trampoline::install(target, thread, suspend_after)?;
     if ctx.hook_fs {
         interception::install_fs(target, &addrs)?;
+        interception::install_reg(target, &addrs)?;
     }
     let target_raw = target.0 as isize;
     let ctx_thread = ctx.clone();
@@ -443,6 +444,8 @@ fn serve_ipc(ch: ipc::Channel, target_raw: isize, ctx: Arc<SpawnCtx>) {
             ipc::OP_CPW => handle_cpw(&ch, target, &req, &ctx),
             ipc::OP_NTCREATEFILE | ipc::OP_NTOPENFILE =>
                 handle_fs(&ch, target, &req, &ctx),
+            ipc::OP_NTOPENKEY | ipc::OP_NTOPENKEYEX =>
+                handle_reg(&ch, target, &req),
             op => {
                 eprintln!("[sbox-exec] ipc: unknown op {op}");
                 ch.reply_fs(0, 0, 0xC0000002u32 as i32 /* STATUS_NOT_IMPLEMENTED */);
@@ -620,6 +623,131 @@ fn broker_open(
             let _ = SetThreadToken(None, None);
         }
         if st.0 < 0 { Err(st.0) } else { Ok((h, iosb[1] as u64)) }
+    }
+}
+
+/// `NtOpenKey` / `NtOpenKeyEx`: args[0]=PHANDLE,
+/// [1]=DesiredAccess, [2]=POBJECT_ATTRIBUTES,
+/// (Ex only) [3]=OpenOptions. v1: default-allow-read; deny any
+/// write bit. The broker dup's the caller's `RootDirectory`
+/// (registry handles can't be path-resolved with
+/// `GetFinalPathNameByHandle`, and default-allow-read needs no
+/// path policy anyway) and re-issues the open relative to it.
+fn handle_reg(ch: &ipc::Channel, target: HANDLE, req: &ipc::Wire) {
+    const REG_WRITE_BITS: u32 =
+        0x0002 /* KEY_SET_VALUE */ |
+        0x0004 /* KEY_CREATE_SUB_KEY */ |
+        0x0020 /* KEY_CREATE_LINK */ |
+        0x00010000 /* DELETE */ |
+        0x00040000 /* WRITE_DAC */ |
+        0x00080000 /* WRITE_OWNER */ |
+        0x40000000 /* GENERIC_WRITE */ |
+        0x10000000 /* GENERIC_ALL */ |
+        0x02000000 /* MAXIMUM_ALLOWED — would resolve to write under broker's token */;
+    let access = req.args[1] as u32;
+    if access & REG_WRITE_BITS != 0 {
+        ch.reply_fs(0, 0, ipc::FS_PASSTHROUGH);
+        return;
+    }
+    let (root_raw, leaf) = match read_target_oa_raw(target, req.args[2] as usize) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[sbox-exec] reg: passthrough ({e:#})");
+            ch.reply_fs(0, 0, ipc::FS_PASSTHROUGH);
+            return;
+        }
+    };
+    let root_h = if root_raw != 0 {
+        match dup_from_target(target, root_raw) {
+            Ok(h) => h,
+            Err(_) => { ch.reply_fs(0, 0, ipc::FS_PASSTHROUGH); return; }
+        }
+    } else { HANDLE::default() };
+    let opts = if req.op == ipc::OP_NTOPENKEYEX { req.args[3] as u32 } else { 0 };
+    let st = broker_open_key(&leaf, root_h, access, opts);
+    if root_raw != 0 { unsafe { let _ = CloseHandle(root_h); } }
+    match st {
+        Ok(h) => {
+            let th = ch.dup_to_target(h).unwrap_or(0);
+            unsafe { let _ = CloseHandle(h); }
+            ch.reply_fs(th, 0, 0);
+        }
+        Err(st) => {
+            if st == 0xC0000022u32 as i32 {
+                eprintln!(
+                    "[sbox-exec] reg: ACCESS_DENIED root={root_raw:#x} leaf={leaf} access={access:#x}",
+                );
+            }
+            ch.reply_fs(0, 0, st);
+        }
+    }
+}
+
+fn broker_open_key(
+    leaf: &str, root: HANDLE, access: u32, opts: u32,
+) -> std::result::Result<HANDLE, i32> {
+    use windows::Wdk::Foundation::OBJECT_ATTRIBUTES;
+    use windows::Win32::Foundation::{NTSTATUS, UNICODE_STRING};
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtOpenKeyEx(h: *mut HANDLE, access: u32,
+            oa: *const OBJECT_ATTRIBUTES, opts: u32) -> NTSTATUS;
+    }
+    unsafe {
+        let mut wleaf = wstr(leaf);
+        if wleaf.last() == Some(&0) { wleaf.pop(); }
+        let us = UNICODE_STRING {
+            Length: (wleaf.len() * 2) as u16,
+            MaximumLength: (wleaf.len() * 2) as u16,
+            Buffer: PWSTR(wleaf.as_mut_ptr()),
+        };
+        let oa = OBJECT_ATTRIBUTES {
+            Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: root,
+            ObjectName: &us as *const _ as *mut _,
+            Attributes: 0x40 /* OBJ_CASE_INSENSITIVE */,
+            SecurityDescriptor: std::ptr::null_mut(),
+            SecurityQualityOfService: std::ptr::null_mut(),
+        };
+        let mut h = HANDLE::default();
+        let st = NtOpenKeyEx(&mut h, access, &oa, opts);
+        if st.0 < 0 { Err(st.0) } else { Ok(h) }
+    }
+}
+
+/// Read `OBJECT_ATTRIBUTES.{RootDirectory, ObjectName}` from
+/// target memory without resolving the root to a path string.
+fn read_target_oa_raw(target: HANDLE, oa_va: usize) -> Result<(u64, String)> {
+    if oa_va == 0 { bail!("null OBJECT_ATTRIBUTES"); }
+    #[repr(C)] #[derive(Clone, Copy)]
+    struct ObjAttrs {
+        length: u32, _pad: u32, root: u64, name: u64,
+        attrs: u32, _pad2: u32, sd: u64, sqos: u64,
+    }
+    #[repr(C)] #[derive(Clone, Copy)]
+    struct UStr { len: u16, max: u16, _pad: u32, buf: u64 }
+    let oa: ObjAttrs = interception::read_remote(target, oa_va)?;
+    let leaf = if oa.name == 0 {
+        String::new()
+    } else {
+        let us: UStr = interception::read_remote(target, oa.name as usize)?;
+        if us.len > 32768 { bail!("ObjectName length {}", us.len); }
+        if us.len == 0 { String::new() }
+        else { interception::read_remote_wstr(target, us.buf as usize, us.len as usize)? }
+    };
+    Ok((oa.root, leaf))
+}
+
+fn dup_from_target(target: HANDLE, raw: u64) -> Result<HANDLE> {
+    use windows::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS};
+    use windows::Win32::System::Threading::GetCurrentProcess;
+    unsafe {
+        let mut h = HANDLE::default();
+        DuplicateHandle(
+            target, HANDLE(raw as *mut c_void),
+            GetCurrentProcess(), &mut h, 0, false, DUPLICATE_SAME_ACCESS,
+        ).context("DuplicateHandle from target")?;
+        Ok(h)
     }
 }
 
