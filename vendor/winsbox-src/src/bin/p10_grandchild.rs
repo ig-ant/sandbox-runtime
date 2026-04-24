@@ -46,48 +46,68 @@ fn main() {
         lowbox_handles: bool,
         ac_acl_on_winsta: bool,
         skip_restricted: bool,
+        /// Lowbox-wrap the initial impersonation token even when
+        /// `use_lowbox` is false. Tests the SECCAPS-asymmetric case:
+        /// SECCAPS lowboxes the *primary* internally, so the initial
+        /// must be lowboxed by hand to satisfy SeTokenCanImpersonate.
+        lowbox_initial: bool,
     }
     const ZERO: PROCESS_CREATION_FLAGS = PROCESS_CREATION_FLAGS(0);
+    const D: Variant = Variant {
+        name: "",
+        use_lowbox: false, use_sec_caps_attr: false, extra_flags: ZERO,
+        lowbox_handles: false, ac_acl_on_winsta: false,
+        skip_restricted: false, lowbox_initial: false,
+    };
+    #[allow(clippy::needless_update)]
     let variants = [
         Variant { name: "baseline (restricted+lowbox, no extras)",
-            use_lowbox: true, use_sec_caps_attr: false, extra_flags: ZERO,
-            lowbox_handles: false, ac_acl_on_winsta: false, skip_restricted: false },
+                  use_lowbox: true, ..D },
         Variant { name: "+ SECURITY_CAPABILITIES attr (double-AC)",
-            use_lowbox: true, use_sec_caps_attr: true, extra_flags: ZERO,
-            lowbox_handles: false, ac_acl_on_winsta: false, skip_restricted: false },
+                  use_lowbox: true, use_sec_caps_attr: true, ..D },
         Variant { name: "+ CREATE_NEW_CONSOLE",
-            use_lowbox: true, use_sec_caps_attr: false, extra_flags: CREATE_NEW_CONSOLE,
-            lowbox_handles: false, ac_acl_on_winsta: false, skip_restricted: false },
+                  use_lowbox: true, extra_flags: CREATE_NEW_CONSOLE, ..D },
         Variant { name: "+ DETACHED_PROCESS (no conhost)",
-            use_lowbox: true, use_sec_caps_attr: false, extra_flags: DETACHED_PROCESS,
-            lowbox_handles: false, ac_acl_on_winsta: false, skip_restricted: false },
+                  use_lowbox: true, extra_flags: DETACHED_PROCESS, ..D },
         Variant { name: "+ CREATE_NO_WINDOW",
-            use_lowbox: true, use_sec_caps_attr: false, extra_flags: CREATE_NO_WINDOW,
-            lowbox_handles: false, ac_acl_on_winsta: false, skip_restricted: false },
+                  use_lowbox: true, extra_flags: CREATE_NO_WINDOW, ..D },
         Variant { name: "+ lowbox saved-handle list (AC dirs)",
-            use_lowbox: true, use_sec_caps_attr: false, extra_flags: ZERO,
-            lowbox_handles: true, ac_acl_on_winsta: false, skip_restricted: false },
+                  use_lowbox: true, lowbox_handles: true, ..D },
         Variant { name: "+ grant AC SID on WinSta0+Default desktop",
-            use_lowbox: true, use_sec_caps_attr: false, extra_flags: ZERO,
-            lowbox_handles: false, ac_acl_on_winsta: true, skip_restricted: false },
-        Variant { name: "restricted-only (no lowbox)",
-            use_lowbox: false, use_sec_caps_attr: false, extra_flags: ZERO,
-            lowbox_handles: false, ac_acl_on_winsta: false, skip_restricted: false },
+                  use_lowbox: true, ac_acl_on_winsta: true, ..D },
+        Variant { name: "restricted-only (no lowbox, no AC)", ..D },
         Variant { name: "lowbox-only (no CreateRestrictedToken)",
-            use_lowbox: true, use_sec_caps_attr: false, extra_flags: ZERO,
-            lowbox_handles: false, ac_acl_on_winsta: false, skip_restricted: true },
-        Variant { name: "restricted + SECURITY_CAPABILITIES (no manual lowbox)",
-            use_lowbox: false, use_sec_caps_attr: true, extra_flags: ZERO,
-            lowbox_handles: false, ac_acl_on_winsta: false, skip_restricted: false },
+                  use_lowbox: true, skip_restricted: true, ..D },
+        Variant { name: "restricted + SECCAPS (no manual lowbox)",
+                  use_sec_caps_attr: true, ..D },
         Variant { name: "restricted + SECCAPS + CREATE_NO_WINDOW",
-            use_lowbox: false, use_sec_caps_attr: true, extra_flags: CREATE_NO_WINDOW,
-            lowbox_handles: false, ac_acl_on_winsta: false, skip_restricted: false },
-        Variant { name: "unrestricted + SECCAPS (= Phase-1 baseline via AsUser)",
-            use_lowbox: false, use_sec_caps_attr: true, extra_flags: ZERO,
-            lowbox_handles: false, ac_acl_on_winsta: false, skip_restricted: true },
+                  use_sec_caps_attr: true, extra_flags: CREATE_NO_WINDOW, ..D },
+        Variant { name: "unrestricted + SECCAPS (= Phase-1 via AsUser)",
+                  use_sec_caps_attr: true, skip_restricted: true, ..D },
         Variant { name: "+ lowbox handles + CREATE_NO_WINDOW",
-            use_lowbox: true, use_sec_caps_attr: false, extra_flags: CREATE_NO_WINDOW,
-            lowbox_handles: true, ac_acl_on_winsta: false, skip_restricted: false },
+                  use_lowbox: true, extra_flags: CREATE_NO_WINDOW,
+                  lowbox_handles: true, ..D },
+        // ── Asymmetric lowbox: SECCAPS lowboxes the primary inside
+        // CreateProcessInternalW; lowbox only the initial so
+        // SeTokenCanImpersonate's AC-match check is satisfied. If
+        // this passes, the broker can drop NtCreateLowBoxToken on
+        // the primary and get SECCAPS' AC-env setup for free →
+        // grandchildren spawn without a hook.
+        Variant { name: "restricted + SECCAPS + lowbox(initial only)",
+                  use_sec_caps_attr: true, lowbox_initial: true, ..D },
+        Variant { name: "restricted + SECCAPS + lowbox(initial) + NO_WINDOW",
+                  use_sec_caps_attr: true, lowbox_initial: true,
+                  extra_flags: CREATE_NO_WINDOW, ..D },
+        Variant { name: "unrestricted + SECCAPS + lowbox(initial only)",
+                  use_sec_caps_attr: true, lowbox_initial: true,
+                  skip_restricted: true, ..D },
+        // ── Restricted-only deltas: if any of these work, the
+        // network boundary would have to come from elsewhere but
+        // brokered-spawn becomes unnecessary.
+        Variant { name: "restricted-only + DETACHED_PROCESS",
+                  extra_flags: DETACHED_PROCESS, ..D },
+        Variant { name: "restricted-only + CREATE_NO_WINDOW",
+                  extra_flags: CREATE_NO_WINDOW, ..D },
     ];
 
     // Output redirected to a file the broker can always read.
@@ -99,10 +119,10 @@ fn main() {
     println!("| variant | exit | grandchild ran? | output head |");
     println!("|---|---|---|---|");
 
-    for v in variants {
+    for (i, v) in variants.iter().copied().enumerate() {
         let _ = std::fs::remove_file(&outfile);
         let r = (|| -> anyhow::Result<(u32, String)> {
-            let ac = appcontainer::AppContainer::create(&format!("p10{}", v.name.len()))?;
+            let ac = appcontainer::AppContainer::create(&format!("p10v{i}"))?;
             let mut acls = acl::AclJournal::default();
             // The AC must be able to read the temp dir to write outfile,
             // and read System32 (already ALL APP PACKAGES).
@@ -129,18 +149,22 @@ fn main() {
             };
             unsafe { let _ = CloseHandle(base); }
 
-            let (primary, initial) = if v.use_lowbox {
-                let lock_lb = if v.lowbox_handles {
+            let primary_src = if v.use_lowbox {
+                let lb = if v.lowbox_handles {
                     make_lowbox_with_handles(lock, ac.sid, &ac.sid_string)?
                 } else {
                     token::make_lowbox(lock, ac.sid)?
                 };
-                let init_lb = token::make_lowbox(init, ac.sid)?;
-                unsafe { let _ = CloseHandle(lock); let _ = CloseHandle(init); }
-                (token::to_primary(lock_lb)?, token::to_impersonation(init_lb)?)
-            } else {
-                (token::to_primary(lock)?, token::to_impersonation(init)?)
-            };
+                unsafe { let _ = CloseHandle(lock); }
+                lb
+            } else { lock };
+            let initial_src = if v.use_lowbox || v.lowbox_initial {
+                let lb = token::make_lowbox(init, ac.sid)?;
+                unsafe { let _ = CloseHandle(init); }
+                lb
+            } else { init };
+            let (primary, initial) =
+                (token::to_primary(primary_src)?, token::to_impersonation(initial_src)?);
 
             let mut size = 0usize;
             unsafe {

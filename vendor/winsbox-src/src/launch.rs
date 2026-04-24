@@ -422,7 +422,6 @@ fn serve_ipc(ch: ipc::Channel, target_raw: isize, ctx: Arc<SpawnCtx>) {
                 if let Err(e) = install_broker_hook(child.hProcess, ctx.clone()) {
                     eprintln!("[sbox-exec] ipc: recurse hook failed: {e:#}");
                 }
-                unsafe { ResumeThread(child.hThread); }
                 let p = ch.dup_to_target(child.hProcess).unwrap_or(0);
                 let t = ch.dup_to_target(child.hThread).unwrap_or(0);
                 // kernel32!CreateProcessInternalW reads PS_CREATE_INFO
@@ -434,6 +433,11 @@ fn serve_ipc(ch: ipc::Channel, target_raw: isize, ctx: Arc<SpawnCtx>) {
                 ) {
                     eprintln!("[sbox-exec] ipc: fill outparams: {e:#}");
                 }
+                // Do NOT resume here. The duplicated thread handle has
+                // THREAD_ALL_ACCESS; the requesting process's
+                // CreateProcessInternalW resumes it after its own
+                // post-processing (CSR/conhost), exactly as if the
+                // kernel had done the spawn.
                 ch.reply(p, t, 0 /*STATUS_SUCCESS*/, child.dwProcessId);
                 // Keep child.hProcess open: the recursive Channel
                 // holds it for future dup_to_target calls (great-
@@ -527,18 +531,27 @@ fn fill_create_outparams(
                     interception::write_remote::<u64>(target, valp as usize + 8,
                         &(child.dwThreadId as u64))?;
                 }
-                // PsAttributeImageInfo = 6 → SECTION_IMAGE_INFORMATION
-                // (~0x40 bytes). Zero it; CreateProcessInternalW reads
-                // SubSystemType/Machine but zero is tolerated for
-                // console apps.
+                // PsAttributeImageInfo = 6 → SECTION_IMAGE_INFORMATION.
+                // CreateProcessInternalW reads SubSystemType (offset
+                // 0x20) and Machine (0x30) here; with the previous
+                // zero-fill cmd.exe printed "cannot be run in Win32
+                // mode". Fetch the real struct from the child we just
+                // created — the broker has full access to it.
                 6 if valp != 0 && size > 0 => {
-                    let zeros = vec![0u8; size.min(0x80) as usize];
-                    let mut n = 0usize;
+                    let sii = query_image_info(child.hProcess)?;
+                    let n = (size as usize).min(sii.len());
+                    eprintln!(
+                        "[sbox-exec] ipc: image_info subsys={} machine={:#x} → {} bytes",
+                        u32::from_le_bytes(sii[0x20..0x24].try_into().unwrap()),
+                        u16::from_le_bytes(sii[0x30..0x32].try_into().unwrap()),
+                        n,
+                    );
+                    let mut written = 0usize;
                     unsafe {
                         let _ = windows::Win32::System::Diagnostics::Debug::WriteProcessMemory(
                             target, valp as *const c_void,
-                            zeros.as_ptr() as *const c_void,
-                            zeros.len(), Some(&mut n),
+                            sii.as_ptr() as *const c_void,
+                            n, Some(&mut written),
                         );
                     }
                 }
@@ -563,6 +576,25 @@ fn remote_peb(proc: HANDLE) -> Result<usize> {
         );
         anyhow::ensure!(st.0 >= 0, "NtQueryInformationProcess: {:#x}", st.0);
         Ok(pbi.PebBaseAddress as usize)
+    }
+}
+
+/// `NtQueryInformationProcess(ProcessImageInformation)` →
+/// `SECTION_IMAGE_INFORMATION` (0x40 bytes on x64). Used to fill the
+/// requesting process's `PS_ATTRIBUTE_IMAGE_INFO` out-attribute.
+fn query_image_info(proc: HANDLE) -> Result<[u8; 0x40]> {
+    use windows::Wdk::System::Threading::{NtQueryInformationProcess, PROCESSINFOCLASS};
+    unsafe {
+        let mut buf = [0u8; 0x40];
+        let mut len = 0u32;
+        let st = NtQueryInformationProcess(
+            proc, PROCESSINFOCLASS(37),
+            buf.as_mut_ptr() as *mut c_void,
+            buf.len() as u32, &mut len,
+        );
+        anyhow::ensure!(st.0 >= 0,
+            "NtQueryInformationProcess(ProcessImageInformation): {:#x}", st.0);
+        Ok(buf)
     }
 }
 
