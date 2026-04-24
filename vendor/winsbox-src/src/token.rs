@@ -68,8 +68,14 @@ pub fn open_self_token() -> Result<HANDLE> {
 /// (interception) replaces this with USER_LOCKDOWN (deny-all +
 /// NULL restricting SID) once the broker can re-apply
 /// impersonation/hooks to grandchildren.
-pub fn make_lockdown(base: HANDLE, il_rid: u32, ac_sid: PSID) -> Result<HANDLE> {
+pub fn make_lockdown(base: HANDLE, il_rid: u32) -> Result<HANDLE> {
     unsafe {
+        use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
+        let str_sid = |s: &str| -> Option<PSID> {
+            let mut sid = PSID::default();
+            ConvertStringSidToSidW(pcwstr(&wstr(s)), &mut sid).ok()?;
+            Some(sid)
+        };
         let groups_buf = get_token_info(base, TokenGroups)?;
         let groups = &*(groups_buf.as_ptr() as *const TOKEN_GROUPS);
         let garr = std::slice::from_raw_parts(
@@ -78,15 +84,10 @@ pub fn make_lockdown(base: HANDLE, il_rid: u32, ac_sid: PSID) -> Result<HANDLE> 
         // Deny only the elevated groups; keep Users/Everyone/AuthUsers/
         // Logon SID enabled.
         let keep_sids: Vec<PSID> = [
-            "S-1-1-0",   // Everyone
-            "S-1-5-11",  // Authenticated Users
+            "S-1-1-0",      // Everyone
+            "S-1-5-11",     // Authenticated Users
             "S-1-5-32-545", // BUILTIN\Users
-        ].iter().filter_map(|s| {
-            use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
-            let mut sid = PSID::default();
-            ConvertStringSidToSidW(pcwstr(&wstr(s)), &mut sid).ok()?;
-            Some(sid)
-        }).collect();
+        ].iter().filter_map(|s| str_sid(s)).collect();
         let deny: Vec<SID_AND_ATTRIBUTES> = garr.iter()
             .filter(|g| {
                 if g.Attributes & (SE_GROUP_LOGON_ID as u32) != 0 { return false; }
@@ -97,11 +98,14 @@ pub fn make_lockdown(base: HANDLE, il_rid: u32, ac_sid: PSID) -> Result<HANDLE> 
             .map(|g| SID_AND_ATTRIBUTES { Sid: g.Sid, Attributes: 0 })
             .collect();
 
-        // Restricting list = the kept SIDs + Logon SID + the AC
-        // package SID. The AC SID is what Phase-1's ACL grants
-        // target; without it in the restricting list those grants
-        // pass the normal-SID check but fail the restricting check
-        // and the lockdown token can't open allowRead/allowWrite.
+        // Restricting list = the kept SIDs + Logon SID + RESTRICTED.
+        // RESTRICTED (S-1-5-12) is the canonical "restricted code"
+        // SID; the broker also grants it on allowRead/allowWrite so
+        // those paths pass *both* the normal-SID check (via the AC
+        // SID added by the lowbox wrap) and the restricting check
+        // (via RESTRICTED). AppContainer package SIDs are not valid
+        // restricting SIDs — CreateRestrictedToken returns
+        // ERROR_INVALID_PARAMETER for them.
         let mut restrict: Vec<SID_AND_ATTRIBUTES> =
             keep_sids.iter().map(|s| SID_AND_ATTRIBUTES { Sid: *s, Attributes: 0 }).collect();
         for g in garr {
@@ -109,8 +113,8 @@ pub fn make_lockdown(base: HANDLE, il_rid: u32, ac_sid: PSID) -> Result<HANDLE> 
                 restrict.push(SID_AND_ATTRIBUTES { Sid: g.Sid, Attributes: 0 });
             }
         }
-        if !ac_sid.is_invalid() {
-            restrict.push(SID_AND_ATTRIBUTES { Sid: ac_sid, Attributes: 0 });
+        if let Some(r) = str_sid("S-1-5-12") {
+            restrict.push(SID_AND_ATTRIBUTES { Sid: r, Attributes: 0 });
         }
 
         let to_delete = privileges_except(base, &["SeChangeNotifyPrivilege"])?;

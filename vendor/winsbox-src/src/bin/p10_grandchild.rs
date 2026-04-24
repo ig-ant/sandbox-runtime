@@ -145,7 +145,7 @@ fn main() {
                 }
                 (p, token::make_initial(base, il)?)
             } else {
-                (token::make_lockdown(base, il, ac.sid)?, token::make_initial(base, il)?)
+                (token::make_lockdown(base, il)?, token::make_initial(base, il)?)
             };
             unsafe { let _ = CloseHandle(base); }
 

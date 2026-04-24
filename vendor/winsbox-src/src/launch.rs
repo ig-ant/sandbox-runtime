@@ -117,7 +117,7 @@ fn build_broker_tokens(ac: &AppContainer) -> Result<BrokerTokens> {
     // at the same IL and lowbox-wrapped or SeTokenCanImpersonate
     // downgrades the impersonation to Identification (PoC P5).
     let il = token::IL_LOW;
-    let lockdown = token::make_lockdown(base, il, ac.sid)?;
+    let lockdown = token::make_lockdown(base, il)?;
     let initial_r = token::make_initial(base, il)?;
     unsafe { let _ = CloseHandle(base); }
 
@@ -160,11 +160,17 @@ fn run_confined(pol: &Policy) -> Result<u32> {
     // Filesystem policy → ACEs. Allow first (icacls /grant), then
     // /deny on the deny paths — icacls always orders explicit deny
     // before allow on the same object, and deny ACEs are evaluated
-    // first regardless.
+    // first regardless. Each grant goes to BOTH the AC package SID
+    // (satisfies the lowbox normal-SID check) and RESTRICTED
+    // S-1-5-12 (satisfies the restricting-SID check on the
+    // lockdown primary after RevertToSelf).
+    const RESTRICTED_SID: &str = "S-1-5-12";
     let mut acl_op = |op: &str, p: &str, perm: &str, deny: bool| {
-        let r = if deny { acls.deny(p, &ac.sid_string, perm) }
-                else    { acls.grant(p, &ac.sid_string, perm) };
-        if let Err(e) = r { log!("ACL {op} {p}: {e:#}"); }
+        for sid in [&ac.sid_string, RESTRICTED_SID] {
+            let r = if deny { acls.deny(p, sid, perm) }
+                    else    { acls.grant(p, sid, perm) };
+            if let Err(e) = r { log!("ACL {op} {p} ({sid}): {e:#}"); }
+        }
     };
     for p in &pol.allow_read {
         if std::path::Path::new(p).exists() { acl_op("allow-read", p, READ_EXECUTE, false); }
@@ -217,15 +223,12 @@ fn run_confined(pol: &Policy) -> Result<u32> {
         log!("no proxy ports in policy; skipping bridge");
     }
 
-    // Mode::Broker layers a restricted lowbox token on top.
+    // Mode::Broker layers a restricted lowbox token on top. Hard
+    // error on failure — silently degrading to AppContainer-only
+    // gave a false green when CreateRestrictedToken rejected the
+    // package SID in the restricting list.
     let tokens = if pol.mode == Mode::Broker {
-        match build_broker_tokens(&ac) {
-            Ok(t) => Some(t),
-            Err(e) => {
-                log!("broker token build failed ({e:#}); falling back to AppContainer-only");
-                None
-            }
-        }
+        Some(build_broker_tokens(&ac).context("broker token build")?)
     } else { None };
 
     // The AC must be able to read its cwd or cmd.exe fails with "The

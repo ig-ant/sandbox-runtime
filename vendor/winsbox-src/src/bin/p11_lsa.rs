@@ -175,7 +175,7 @@ fn parent() {
             let base = token::open_self_token()?;
             let il = token::IL_LOW;
             let lock = if v.restricted {
-                token::make_lockdown(base, il, ac.sid)?
+                token::make_lockdown(base, il)?
             } else {
                 let mut p = HANDLE::default();
                 windows::Win32::Security::DuplicateTokenEx(
