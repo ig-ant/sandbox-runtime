@@ -216,12 +216,12 @@ fn run_confined(pol: &Policy) -> Result<u32> {
     }
     for p in &pol.deny_write {
         if std::path::Path::new(p).exists() {
-            acl_op("deny-write", p, MODIFY, true, grant_sids);
+            acl_op("deny-write", p, MODIFY, true, &both);
         }
     }
     for p in &pol.deny_read {
         if std::path::Path::new(p).exists() {
-            acl_op("deny-read", p, FULL, true, grant_sids);
+            acl_op("deny-read", p, FULL, true, &both);
             log!("icacls {p}:\n{}", crate::acl::dump(p).trim_end());
         }
     }
@@ -593,6 +593,13 @@ fn handle_fs(ch: &ipc::Channel, target: HANDLE, req: &ipc::Wire, ctx: &Arc<Spawn
         Err(st) => {
             if ctx.trace || (st != 0xC0000034u32 as i32 && st != 0xC000003Au32 as i32) {
                 eprintln!("[sbox-exec] fs: open {path}: {st:#x} access={access:#x}");
+            }
+            if st == 0xC000000Du32 as i32 {
+                eprintln!(
+                    "[sbox-exec] fs:   args op={} a4={:#x} a5={:#x} a6={:#x} a7={:#x} a8={:#x} a9={:#x} a10={:#x}",
+                    req.op, req.args[4], req.args[5], req.args[6],
+                    req.args[7], req.args[8], req.args[9], req.args[10],
+                );
             }
             ch.reply_fs(0, 0, st);
         }
