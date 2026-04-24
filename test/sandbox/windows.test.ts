@@ -88,11 +88,11 @@ d(`windows sandbox [WINSBOX_PHASE=${PHASE}]`, () => {
   // lockdown primary without re-impersonation and fails. Tests that
   // exercise an EXTERNAL exe via `cmd /c` are gated on the process
   // hook (Phase 2b).
-  // jobwatch.rs re-impersonates grandchildren, but cmd /c <ext.exe>
-  // still hits "Access is denied" — likely conhost-sharing or a
-  // resource not covered by the lockdown token's default DACL.
-  // Needs ProcMon on a real box to isolate; see token.rs TODO.
-  const BROKER_PROC_HOOK_LANDED = false
+  // Broker now hooks NtCreateUserProcess and performs every spawn
+  // itself (interception.rs + ipc.rs), so cmd→ext.exe goes through
+  // the same CreateProcessAsUserW + SetThreadToken recipe that
+  // works for the immediate target.
+  const BROKER_PROC_HOOK_LANDED = true
   const extCompat =
     PHASE !== '2' || BROKER_PROC_HOOK_LANDED
       ? compat

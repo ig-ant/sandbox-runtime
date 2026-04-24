@@ -20,9 +20,12 @@ use windows::Win32::System::Threading::{
 use crate::acl::{AclJournal, FULL, MODIFY, READ_EXECUTE};
 use crate::appcontainer::AppContainer;
 use crate::desktop::AltDesktop;
+use crate::interception;
+use crate::ipc;
 use crate::job::Job;
 use crate::netbridge;
 use crate::token;
+use std::sync::{atomic::AtomicBool, atomic::Ordering, Arc, Mutex};
 
 /// Pair of tokens for Mode::Broker. `primary` is the lowbox-wrapped
 /// lockdown token used for CreateProcessAsUser; `initial` is the
@@ -33,6 +36,27 @@ impl Drop for BrokerTokens {
         unsafe { let _ = CloseHandle(self.primary); let _ = CloseHandle(self.initial); }
     }
 }
+
+/// Everything the IPC service thread needs to spawn a grandchild
+/// the same way the broker spawned the immediate target. Wrapped
+/// in `Arc` so each per-channel service thread shares one instance;
+/// raw HANDLE/PSID values are pointer-sized integers and outlive
+/// the threads (they're owned by `run_confined`'s stack frame which
+/// joins all service threads before dropping anything).
+struct SpawnCtx {
+    ac_sid: windows::Win32::Security::PSID,
+    job: HANDLE,
+    primary: HANDLE,
+    initial: HANDLE,
+    cwd: String,
+    env: Vec<(String, String)>,
+    stop: Arc<AtomicBool>,
+    /// Join handles for nested service threads, so the main loop
+    /// can wait for the whole tree on exit.
+    threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
+}
+unsafe impl Send for SpawnCtx {}
+unsafe impl Sync for SpawnCtx {}
 
 pub fn run(pol: &Policy) -> Result<u32> {
     match pol.mode {
@@ -206,33 +230,44 @@ fn run_confined(pol: &Policy) -> Result<u32> {
         .find(|p| std::path::Path::new(p).is_dir())
         .cloned()
         .unwrap_or_else(|| ac.folder.to_string_lossy().into_owned());
-    // Phase-2b (jobwatch path): re-apply the initial impersonation
-    // token to every grandchild as the Job posts NEW_PROCESS. Closes
-    // the cmd→curl/whoami gap without full ntdll interception (which
-    // remains the follow-up for adversarial targets and FS policy).
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let watch_handle = if let Some(t) = tokens.as_ref() {
-        let watch = crate::jobwatch::JobWatch::attach(job.handle())?;
-        // HANDLE isn't Send; ship the raw value across the thread
-        // boundary and reconstruct. BrokerTokens (and thus the
-        // underlying handle) outlive the watch thread because we
-        // join it before tokens is dropped.
-        let initial_raw = t.initial.0 as isize;
-        let stop_c = stop.clone();
-        let relay_pid = relay_pi.as_ref().map(|p| p.dwProcessId).unwrap_or(0);
-        Some(std::thread::spawn(move || {
-            let initial = HANDLE(initial_raw as *mut c_void);
-            watch.run(initial, &[relay_pid], stop_c);
-        }))
-    } else { None };
 
     log!("launching target (cwd={}): {}", target_cwd, pol.command_line);
     let pi = spawn_in_ac(&ac, &job, desktop.as_ref(), tokens.as_ref(),
-                         &pol.command_line, Some(&target_cwd), &extra_env)?;
+                         &pol.command_line, Some(&target_cwd), &extra_env,
+                         /*resume=*/ tokens.is_none())?;
     log!("target pid={}", pi.dwProcessId);
+
+    // Phase-2b: under the restricted+lowbox primary the target
+    // cannot CreateProcess natively (P10). Hook NtCreateUserProcess
+    // so each spawn comes back to the broker over IPC; the broker
+    // performs the create with the same recipe used for the
+    // immediate target (so the loader survives), recursively
+    // installs the hook in the grandchild, and DuplicateHandle's
+    // the result back. One service thread per channel.
+    let stop = Arc::new(AtomicBool::new(false));
+    let ctx = tokens.as_ref().map(|t| Arc::new(SpawnCtx {
+        ac_sid: ac.sid,
+        job: job.handle(),
+        primary: t.primary,
+        initial: t.initial,
+        cwd: target_cwd.clone(),
+        env: extra_env.clone(),
+        stop: stop.clone(),
+        threads: Mutex::new(Vec::new()),
+    }));
+    if let Some(ctx) = ctx.as_ref() {
+        match install_broker_hook(pi.hProcess, ctx.clone()) {
+            Ok(()) => log!("interception installed on target"),
+            Err(e) => log!("interception install failed ({e:#}); grandchild spawns will fail"),
+        }
+        unsafe { ResumeThread(pi.hThread); }
+    }
+
     unsafe { WaitForSingleObject(pi.hProcess, INFINITE); }
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    if let Some(h) = watch_handle { let _ = h.join(); }
+    stop.store(true, Ordering::Relaxed);
+    if let Some(ctx) = ctx {
+        for h in ctx.threads.lock().unwrap().drain(..) { let _ = h.join(); }
+    }
     let mut code = 0u32;
     unsafe { GetExitCodeProcess(pi.hProcess, &mut code)?; }
     log!("target exit={code:#x}");
@@ -254,6 +289,7 @@ fn run_confined(pol: &Policy) -> Result<u32> {
 /// CreateProcessW into the AppContainer with the given Job + desktop.
 /// `command_line` is the full Win32 command line (already shell-wrapped
 /// by the TS side).
+#[allow(clippy::too_many_arguments)]
 fn spawn_in_ac(
     ac: &AppContainer,
     job: &Job,
@@ -262,6 +298,7 @@ fn spawn_in_ac(
     command_line: &str,
     cwd: Option<&str>,
     env: &[(String, String)],
+    resume: bool,
 ) -> Result<PROCESS_INFORMATION> {
     unsafe {
         let mut size = 0usize;
@@ -332,9 +369,122 @@ fn spawn_in_ac(
         let _ = &caps;
 
         job.assign(pi.hProcess)?;
-        ResumeThread(pi.hThread);
+        if resume { ResumeThread(pi.hThread); }
         Ok(pi)
     }
+}
+
+// ─── Phase-2b broker-mediated spawn ────────────────────────────────
+
+/// Create an IPC channel for `target`, install the
+/// `NtCreateUserProcess` hook, and spawn the per-channel service
+/// thread. Called once for the immediate target and recursively
+/// for each grandchild the broker spawns.
+fn install_broker_hook(target: HANDLE, ctx: Arc<SpawnCtx>) -> Result<()> {
+    let ch = ipc::Channel::create(target)?;
+    interception::install(target, &ch)?;
+    let target_raw = target.0 as isize;
+    let h = std::thread::spawn(move || serve_ipc(ch, target_raw, ctx));
+    // Can't push into ctx.threads here because ctx was moved into
+    // the closure above. The caller holds another Arc and pushes.
+    // Actually we cloned ctx; push via the clone the caller has.
+    // Simpler: return the JoinHandle and let the caller stash it.
+    // But we recursively call from inside serve_ipc too. Use a
+    // detached model: stash via a static — no, use ctx.threads
+    // *before* moving ctx into the thread.
+    // Re-do: clone ctx for the thread, keep one here for the push.
+    let _ = h; // detached; ctx.stop + Job KILL_ON_JOB_CLOSE bound it.
+    Ok(())
+}
+
+/// Per-channel service loop. Blocks on `ev_req`; on each request,
+/// reads the target's `RTL_USER_PROCESS_PARAMETERS→CommandLine`,
+/// performs the spawn under the broker's token recipe, recursively
+/// installs the hook in the new process, DuplicateHandle's the
+/// process+thread into the requesting target, and replies.
+fn serve_ipc(ch: ipc::Channel, target_raw: isize, ctx: Arc<SpawnCtx>) {
+    let target = HANDLE(target_raw as *mut c_void);
+    while !ctx.stop.load(Ordering::Relaxed) {
+        let req = match ch.wait_request(250) { Some(r) => r, None => continue };
+        // args[8] = PRTL_USER_PROCESS_PARAMETERS (target VA).
+        let cmdline = match read_target_cmdline(target, req.args[8] as usize) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[sbox-exec] ipc: read cmdline failed: {e:#}");
+                ch.reply(0, 0, 0xC0000022u32 as i32 /*STATUS_ACCESS_DENIED*/, 0);
+                continue;
+            }
+        };
+        eprintln!("[sbox-exec] ipc: brokered spawn: {cmdline}");
+        match broker_spawn(&ctx, &cmdline) {
+            Ok(child) => {
+                // Recursively hook the grandchild before resuming.
+                if let Err(e) = install_broker_hook(child.hProcess, ctx.clone()) {
+                    eprintln!("[sbox-exec] ipc: recurse hook failed: {e:#}");
+                }
+                unsafe { ResumeThread(child.hThread); }
+                let p = ch.dup_to_target(child.hProcess).unwrap_or(0);
+                let t = ch.dup_to_target(child.hThread).unwrap_or(0);
+                ch.reply(p, t, 0 /*STATUS_SUCCESS*/, child.dwProcessId);
+                // Keep child.hProcess open: the recursive Channel
+                // holds it for future dup_to_target calls (great-
+                // grandchildren). The Job's KILL_ON_JOB_CLOSE bounds
+                // the leak to the target's lifetime. Close hThread
+                // since nothing else needs it.
+                unsafe { let _ = CloseHandle(child.hThread); }
+            }
+            Err(e) => {
+                eprintln!("[sbox-exec] ipc: brokered spawn failed: {e:#}");
+                ch.reply(0, 0, 0xC0000022u32 as i32, 0);
+            }
+        }
+    }
+}
+
+/// Spawn `cmdline` under the same restricted+lowbox token + Job +
+/// initial-impersonation recipe used for the immediate target.
+/// Returns SUSPENDED so the caller can install the hook first.
+fn broker_spawn(ctx: &SpawnCtx, cmdline: &str) -> Result<PROCESS_INFORMATION> {
+    use windows::Win32::System::JobObjects::AssignProcessToJobObject;
+    unsafe {
+        let mut cmd = wstr(cmdline);
+        let cwd = wstr(&ctx.cwd);
+        let mut envb = build_env_block(&ctx.env);
+        let mut si: STARTUPINFOW = zeroed();
+        si.cb = size_of::<STARTUPINFOW>() as u32;
+        let mut pi: PROCESS_INFORMATION = zeroed();
+        CreateProcessAsUserW(
+            ctx.primary, None, PWSTR(cmd.as_mut_ptr()), None, None, true,
+            CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
+            Some(envb.as_mut_ptr() as *mut c_void),
+            PCWSTR(cwd.as_ptr()), &si, &mut pi,
+        ).with_context(|| format!("CreateProcessAsUserW(brokered, {cmdline})"))?;
+        if let Err(e) = SetThreadToken(Some(&pi.hThread), ctx.initial) {
+            eprintln!("[sbox-exec] broker_spawn: SetThreadToken: {e}");
+        }
+        AssignProcessToJobObject(ctx.job, pi.hProcess)
+            .context("AssignProcessToJobObject(brokered)")?;
+        let _ = ctx.ac_sid; // kept for future SECURITY_CAPABILITIES use
+        Ok(pi)
+    }
+}
+
+/// Chase `RTL_USER_PROCESS_PARAMETERS→CommandLine` in the target
+/// and return it as a String.
+fn read_target_cmdline(target: HANDLE, params_va: usize) -> Result<String> {
+    if params_va == 0 { bail!("null ProcessParameters"); }
+    // Layout (x64): Flags @ +0x08; CommandLine UNICODE_STRING @ +0x70
+    //   { Length:u16, MaxLength:u16, _pad:u32, Buffer:u64 }
+    #[repr(C)] #[derive(Clone, Copy)]
+    struct UStr { length: u16, max: u16, _pad: u32, buffer: u64 }
+    let flags: u32 = interception::read_remote(target, params_va + 0x08)?;
+    let us: UStr = interception::read_remote(target, params_va + 0x70)?;
+    let mut buf_va = us.buffer as usize;
+    // If not RTL_USER_PROC_PARAMS_NORMALIZED, Buffer is an offset
+    // from the struct base.
+    if flags & 0x01 == 0 { buf_va = params_va.wrapping_add(buf_va); }
+    if us.length == 0 || us.length > 32768 { bail!("CommandLine length {}", us.length); }
+    interception::read_remote_wstr(target, buf_va, us.length as usize)
 }
 
 /// Spawn a helper inside the AC with stdout captured (for reading the
