@@ -87,9 +87,22 @@ pub const USER_LOCKDOWN: LockdownSpec = LockdownSpec {
 /// `build_broker_tokens` can apply the same level to the initial
 /// impersonation token (SeTokenCanImpersonate requires they match).
 pub fn spec_from_env() -> (LockdownSpec, u32) {
+    // WINSBOX_IL=low keeps the lockdown spec but at Low IL —
+    // bisects whether the inside-relay loopback connect failure
+    // under USER_LOCKDOWN is the Untrusted-IL target failing the
+    // no-write-up check on the Low-IL relay's AFD endpoint, or
+    // the deny-only enabled groups.
+    let il = match std::env::var("WINSBOX_IL").as_deref() {
+        Ok("low") => IL_LOW,
+        Ok("untrusted") => IL_UNTRUSTED,
+        _ => match std::env::var("WINSBOX_TOKEN").as_deref() {
+            Ok("lockdown") => IL_UNTRUSTED,
+            _ => IL_LOW,
+        },
+    };
     match std::env::var("WINSBOX_TOKEN").as_deref() {
-        Ok("lockdown") => (USER_LOCKDOWN, IL_UNTRUSTED),
-        _ => (USER_LIMITED, IL_LOW),
+        Ok("lockdown") => (USER_LOCKDOWN, il),
+        _ => (USER_LIMITED, il),
     }
 }
 
