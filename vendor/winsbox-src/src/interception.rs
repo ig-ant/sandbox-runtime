@@ -51,16 +51,25 @@ fn stub_env(a: &StubAddrs) -> Result<StubEnv> {
 /// broker can't resolve — go through unhooked under the initial
 /// impersonation token. Loader-time read access to the exe's
 /// own DLL directory is granted by a per-spawn ACL in
-/// `broker_spawn` instead.
+/// `broker_spawn` instead. A copy of the original syscall stub
+/// is saved so the broker can reply `FS_PASSTHROUGH` and the
+/// hook tail-jmps to it (the target does the open under its
+/// own token — required for `\Device\Afd` etc., where the
+/// endpoint must be created inside the target's AppContainer).
 #[cfg(target_arch = "x86_64")]
 pub fn install_fs(target: HANDLE, a: &StubAddrs) -> Result<()> {
     let env = stub_env(a)?;
-    let ntcf = ntdll_export("NtCreateFile")?;
-    let ntof = ntdll_export("NtOpenFile")?;
-    patch_with_stub(target, "NtCreateFile", ntcf,
-                    &emit_fs_stub(&env, crate::ipc::OP_NTCREATEFILE, 11))?;
-    patch_with_stub(target, "NtOpenFile", ntof,
-                    &emit_fs_stub(&env, crate::ipc::OP_NTOPENFILE, 6))?;
+    for (name, op, n_args) in [
+        ("NtCreateFile", crate::ipc::OP_NTCREATEFILE, 11usize),
+        ("NtOpenFile",   crate::ipc::OP_NTOPENFILE,    6usize),
+    ] {
+        let va = ntdll_export(name)?;
+        let mut orig = [0u8; 32];
+        read_remote_bytes(target, va, &mut orig)?;
+        let saved = alloc_remote_rx(target, &orig)?;
+        patch_with_stub(target, name, va,
+                        &emit_fs_stub(&env, op, n_args, saved as u64))?;
+    }
     Ok(())
 }
 
@@ -160,30 +169,48 @@ fn emit_cpw_stub(e: &StubEnv) -> Vec<u8> {
     s
 }
 
-// FOLLOW-UP: a try-original-first stub (tail-call a saved copy of
-// the syscall stub, only IPC on STATUS_ACCESS_DENIED) is the right
-// architecture — it lets the loader's object-directory-relative
-// opens and device opens succeed natively without the broker
-// having to whitelist them, and cuts IPC volume. The hand-emitted
-// version (14da6b9) AVs in-loader and needs WinDbg on a real box
-// to root-cause; until then the FS hook is installed
-// post-rendezvous and the loader's DLL-directory access is
-// covered by a per-spawn ACL grant in `broker_spawn`.
+// FOLLOW-UP: a try-original-first stub (tail-call the saved
+// copy, only IPC on STATUS_ACCESS_DENIED) would cut IPC volume
+// dramatically and let the loader be hooked too. The
+// hand-emitted version (14da6b9) AVs in-loader; needs WinDbg.
+// Until then the broker decides per-request whether to handle
+// the open itself or reply FS_PASSTHROUGH and have the stub
+// tail-jmp the saved original.
 #[cfg(target_arch = "x86_64")]
-fn emit_fs_stub(e: &StubEnv, op: u64, n_args: usize) -> Vec<u8> {
-    let mut s = Vec::<u8>::with_capacity(256);
+fn emit_fs_stub(e: &StubEnv, op: u64, n_args: usize, saved_orig: u64) -> Vec<u8> {
+    let mut s = Vec::<u8>::with_capacity(320);
     emit_prologue(&mut s, e, op, n_args);
-    // ── Phase C (FS)
+    // r10 = section (reloaded by emit_prologue's tail).
+    // ── Passthrough check: if r_status == FS_PASSTHROUGH,
+    // reload rcx/rdx/r8/r9 from section (stack args at
+    // [rsp+0x28..] are unchanged — emit_prologue's sub/add
+    // cancelled) and tail-jmp the saved original syscall stub.
+    // Its `ret` returns to *our* caller; out-params are written
+    // by the kernel.
+    s.extend_from_slice(&[0x41, 0x8B, 0x82, 0x80, 0x00, 0x00, 0x00]); // mov eax,[r10+0x80]
+    s.extend_from_slice(&[0x3D]);                                      // cmp eax, FS_PASSTHROUGH
+    s.extend_from_slice(&(crate::ipc::FS_PASSTHROUGH as u32).to_le_bytes().as_slice());
+    s.extend_from_slice(&[0x75, 0x1C]);                                // jne broker_reply (+28)
+    // reload rcx/rdx/r8/r9 from section
+    s.extend_from_slice(&[0x49, 0x8B, 0x4A, 0x08]); // mov rcx,[r10+0x08]
+    s.extend_from_slice(&[0x49, 0x8B, 0x52, 0x10]); // mov rdx,[r10+0x10]
+    s.extend_from_slice(&[0x4D, 0x8B, 0x42, 0x18]); // mov r8, [r10+0x18]
+    s.extend_from_slice(&[0x4D, 0x8B, 0x4A, 0x20]); // mov r9, [r10+0x20]
+    // mov rax, saved_orig; jmp rax — the saved stub's `ret`
+    // goes to NtCreateFile's caller (our [rsp] is untouched).
+    s.extend_from_slice(&[0x48, 0xB8]); s.extend_from_slice(&saved_orig.to_le_bytes());
+    s.extend_from_slice(&[0xFF, 0xE0]);
+    // ↑ 4×4 + 10 + 2 = 28 bytes; jne disp = 28? Recount: 4+4+4+4+10+2 = 28 = 0x1C.
+    // (jne disp is to NEXT instruction after the block.)
+    // broker_reply:
     // rcx = args[0] = PHANDLE FileHandle @ +0x08; *rcx = r0 @ +0x68
     s.extend_from_slice(&[0x49, 0x8B, 0x4A, 0x08]);
     s.extend_from_slice(&[0x49, 0x8B, 0x42, 0x68, 0x48, 0x89, 0x01]);
     // rcx = args[3] = PIO_STATUS_BLOCK @ +0x20
     s.extend_from_slice(&[0x49, 0x8B, 0x4A, 0x20]);
     s.extend_from_slice(&[0x48, 0x85, 0xC9, 0x74, 0x12]);             // jz +0x12
-    //   [rcx+0] = sign-extended r_status @ +0x80 (iosb.Status)
     s.extend_from_slice(&[0x49, 0x63, 0x82, 0x80, 0x00, 0x00, 0x00]); // movsxd rax,[r10+0x80]
     s.extend_from_slice(&[0x48, 0x89, 0x01]);
-    //   [rcx+8] = r1 @ +0x70 (iosb.Information)
     s.extend_from_slice(&[0x49, 0x8B, 0x42, 0x70, 0x48, 0x89, 0x41, 0x08]);
     // eax = r_status @ +0x80 (NTSTATUS)
     s.extend_from_slice(&[0x41, 0x8B, 0x82, 0x80, 0x00, 0x00, 0x00]);

@@ -53,52 +53,18 @@ impl FsPolicy {
     /// `nt_path` is the broker-side path string as read from the
     /// caller's `OBJECT_ATTRIBUTES.ObjectName` (already UTF-16→UTF-8).
     pub fn evaluate(&self, nt_path: &str, desired_access: u32) -> Decision {
-        let lower = canon_dos(nt_path);
-        // Non-filesystem device endpoints whose driver enforces
-        // its own per-IOCTL access check against the *caller*'s
-        // token (so brokering the open doesn't widen the
-        // boundary): AFD's connect/bind checks the lowbox
-        // network capability; ConDrv attaches to the caller's
-        // conhost. Everything else under \Device\ is denied —
-        // brokering a named-pipe or PhysicalDrive open with the
-        // broker's full token would be a straight escape. The
-        // follow-up is a "try original syscall first" stub so
-        // device opens the lockdown token can already do never
-        // reach the broker.
-        if let Some(dev) = lower.strip_prefix(r"\device\") {
-            return if dev.starts_with("harddiskvolume")
-                || dev.starts_with("mup")
-                || dev.starts_with("lanmanredirector")
-                || dev.starts_with("namedpipe\\")
-                || dev.starts_with("physicaldrive")
-            {
-                Decision::Deny("device→fs/pipe namespace")
-            } else {
-                // AFD/ConDrv/CNG/KsecDD/Nsi/NetBT etc. — open
-                // under the target's lowbox token so the
-                // endpoint is AC-tagged and the target can use
-                // it; the device driver enforces the boundary.
-                Decision::AllowAsTarget
-            };
-        }
-        if let Some(rest) = lower.strip_prefix(r"\??\") {
-            if matches!(rest,
-                "nul" | "con" | "conin$" | "conout$" | "aux" | "prn"
-            ) {
-                return Decision::Allow;
-            }
-            if rest.starts_with("pipe\\") || rest.starts_with("unc\\") {
-                return Decision::Deny("pipe/UNC");
-            }
-            if rest.starts_with("mountpointmanager")
-                || rest.starts_with("nsi")
-            {
-                return Decision::Allow;
-            }
-        }
+        // Anything that isn't a `\??\<drive>:\…` filesystem
+        // path — devices, pipes, UNC, object directories — is
+        // passed through to the target's own syscall. The
+        // lockdown+lowbox token is the boundary there (AFD
+        // checks network capability at IOCTL time, named-pipe
+        // servers' DACLs are checked against the lockdown,
+        // PhysicalDrive needs admin). The broker only mediates
+        // filesystem paths, where it is *granting* access the
+        // lockdown token doesn't have and so must apply policy.
         let dos = match nt_to_dos(nt_path) {
             Some(d) => d,
-            None => return Decision::Deny("non-DOS namespace"),
+            None => return Decision::AllowAsTarget,
         };
         if self.deny_read.iter().any(|d| under(&dos, d)) {
             return Decision::Deny("denyRead");

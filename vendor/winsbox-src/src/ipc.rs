@@ -31,6 +31,13 @@ pub const OP_CPW: u64 = 0;
 pub const OP_NTCREATEFILE: u64 = 1;
 pub const OP_NTOPENFILE: u64 = 2;
 
+/// Sentinel `r_status` the broker returns when the FS stub
+/// should reload its spilled args and tail-jmp to the saved
+/// original syscall stub — i.e. let the *target* do the open
+/// under its own token. Used for `\Device\*` so AFD/ConDrv
+/// endpoints are created in the target's AppContainer.
+pub const FS_PASSTHROUGH: i32 = 0xE0000001u32 as i32;
+
 /// Section layout shared by every hook stub. The stub writes `op`
 /// + `args`; the broker writes the `r*` fields. Field meaning is
 /// op-dependent. Handle values are target-side; pointer values

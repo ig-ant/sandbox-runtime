@@ -507,22 +507,33 @@ fn handle_fs(ch: &ipc::Channel, target: HANDLE, req: &ipc::Wire, ctx: &Arc<Spawn
     let path = match read_target_obj_path(target, oa_va) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("[sbox-exec] fs: read OBJECT_ATTRIBUTES: {e:#}");
-            ch.reply_fs(0, 0, 0xC000000Du32 as i32 /* STATUS_INVALID_PARAMETER */);
+            // RootDirectory that isn't a file handle, or other
+            // shapes the broker can't resolve — let the target
+            // do the open itself under its own token.
+            eprintln!("[sbox-exec] fs: passthrough ({e:#})");
+            ch.reply_fs(0, 0, ipc::FS_PASSTHROUGH);
             return;
         }
     };
     use crate::policy_engine::Decision;
-    let imp = match ctx.fs.evaluate(&path, access) {
+    match ctx.fs.evaluate(&path, access) {
         Decision::Deny(why) => {
             eprintln!("[sbox-exec] fs: DENY {path} ({why}, access={access:#x})");
             ch.reply_fs(0, 0, 0xC0000022u32 as i32 /* STATUS_ACCESS_DENIED */);
             return;
         }
-        Decision::Allow => HANDLE::default(),
-        Decision::AllowAsTarget => ctx.initial,
-    };
-    match broker_open(req, &path, imp) {
+        Decision::AllowAsTarget => {
+            // Tell the stub to tail-jmp the saved original
+            // syscall so the *target* does the open under its
+            // own lowbox token — required for AFD/ConDrv where
+            // the endpoint must be created inside the target's
+            // AppContainer process, not the broker's.
+            ch.reply_fs(0, 0, ipc::FS_PASSTHROUGH);
+            return;
+        }
+        Decision::Allow => {}
+    }
+    match broker_open(req, &path, HANDLE::default()) {
         Ok((h, info)) => {
             let th = ch.dup_to_target(h).unwrap_or(0);
             unsafe { let _ = CloseHandle(h); }
