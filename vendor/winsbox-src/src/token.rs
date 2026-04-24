@@ -40,20 +40,21 @@ pub enum Restricting {
     Keep,
     /// {Logon SID, RESTRICTED} only.
     LogonAndRestricted,
-    /// {Everyone, RESTRICTED, Logon SID}. Lets the lowbox'd
-    /// target pass the restricting check on `\Device\Afd`
-    /// (sockets), `\BaseNamedObjects`, the win32k
-    /// `SharedSection`, and other system objects that grant
-    /// `Everyone` — without weakening FS: a raw `NtCreateFile`
-    /// on a user file still fails the *normal*-SID check
-    /// because `Everyone` is deny-only there, and the lowbox-
-    /// added enabled groups (`ALL APP PACKAGES`, AC SID,
-    /// Logon) aren't granted by user-file DACLs.
-    /// `CreateRestrictedToken` rejects every `S-1-15-*` SID in
-    /// `SidsToRestrict` (not just package SIDs — verified for
-    /// `S-1-15-2-1` at ff18fb4), so `ALL APP PACKAGES` cannot
-    /// be the restricting-list entry. RESTRICTED is kept so
-    /// the broker's per-spawn exe-dir grants resolve.
+    /// {Everyone, Authenticated Users, Users, RESTRICTED,
+    /// Logon SID}. With `keep_enabled = []` the *normal*-SID
+    /// check is already the FS boundary — only objects
+    /// granting `ALL APP PACKAGES` (lowbox-added), the AC
+    /// SID, or the Logon SID pass it, and user files grant
+    /// none of those. The restricting list is therefore
+    /// widened to the USER_LIMITED set so passthrough'd
+    /// opens of `\Device\Afd` (grants `Authenticated
+    /// Users`), system registry/sections (grant `Users`),
+    /// and `\BaseNamedObjects` (grants `Everyone`) all
+    /// satisfy the restricting check; the normal check stays
+    /// tight. `CreateRestrictedToken` rejects every
+    /// `S-1-15-*` SID in `SidsToRestrict` (verified for
+    /// `S-1-15-2-1` at ff18fb4), so the restricting list
+    /// can't simply mirror the lowbox-enabled groups.
     Lockdown,
     /// {S-1-0-0}. Chromium USER_LOCKDOWN — every access check
     /// fails the restricting pass unless the object's DACL grants
@@ -200,7 +201,12 @@ pub fn make_lockdown_with(
                 if let Some(l) = logon_sid {
                     v.push(SID_AND_ATTRIBUTES { Sid: l, Attributes: 0 });
                 }
-                for s in ["S-1-1-0" /*Everyone*/, "S-1-5-12" /*RESTRICTED*/] {
+                for s in [
+                    "S-1-1-0",      // Everyone
+                    "S-1-5-11",     // Authenticated Users
+                    "S-1-5-32-545", // BUILTIN\Users
+                    "S-1-5-12",     // RESTRICTED
+                ] {
                     if let Some(p) = str_sid(s) {
                         owned_restrict.push(p);
                         v.push(SID_AND_ATTRIBUTES { Sid: p, Attributes: 0 });
