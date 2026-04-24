@@ -91,25 +91,26 @@ fn run_appcontainer(pol: &Policy) -> Result<u32> {
         acls.grant(dir.to_str().unwrap(), ac.sid, &ac.sid_string, READ_EXECUTE).ok();
     }
 
-    // Filesystem policy → ACEs.
+    // Filesystem policy → ACEs. Deny first so the explicit deny ACE is
+    // already on the object when the allow propagation reaches it
+    // (SetEntriesInAclW merges, keeping deny ahead of allow).
+    let mut acl_op = |op: &str, p: &str, mask: u32, deny: bool| {
+        let r = if deny { acls.deny(p, ac.sid, &ac.sid_string, mask) }
+                else    { acls.grant(p, ac.sid, &ac.sid_string, mask) };
+        if let Err(e) = r { log!("ACL {op} {p}: {e:#}"); }
+    };
+    for p in &pol.deny_read {
+        if std::path::Path::new(p).exists() { acl_op("deny-read", p, 0x1F01FF /*FILE_ALL_ACCESS*/, true); }
+    }
+    for p in &pol.deny_write {
+        if std::path::Path::new(p).exists() { acl_op("deny-write", p, MODIFY, true); }
+    }
     for p in &pol.allow_read {
-        if std::path::Path::new(p).exists() {
-            acls.grant(p, ac.sid, &ac.sid_string, READ_EXECUTE).ok();
-        }
+        if std::path::Path::new(p).exists() { acl_op("allow-read", p, READ_EXECUTE, false); }
     }
     for p in &pol.allow_write {
         std::fs::create_dir_all(p).ok();
-        acls.grant(p, ac.sid, &ac.sid_string, MODIFY).ok();
-    }
-    for p in &pol.deny_read {
-        if std::path::Path::new(p).exists() {
-            acls.deny(p, ac.sid, &ac.sid_string, READ_EXECUTE).ok();
-        }
-    }
-    for p in &pol.deny_write {
-        if std::path::Path::new(p).exists() {
-            acls.deny(p, ac.sid, &ac.sid_string, MODIFY).ok();
-        }
+        acl_op("allow-write", p, MODIFY, false);
     }
 
     log!("ACLs applied: {} grants/denies", pol.allow_read.len() + pol.allow_write.len() + pol.deny_read.len() + pol.deny_write.len());
@@ -142,10 +143,17 @@ fn run_appcontainer(pol: &Policy) -> Result<u32> {
         log!("no proxy ports in policy; skipping bridge");
     }
 
-    // Launch the real target inside the AC + Job (+ alternate desktop).
-    log!("launching target: {}", pol.command_line);
+    // The AC must be able to read its cwd or cmd.exe fails with "The
+    // current directory is invalid". Use the first allow_write (or the
+    // AC package folder) instead of the broker's cwd, which the AC
+    // generally cannot reach.
+    let target_cwd = pol.allow_write.iter()
+        .find(|p| std::path::Path::new(p).is_dir())
+        .cloned()
+        .unwrap_or_else(|| ac.folder.to_string_lossy().into_owned());
+    log!("launching target (cwd={}): {}", target_cwd, pol.command_line);
     let pi = spawn_in_ac(&ac, &job, desktop.as_ref(), &pol.command_line,
-                         pol.cwd.as_deref(), &extra_env)?;
+                         Some(&target_cwd), &extra_env)?;
     log!("target pid={}", pi.dwProcessId);
     unsafe { WaitForSingleObject(pi.hProcess, INFINITE); }
     let mut code = 0u32;
