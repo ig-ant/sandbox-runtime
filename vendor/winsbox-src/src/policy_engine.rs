@@ -26,7 +26,18 @@ pub struct FsPolicy {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Decision { Allow, Deny(&'static str) }
+pub enum Decision {
+    /// Open with the broker's full token (filesystem paths the
+    /// lockdown token can't reach).
+    Allow,
+    /// Open while impersonating the target's lowbox token.
+    /// Device endpoints (AFD, ConDrv, …) tag themselves with the
+    /// *creator*'s AppContainer at NtCreateFile time; opening
+    /// them with the broker's non-AC token yields a non-AC
+    /// socket that the target then can't connect on.
+    AllowAsTarget,
+    Deny(&'static str),
+}
 
 impl FsPolicy {
     pub fn from_policy(p: &Policy) -> Self {
@@ -55,18 +66,19 @@ impl FsPolicy {
         // device opens the lockdown token can already do never
         // reach the broker.
         if let Some(dev) = lower.strip_prefix(r"\device\") {
-            return if dev.starts_with("afd")
-                || dev.starts_with("condrv")
-                || dev == "null"
-                || dev.starts_with("deviceapi")
-                || dev == "cng"
-                || dev == "ksecdd"
-                || dev == "nsi"
-                || dev.starts_with("mailslot")
+            return if dev.starts_with("harddiskvolume")
+                || dev.starts_with("mup")
+                || dev.starts_with("lanmanredirector")
+                || dev.starts_with("namedpipe\\")
+                || dev.starts_with("physicaldrive")
             {
-                Decision::Allow
+                Decision::Deny("device→fs/pipe namespace")
             } else {
-                Decision::Deny("device namespace")
+                // AFD/ConDrv/CNG/KsecDD/Nsi/NetBT etc. — open
+                // under the target's lowbox token so the
+                // endpoint is AC-tagged and the target can use
+                // it; the device driver enforces the boundary.
+                Decision::AllowAsTarget
             };
         }
         if let Some(rest) = lower.strip_prefix(r"\??\") {

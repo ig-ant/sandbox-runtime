@@ -448,7 +448,11 @@ fn handle_cpw(ch: &ipc::Channel, target: HANDLE, req: &ipc::Wire, ctx: &Arc<Spaw
     //   [8]=lpCurrentDirectory, [9]=lpStartupInfo, [10]=lpProcessInformation.
     let app = read_target_wstr(target, req.args[1] as usize).unwrap_or_default();
     let cmd = read_target_wstr(target, req.args[2] as usize).unwrap_or_default();
-    let cwd = read_target_wstr(target, req.args[8] as usize).ok();
+    // NULL lpCurrentDirectory means "inherit caller's cwd";
+    // read_target_wstr returns "" for null, which
+    // CreateProcessAsUserW rejects with ERROR_INVALID_NAME.
+    let cwd = read_target_wstr(target, req.args[8] as usize)
+        .ok().filter(|s| !s.is_empty());
     let caller_flags = req.args[6] as u32;
     let si = read_target_startupinfo(target, req.args[9] as usize);
     let cmdline = if !cmd.is_empty() { cmd } else { app.clone() };
@@ -509,32 +513,39 @@ fn handle_fs(ch: &ipc::Channel, target: HANDLE, req: &ipc::Wire, ctx: &Arc<Spawn
         }
     };
     use crate::policy_engine::Decision;
-    match ctx.fs.evaluate(&path, access) {
+    let imp = match ctx.fs.evaluate(&path, access) {
         Decision::Deny(why) => {
             eprintln!("[sbox-exec] fs: DENY {path} ({why}, access={access:#x})");
             ch.reply_fs(0, 0, 0xC0000022u32 as i32 /* STATUS_ACCESS_DENIED */);
+            return;
         }
-        Decision::Allow => match broker_open(req, &path) {
-            Ok((h, info)) => {
-                let th = ch.dup_to_target(h).unwrap_or(0);
-                unsafe { let _ = CloseHandle(h); }
-                ch.reply_fs(th, info, 0);
+        Decision::Allow => HANDLE::default(),
+        Decision::AllowAsTarget => ctx.initial,
+    };
+    match broker_open(req, &path, imp) {
+        Ok((h, info)) => {
+            let th = ch.dup_to_target(h).unwrap_or(0);
+            unsafe { let _ = CloseHandle(h); }
+            ch.reply_fs(th, info, 0);
+        }
+        Err(st) => {
+            if st != 0xC0000034u32 as i32 /* OBJECT_NAME_NOT_FOUND */ {
+                eprintln!("[sbox-exec] fs: open {path}: {st:#x}");
             }
-            Err(st) => {
-                if st != 0xC0000034u32 as i32 /* OBJECT_NAME_NOT_FOUND */ {
-                    eprintln!("[sbox-exec] fs: open {path}: {st:#x}");
-                }
-                ch.reply_fs(0, 0, st);
-            }
-        },
+            ch.reply_fs(0, 0, st);
+        }
     }
 }
 
 /// Issue the brokered `NtCreateFile`/`NtOpenFile` with the
-/// caller's flags under the broker's full token. Returns the
-/// broker-side handle + `IO_STATUS_BLOCK.Information`, or the raw
-/// `NTSTATUS` on failure.
-fn broker_open(req: &ipc::Wire, nt_path: &str) -> std::result::Result<(HANDLE, u64), i32> {
+/// caller's flags. If `impersonate` is non-null, the open
+/// happens under that token (used for `\Device\*` so the
+/// endpoint is created in the target's AppContainer); otherwise
+/// under the broker's full token. Returns the broker-side
+/// handle + `IO_STATUS_BLOCK.Information`, or the raw `NTSTATUS`.
+fn broker_open(
+    req: &ipc::Wire, nt_path: &str, impersonate: HANDLE,
+) -> std::result::Result<(HANDLE, u64), i32> {
     use windows::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows::Win32::Foundation::{NTSTATUS, UNICODE_STRING};
     #[link(name = "ntdll")]
@@ -564,6 +575,9 @@ fn broker_open(req: &ipc::Wire, nt_path: &str) -> std::result::Result<(HANDLE, u
             SecurityDescriptor: std::ptr::null_mut(),
             SecurityQualityOfService: std::ptr::null_mut(),
         };
+        if !impersonate.is_invalid() {
+            let _ = SetThreadToken(None, impersonate);
+        }
         let mut h = HANDLE::default();
         let mut iosb = [0usize; 2];
         let access = req.args[1] as u32;
@@ -580,6 +594,9 @@ fn broker_open(req: &ipc::Wire, nt_path: &str) -> std::result::Result<(HANDLE, u
                 req.args[4] as u32,             // ShareAccess
                 req.args[5] as u32)             // OpenOptions
         };
+        if !impersonate.is_invalid() {
+            let _ = SetThreadToken(None, None);
+        }
         if st.0 < 0 { Err(st.0) } else { Ok((h, iosb[1] as u64)) }
     }
 }
@@ -681,11 +698,16 @@ fn broker_spawn(
     // ACE is inert once the AC profile is deleted.
     if let Some(app) = app {
         if let Some(dir) = std::path::Path::new(app).parent() {
-            if let Some(d) = dir.to_str() {
+            let d = dir.to_string_lossy();
+            // System32 / Program Files already grant
+            // ALL APPLICATION PACKAGES; icacls on them fails
+            // with Access Denied and just spams the log.
+            let lc = d.to_ascii_lowercase();
+            if !lc.starts_with(r"c:\windows")
+                && !lc.starts_with(r"c:\program files")
+            {
                 for sid in [ctx.ac_sid_string.as_str(), "S-1-5-12"] {
-                    if let Err(e) = crate::acl::grant_oneshot(d, sid, READ_EXECUTE) {
-                        eprintln!("[sbox-exec] broker_spawn: grant {sid} on {d}: {e:#}");
-                    }
+                    let _ = crate::acl::grant_oneshot(&d, sid, READ_EXECUTE);
                 }
             }
         }
