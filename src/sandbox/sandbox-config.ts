@@ -255,6 +255,13 @@ export const WindowsConfigSchema = z.object({
         'stub = no confinement (test scaffold); app-container = Phase 1; broker = Phase 2.',
     ),
   useAlternateDesktop: z.boolean().optional(),
+  brokerFs: z
+    .boolean()
+    .optional()
+    .describe(
+      'Hook NtCreateFile/NtOpenFile so file opens go through the ' +
+        'broker policy engine. Default true in broker mode.',
+    ),
 })
 
 /**

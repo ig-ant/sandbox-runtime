@@ -129,6 +129,12 @@ export async function wrapCommandWithSandboxWindows(
     // Off by default until conhost-on-alt-desktop is sorted; the Job
     // UI restrictions already block the cross-process window vectors.
     useAlternateDesktop: p.windowsConfig?.useAlternateDesktop ?? false,
+    // Hook NtCreateFile/NtOpenFile so reads/writes go through the
+    // broker's policy engine instead of relying on Phase-1 ACL
+    // grants alone. Lets the lockdown token open paths the AC SID
+    // wasn't granted on (tool install dirs, ambient reads).
+    brokerFs:
+      p.windowsConfig?.brokerFs ?? defaultMode(p.windowsConfig) === 'broker',
     mode: defaultMode(p.windowsConfig),
   }
 

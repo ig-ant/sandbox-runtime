@@ -406,9 +406,9 @@ fn install_broker_hook(
     }
     let cpw = crate::entry_trampoline::cpw_address()?;
     interception::install(target, &ch, cpw, ctx.hook_fs)?;
-    sync.go();
     let target_raw = target.0 as isize;
     let _ = std::thread::spawn(move || serve_ipc(ch, target_raw, ctx));
+    sync.go();
     Ok(())
 }
 
