@@ -105,6 +105,10 @@ fn run_appcontainer(pol: &Policy) -> Result<u32> {
         if std::path::Path::new(p).exists() { acl_op("allow-read", p, READ_EXECUTE, false); }
     }
     for p in &pol.allow_write {
+        // Skip device names (NUL, CON, …) — not real filesystem objects.
+        let leaf = std::path::Path::new(p).file_name()
+            .map(|f| f.to_string_lossy().to_ascii_uppercase()).unwrap_or_default();
+        if matches!(leaf.as_str(), "NUL" | "CON" | "PRN" | "AUX") { continue; }
         std::fs::create_dir_all(p).ok();
         acl_op("allow-write", p, MODIFY, false);
     }

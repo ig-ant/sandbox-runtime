@@ -120,11 +120,11 @@ d(`windows sandbox [WINSBOX_PHASE=${PHASE}]`, () => {
 
   compat('curl allowed domain via proxy succeeds', 'stub', async () => {
     const r = await runSandboxed(
-      'curl.exe -sS -o NUL -w "%{http_code}" https://example.com/',
+      'curl.exe -sSI https://example.com/',
       fx.config,
     )
     expect(r.exitCode).toBe(0)
-    expect(r.stdout.trim()).toMatch(/^[23]\d\d$/)
+    expect(r.stdout).toMatch(/HTTP\/[\d.]+ [23]\d\d/)
   })
 
   compat('npm view (multi-process + network) succeeds', toolPhase, async () => {

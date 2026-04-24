@@ -13,23 +13,31 @@ pub struct AclJournal {
 
 impl AclJournal {
     pub fn grant(&mut self, path: &str, sid_str: &str, perm: &str) -> Result<()> {
-        run_icacls(&[path, "/grant", &format!("*{sid_str}:(OI)(CI){perm}")])?;
+        // (OI)(CI) only valid on directories.
+        let spec = if std::path::Path::new(path).is_dir() {
+            format!("*{sid_str}:(OI)(CI)({perm})")
+        } else {
+            format!("*{sid_str}:({perm})")
+        };
+        run_icacls(&[path, "/grant", &spec])?;
         self.entries.push((path.to_string(), sid_str.to_string()));
         Ok(())
     }
     pub fn deny(&mut self, path: &str, sid_str: &str, perm: &str) -> Result<()> {
-        // Deny both the per-instance package SID and ALL APPLICATION
-        // PACKAGES (S-1-15-2-1) — the AC token carries both.
-        run_icacls(&[path, "/deny", &format!("*{sid_str}:(OI)(CI){perm}")])?;
-        self.entries.push((path.to_string(), sid_str.to_string()));
-        run_icacls(&[path, "/deny", &format!("*S-1-15-2-1:(OI)(CI){perm}")])?;
-        self.entries.push((path.to_string(), "S-1-15-2-1".to_string()));
+        // /deny perm spec must be the simple "(F)" form — including
+        // inheritance flags here yields an allow-mask-0 ACE instead
+        // of an ACCESS_DENIED_ACE. Use /T to recurse to existing
+        // children. Deny both the package SID and ALL APPLICATION
+        // PACKAGES (S-1-15-2-1) since the AC token carries both.
+        for s in [sid_str, "S-1-15-2-1"] {
+            run_icacls(&[path, "/deny", &format!("*{s}:({perm})"), "/T", "/C"])?;
+            self.entries.push((path.to_string(), s.to_string()));
+        }
         Ok(())
     }
     pub fn revert_all(&mut self) {
         for (path, sid_str) in self.entries.drain(..) {
-            let _ = run_icacls(&[&path, "/remove:g", &format!("*{sid_str}")]);
-            let _ = run_icacls(&[&path, "/remove:d", &format!("*{sid_str}")]);
+            let _ = run_icacls(&[&path, "/remove", &format!("*{sid_str}"), "/T", "/C"]);
         }
     }
 }
