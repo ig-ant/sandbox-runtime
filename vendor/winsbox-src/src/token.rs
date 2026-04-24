@@ -50,37 +50,67 @@ pub fn open_self_token() -> Result<HANDLE> {
     }
 }
 
-/// Lockdown primary: deny-only on every group except the Logon SID,
-/// restricting SID = NULL SID, all privileges deleted except
-/// SeChangeNotify. IL is set by the caller (Low for launch; the entry
-/// trampoline can drop it to Untrusted post-init in a later commit).
+/// Phase-2a primary token: USER_LIMITED. Deny-only on
+/// admin/elevated groups, keep Users/Everyone/Authenticated Users
+/// (so child processes that inherit this token can still read
+/// system files without the broker's NtCreateUserProcess hook),
+/// drop every privilege except SeChangeNotify, Low IL. Phase-2b
+/// (interception) replaces this with USER_LOCKDOWN (deny-all +
+/// NULL restricting SID) once the broker can re-apply
+/// impersonation/hooks to grandchildren.
 pub fn make_lockdown(base: HANDLE, il_rid: u32) -> Result<HANDLE> {
     unsafe {
         let groups_buf = get_token_info(base, TokenGroups)?;
         let groups = &*(groups_buf.as_ptr() as *const TOKEN_GROUPS);
         let garr = std::slice::from_raw_parts(
             groups.Groups.as_ptr(), groups.GroupCount as usize);
+
+        // Deny only the elevated groups; keep Users/Everyone/AuthUsers/
+        // Logon SID enabled.
+        let keep_sids: Vec<PSID> = [
+            "S-1-1-0",   // Everyone
+            "S-1-5-11",  // Authenticated Users
+            "S-1-5-32-545", // BUILTIN\Users
+        ].iter().filter_map(|s| {
+            use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
+            let mut sid = PSID::default();
+            ConvertStringSidToSidW(pcwstr(&wstr(s)), &mut sid).ok()?;
+            Some(sid)
+        }).collect();
         let deny: Vec<SID_AND_ATTRIBUTES> = garr.iter()
-            .filter(|g| g.Attributes & (SE_GROUP_LOGON_ID as u32) == 0)
+            .filter(|g| {
+                if g.Attributes & (SE_GROUP_LOGON_ID as u32) != 0 { return false; }
+                if g.Attributes & 0x20 /*INTEGRITY*/ != 0 { return false; }
+                !keep_sids.iter().any(|k|
+                    windows::Win32::Security::EqualSid(*k, g.Sid).is_ok())
+            })
             .map(|g| SID_AND_ATTRIBUTES { Sid: g.Sid, Attributes: 0 })
             .collect();
 
-        let to_delete = privileges_except(base, &["SeChangeNotifyPrivilege"])?;
+        // Restricting list = the kept SIDs + Logon SID, so the token
+        // is flagged restricted (SeTokenCanImpersonate axis) while
+        // still granting Users-level read.
+        let mut restrict: Vec<SID_AND_ATTRIBUTES> =
+            keep_sids.iter().map(|s| SID_AND_ATTRIBUTES { Sid: *s, Attributes: 0 }).collect();
+        for g in garr {
+            if g.Attributes & (SE_GROUP_LOGON_ID as u32) != 0 {
+                restrict.push(SID_AND_ATTRIBUTES { Sid: g.Sid, Attributes: 0 });
+            }
+        }
 
-        let null_auth = SID_IDENTIFIER_AUTHORITY { Value: [0,0,0,0,0,0] };
-        let mut null_sid = PSID::default();
-        AllocateAndInitializeSid(&null_auth, 1, 0,0,0,0,0,0,0,0, &mut null_sid)?;
-        let restrict = [SID_AND_ATTRIBUTES { Sid: null_sid, Attributes: 0 }];
+        let to_delete = privileges_except(base, &["SeChangeNotifyPrivilege"])?;
 
         let mut out = HANDLE::default();
         CreateRestrictedToken(
             base, CREATE_RESTRICTED_TOKEN_FLAGS(0),
-            Some(&deny),
+            if deny.is_empty() { None } else { Some(&deny) },
             if to_delete.is_empty() { None } else { Some(&to_delete) },
             Some(&restrict),
             &mut out,
-        ).context("CreateRestrictedToken(lockdown)")?;
-        FreeSid(null_sid);
+        ).context("CreateRestrictedToken(USER_LIMITED)")?;
+        for s in keep_sids { FreeSid(s); }
+        let _ = AllocateAndInitializeSid; // keep import
+        let _ = SID_IDENTIFIER_AUTHORITY { Value: [0;6] };
         set_il(out, il_rid)?;
         Ok(out)
     }
