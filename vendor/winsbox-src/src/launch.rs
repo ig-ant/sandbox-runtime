@@ -666,43 +666,36 @@ fn handle_reg(
             return;
         }
     };
-    let access = if req.op == ipc::OP_NTOPENSECTION {
-        // Sections: there is no one read mask (KnownDlls need
-        // MAP_EXECUTE, the win32k `SharedSection` needs
-        // MAP_WRITE and *not* MAP_EXECUTE). Passthrough on any
-        // write bit or MAXIMUM_ALLOWED — under USER_LIMITED the
-        // target's token opens it directly; under USER_LOCKDOWN
-        // the loader-time opens are on the main thread under
-        // the initial impersonation token, and post-RevertToSelf
-        // the `Restricting::Lockdown` list (Everyone) lets
-        // system sections through. Read-only requests are
-        // brokered with the exact requested mask.
-        if req_access & (SEC_WRITE_BITS | MAXIMUM_ALLOWED) != 0 {
-            if ctx.trace {
-                eprintln!("[sbox-exec] sec: passthrough access={req_access:#x} {leaf}");
-            }
-            ch.reply_fs(0, 0, ipc::FS_PASSTHROUGH);
-            return;
+    // Passthrough on any explicit write bit. Under
+    // USER_LIMITED the target's token opens it directly;
+    // under USER_LOCKDOWN the `Restricting::Lockdown` list
+    // (Everyone, RESTRICTED, Logon) plus the lowbox-added
+    // ALL APP PACKAGES enabled group lets system registry/
+    // sections through anyway. Brokering every
+    // KEY_ALL_ACCESS open (12e3d0d tried this) adds hundreds
+    // of IPCs and risks an `ExitProcess`-time hang where a
+    // thread is killed mid-stub holding the section
+    // spinlock and a `DLL_PROCESS_DETACH` callback then
+    // spins forever.
+    let write_bits = if req.op == ipc::OP_NTOPENSECTION {
+        SEC_WRITE_BITS
+    } else { KEY_WRITE_BITS };
+    if req_access & write_bits != 0 {
+        if ctx.trace {
+            eprintln!("[sbox-exec] {tag}: passthrough write access={req_access:#x} {leaf}");
         }
-        req_access
-    } else {
-        // Registry: Win32 routinely opens with KEY_ALL_ACCESS
-        // / MAXIMUM_ALLOWED then only reads (`WSAStartup` on
-        // `WinSock2\Parameters`, `RegOpenKeyEx` on HKLM/HKCU
-        // roots). Broker every open that has any read intent
-        // with KEY_READ; the dup'd handle is read-only so
-        // `NtSetValueKey` on it fails ACCESS_DENIED — same
-        // effective write policy. Pure-write requests
-        // passthrough for the lockdown token to deny.
-        if req_access & KEY_READ_INTENT == 0 && req_access & KEY_WRITE_BITS != 0 {
-            if ctx.trace {
-                eprintln!("[sbox-exec] reg: passthrough write-only access={req_access:#x} {leaf}");
-            }
-            ch.reply_fs(0, 0, ipc::FS_PASSTHROUGH);
-            return;
-        }
-        KEY_READ | (req_access & KEY_WOW64)
-    };
+        ch.reply_fs(0, 0, ipc::FS_PASSTHROUGH);
+        return;
+    }
+    // MAXIMUM_ALLOWED under the broker's token would resolve
+    // to write — substitute the read mask. kernelbase opens
+    // the HKLM/HKCU roots this way and every subkey hangs
+    // off the result.
+    let _ = KEY_READ_INTENT;
+    let access = if req_access & MAXIMUM_ALLOWED != 0 {
+        (if req.op == ipc::OP_NTOPENSECTION { req_access & !MAXIMUM_ALLOWED }
+         else { KEY_READ }) | (req_access & KEY_WOW64)
+    } else { req_access };
     let root_h = if root_raw != 0 {
         match dup_from_target(target, root_raw) {
             Ok(h) => h,
