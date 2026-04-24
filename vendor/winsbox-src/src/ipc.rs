@@ -27,20 +27,26 @@ use windows::Win32::System::Threading::{
     CreateEventW, GetCurrentProcess, SetEvent, WaitForSingleObject,
 };
 
-/// Section layout. The stub writes [0..0x58); the broker writes
-/// [0x60..0x80). All fields are raw 64-bit values (handles are
-/// target-side handle table entries; pointers are target-VA).
+/// Section layout for the `CreateProcessInternalW` hook. The stub
+/// writes `args` (12×u64); the broker writes the `out_*` fields.
+/// Handle values are target-side; pointer values are target-VA.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Wire {
-    pub args: [u64; 11],     // 0x00..0x58: rcx,rdx,r8,r9,[rsp+0x28..0x58]
-    pub _pad: u64,           // 0x58
-    pub out_process: u64,    // 0x60: target-side HANDLE
-    pub out_thread: u64,     // 0x68
-    pub out_status: i32,     // 0x70: NTSTATUS
-    pub out_pid: u32,        // 0x74
+    /// rcx,rdx,r8,r9,[rsp+0x28..0x60] — i.e. CreateProcessInternalW's
+    /// (hUserToken, lpApplicationName, lpCommandLine,
+    ///  lpProcessAttributes, lpThreadAttributes, bInheritHandles,
+    ///  dwCreationFlags, lpEnvironment, lpCurrentDirectory,
+    ///  lpStartupInfo, lpProcessInformation, phRestrictedToken).
+    pub args: [u64; 12],     // 0x00..0x60
+    pub out_process: u64,    // 0x60: target-side hProcess
+    pub out_thread: u64,     // 0x68: target-side hThread
+    pub out_pid: u32,        // 0x70
+    pub out_tid: u32,        // 0x74
+    pub out_result: u32,     // 0x78: BOOL
+    pub out_error: u32,      // 0x7c: GetLastError on failure
 }
-const _: () = assert!(size_of::<Wire>() == 0x78);
+const _: () = assert!(size_of::<Wire>() == 0x80);
 
 pub const SECTION_SIZE: usize = 4096;
 
@@ -113,12 +119,25 @@ impl Channel {
         }
     }
 
-    pub fn reply(&self, out_process: u64, out_thread: u64, status: i32, pid: u32) {
+    pub fn reply_ok(&self, hproc: u64, hthread: u64, pid: u32, tid: u32) {
         unsafe {
-            (*self.view).out_process = out_process;
-            (*self.view).out_thread  = out_thread;
-            (*self.view).out_status  = status;
+            (*self.view).out_process = hproc;
+            (*self.view).out_thread  = hthread;
             (*self.view).out_pid     = pid;
+            (*self.view).out_tid     = tid;
+            (*self.view).out_result  = 1;
+            (*self.view).out_error   = 0;
+            let _ = SetEvent(self.ev_resp);
+        }
+    }
+    pub fn reply_err(&self, error: u32) {
+        unsafe {
+            (*self.view).out_process = 0;
+            (*self.view).out_thread  = 0;
+            (*self.view).out_pid     = 0;
+            (*self.view).out_tid     = 0;
+            (*self.view).out_result  = 0;
+            (*self.view).out_error   = error;
             let _ = SetEvent(self.ev_resp);
         }
     }
@@ -141,7 +160,7 @@ impl Drop for Channel {
     }
 }
 
-fn dup_into(target: HANDLE, src: HANDLE) -> Result<u64> {
+pub fn dup_into(target: HANDLE, src: HANDLE) -> Result<u64> {
     unsafe {
         let mut out = HANDLE::default();
         DuplicateHandle(

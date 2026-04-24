@@ -256,11 +256,13 @@ fn run_confined(pol: &Policy) -> Result<u32> {
         threads: Mutex::new(Vec::new()),
     }));
     if let Some(ctx) = ctx.as_ref() {
-        match install_broker_hook(pi.hProcess, ctx.clone()) {
+        match install_broker_hook(pi.hProcess, pi.hThread, ctx.clone()) {
             Ok(()) => log!("interception installed on target"),
-            Err(e) => log!("interception install failed ({e:#}); grandchild spawns will fail"),
+            Err(e) => {
+                log!("interception install failed ({e:#}); grandchild spawns will fail");
+                unsafe { ResumeThread(pi.hThread); }
+            }
         }
-        unsafe { ResumeThread(pi.hThread); }
     }
 
     unsafe { WaitForSingleObject(pi.hProcess, INFINITE); }
@@ -376,326 +378,157 @@ fn spawn_in_ac(
 
 // ─── Phase-2b broker-mediated spawn ────────────────────────────────
 
-/// Create an IPC channel for `target`, install the
-/// `NtCreateUserProcess` hook, and spawn the per-channel service
-/// thread. Called once for the immediate target and recursively
-/// for each grandchild the broker spawns.
-fn install_broker_hook(target: HANDLE, ctx: Arc<SpawnCtx>) -> Result<()> {
+/// Create an IPC channel for `target`, install the entry-point
+/// rendezvous, **resume** the target so its loader runs, wait for
+/// the rendezvous, patch `kernelbase!CreateProcessInternalW`, let
+/// the target continue, and spawn the per-channel service thread.
+/// Called once for the immediate target and recursively for each
+/// grandchild the broker spawns. The target must be SUSPENDED on
+/// entry; on success it is running.
+fn install_broker_hook(
+    target: HANDLE, thread: HANDLE, ctx: Arc<SpawnCtx>,
+) -> Result<()> {
     let ch = ipc::Channel::create(target)?;
-    interception::install(target, &ch)?;
+    let sync = crate::entry_trampoline::install(target, thread)?;
+    unsafe { ResumeThread(thread); }
+    if !sync.wait_loaded(15_000) {
+        bail!("entry rendezvous timed out (loader hung?)");
+    }
+    let cpw = crate::entry_trampoline::cpw_address()?;
+    interception::install(target, &ch, cpw)?;
+    sync.go();
     let target_raw = target.0 as isize;
-    let h = std::thread::spawn(move || serve_ipc(ch, target_raw, ctx));
-    // Can't push into ctx.threads here because ctx was moved into
-    // the closure above. The caller holds another Arc and pushes.
-    // Actually we cloned ctx; push via the clone the caller has.
-    // Simpler: return the JoinHandle and let the caller stash it.
-    // But we recursively call from inside serve_ipc too. Use a
-    // detached model: stash via a static — no, use ctx.threads
-    // *before* moving ctx into the thread.
-    // Re-do: clone ctx for the thread, keep one here for the push.
-    let _ = h; // detached; ctx.stop + Job KILL_ON_JOB_CLOSE bound it.
+    let _ = std::thread::spawn(move || serve_ipc(ch, target_raw, ctx));
     Ok(())
 }
 
 /// Per-channel service loop. Blocks on `ev_req`; on each request,
-/// reads the target's `RTL_USER_PROCESS_PARAMETERS→CommandLine`,
-/// performs the spawn under the broker's token recipe, recursively
-/// installs the hook in the new process, DuplicateHandle's the
-/// process+thread into the requesting target, and replies.
+/// reads the caller's `lpCommandLine` / `dwCreationFlags`, performs
+/// the spawn under the broker's token recipe (forwarding the
+/// caller's console flags), recursively installs the hook in the
+/// new process, `DuplicateHandle`s process+thread into the
+/// requesting target, and replies with `PROCESS_INFORMATION`.
 fn serve_ipc(ch: ipc::Channel, target_raw: isize, ctx: Arc<SpawnCtx>) {
     let target = HANDLE(target_raw as *mut c_void);
     while !ctx.stop.load(Ordering::Relaxed) {
         let req = match ch.wait_request(250) { Some(r) => r, None => continue };
-        // args[8] = PRTL_USER_PROCESS_PARAMETERS (target VA).
-        let cmdline = match read_target_cmdline(target, req.args[8] as usize) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("[sbox-exec] ipc: read cmdline failed: {e:#}");
-                ch.reply(0, 0, 0xC0000022u32 as i32 /*STATUS_ACCESS_DENIED*/, 0);
-                continue;
-            }
-        };
-        eprintln!("[sbox-exec] ipc: brokered spawn: {cmdline}");
-        match broker_spawn(&ctx, &cmdline) {
+        // CreateProcessInternalW args:
+        //   [1]=lpApplicationName, [2]=lpCommandLine, [6]=dwCreationFlags,
+        //   [8]=lpCurrentDirectory, [10]=lpProcessInformation.
+        let app = read_target_wstr(target, req.args[1] as usize).unwrap_or_default();
+        let cmd = read_target_wstr(target, req.args[2] as usize).unwrap_or_default();
+        let cwd = read_target_wstr(target, req.args[8] as usize).ok();
+        let caller_flags = req.args[6] as u32;
+        let cmdline = if !cmd.is_empty() { cmd } else { app.clone() };
+        if cmdline.is_empty() {
+            eprintln!("[sbox-exec] ipc: empty cmdline (app={app:?})");
+            ch.reply_err(87 /* ERROR_INVALID_PARAMETER */);
+            continue;
+        }
+        eprintln!(
+            "[sbox-exec] ipc: brokered spawn: {cmdline}  (flags={caller_flags:#x} app={app:?})"
+        );
+        let app_opt = (!app.is_empty()).then_some(app.as_str());
+        match broker_spawn(&ctx, app_opt, &cmdline, cwd.as_deref(), caller_flags) {
             Ok(child) => {
-                // Recursively hook the grandchild before resuming.
-                if let Err(e) = install_broker_hook(child.hProcess, ctx.clone()) {
-                    eprintln!("[sbox-exec] ipc: recurse hook failed: {e:#}");
+                // Recursively hook the grandchild. This resumes it
+                // (for the rendezvous), waits for its loader, patches
+                // CreateProcessInternalW, and lets it run. If the
+                // caller asked CREATE_SUSPENDED that intent is lost —
+                // acceptable for cmd/npm/node which never do.
+                if let Err(e) = install_broker_hook(
+                    child.hProcess, child.hThread, ctx.clone(),
+                ) {
+                    eprintln!("[sbox-exec] ipc: recurse hook failed: {e:#}; child runs unhooked");
+                    unsafe { ResumeThread(child.hThread); }
                 }
                 let p = ch.dup_to_target(child.hProcess).unwrap_or(0);
                 let t = ch.dup_to_target(child.hThread).unwrap_or(0);
-                // kernel32!CreateProcessInternalW reads PS_CREATE_INFO
-                // and the PS_ATTRIBUTE_CLIENT_ID/IMAGE_INFO out-attrs
-                // after NtCreateUserProcess returns; populate them so
-                // it doesn't fail post-processing.
-                if let Err(e) = fill_create_outparams(
-                    &ch, target, &req, &child, p, t,
-                ) {
-                    eprintln!("[sbox-exec] ipc: fill outparams: {e:#}");
-                }
-                // Do NOT resume here. The duplicated thread handle has
-                // THREAD_ALL_ACCESS; the requesting process's
-                // CreateProcessInternalW resumes it after its own
-                // post-processing (CSR/conhost), exactly as if the
-                // kernel had done the spawn.
-                ch.reply(p, t, 0 /*STATUS_SUCCESS*/, child.dwProcessId);
+                ch.reply_ok(p, t, child.dwProcessId, child.dwThreadId);
                 // Keep child.hProcess open: the recursive Channel
-                // holds it for future dup_to_target calls (great-
-                // grandchildren). The Job's KILL_ON_JOB_CLOSE bounds
-                // the leak to the target's lifetime. Close hThread
-                // since nothing else needs it.
+                // holds it for future dup_to_target calls. Job
+                // KILL_ON_JOB_CLOSE bounds the leak.
                 unsafe { let _ = CloseHandle(child.hThread); }
             }
             Err(e) => {
-                eprintln!("[sbox-exec] ipc: brokered spawn failed: {e:#}");
-                ch.reply(0, 0, 0xC0000022u32 as i32, 0);
+                let gle = unsafe {
+                    windows::Win32::Foundation::GetLastError().0
+                };
+                eprintln!("[sbox-exec] ipc: brokered spawn failed: {e:#} (gle={gle})");
+                ch.reply_err(if gle != 0 { gle } else { 5 });
             }
         }
     }
 }
 
 /// Spawn `cmdline` under the same restricted+lowbox token + Job +
-/// initial-impersonation recipe used for the immediate target.
-/// Returns SUSPENDED so the caller can install the hook first.
-fn broker_spawn(ctx: &SpawnCtx, cmdline: &str) -> Result<PROCESS_INFORMATION> {
+/// initial-impersonation recipe used for the immediate target,
+/// forwarding the caller's console-related creation flags. Returns
+/// SUSPENDED so the caller can install the hook first.
+fn broker_spawn(
+    ctx: &SpawnCtx,
+    app: Option<&str>,
+    cmdline: &str,
+    cwd: Option<&str>,
+    caller_flags: u32,
+) -> Result<PROCESS_INFORMATION> {
     use windows::Win32::System::JobObjects::AssignProcessToJobObject;
+    use windows::Win32::System::Threading::PROCESS_CREATION_FLAGS;
+    // Forward the flags that affect console/window behaviour and
+    // priority; mask out the ones that would defeat brokering or
+    // duplicate work the broker does itself.
+    const PASS_THROUGH: u32 =
+        0x00000010 /* CREATE_NEW_CONSOLE */ |
+        0x00000200 /* CREATE_NEW_PROCESS_GROUP */ |
+        0x08000000 /* CREATE_NO_WINDOW */ |
+        0x00000008 /* DETACHED_PROCESS */ |
+        0x00040000 /* CREATE_PROTECTED_PROCESS — refused, but pass to surface error */ |
+        0x00000020 | 0x00000040 | 0x00000080 | 0x00008000 |
+        0x00000100 | 0x00100000; /* *_PRIORITY_CLASS */
+    let fwd = PROCESS_CREATION_FLAGS(caller_flags & PASS_THROUGH);
     unsafe {
         let mut cmd = wstr(cmdline);
-        let cwd = wstr(&ctx.cwd);
+        let app_w = app.map(wstr);
+        let app_p = app_w.as_ref().map(|w| pcwstr(w)).unwrap_or(PCWSTR::null());
+        let cwd_w = wstr(cwd.unwrap_or(&ctx.cwd));
         let mut envb = build_env_block(&ctx.env);
         let mut si: STARTUPINFOW = zeroed();
         si.cb = size_of::<STARTUPINFOW>() as u32;
         let mut pi: PROCESS_INFORMATION = zeroed();
         CreateProcessAsUserW(
-            ctx.primary, None, PWSTR(cmd.as_mut_ptr()), None, None, true,
-            CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
+            ctx.primary, app_p, PWSTR(cmd.as_mut_ptr()), None, None, true,
+            CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED | fwd,
             Some(envb.as_mut_ptr() as *mut c_void),
-            PCWSTR(cwd.as_ptr()), &si, &mut pi,
+            PCWSTR(cwd_w.as_ptr()), &si, &mut pi,
         ).with_context(|| format!("CreateProcessAsUserW(brokered, {cmdline})"))?;
         if let Err(e) = SetThreadToken(Some(&pi.hThread), ctx.initial) {
             eprintln!("[sbox-exec] broker_spawn: SetThreadToken: {e}");
         }
         AssignProcessToJobObject(ctx.job, pi.hProcess)
             .context("AssignProcessToJobObject(brokered)")?;
-        let _ = ctx.ac_sid; // kept for future SECURITY_CAPABILITIES use
+        let _ = ctx.ac_sid;
         Ok(pi)
     }
 }
 
-/// Populate the caller's `PS_CREATE_INFO` (arg10) and the
-/// `PS_ATTRIBUTE_CLIENT_ID` / `PS_ATTRIBUTE_IMAGE_INFO` entries in
-/// `PS_ATTRIBUTE_LIST` (arg11) so `CreateProcessInternalW`'s
-/// post-`NtCreateUserProcess` path sees a coherent success state.
-fn fill_create_outparams(
-    ch: &ipc::Channel,
-    target: HANDLE,
-    req: &ipc::Wire,
-    child: &PROCESS_INFORMATION,
-    target_hproc: u64,
-    target_hthread: u64,
-) -> Result<()> {
-    let _ = (target_hproc, target_hthread);
-    // ── PS_CREATE_INFO @ args[9]
-    // Layout (x64): Size:u64 @0x00, State:u32 @0x08, then a union.
-    // For State=PsCreateSuccess(6), SuccessState starts @0x10:
-    //   OutputFlags:u32 @0x10, FileHandle @0x18, SectionHandle @0x20,
-    //   UserProcessParametersNative @0x28, UserProcessParametersWow64 @0x30,
-    //   CurrentParameterFlags @0x34, PebAddressNative @0x38,
-    //   PebAddressWow64 @0x40, ManifestAddress @0x48, ManifestSize @0x50.
-    let ci = req.args[9] as usize;
-    if ci != 0 {
-        let peb = remote_peb(child.hProcess).unwrap_or(0);
-        // PEB+0x20 = ProcessParameters; PEB+0x20+0x08 = its Flags.
-        let upp: u64 = if peb != 0 {
-            interception::read_remote(child.hProcess, peb + 0x20).unwrap_or(0)
-        } else { 0 };
-        let upp_flags: u32 = if upp != 0 {
-            interception::read_remote(child.hProcess, upp as usize + 0x08).unwrap_or(0)
-        } else { 0 };
-        // Reopen the child's image file + SEC_IMAGE section so the
-        // caller's CreateProcessInternalW can run AppCompat / Safer
-        // checks (BasepCheckWinSaferRestrictions reads FileHandle)
-        // and close them on the success path.
-        let (t_file, t_sect) = open_child_image(ch, child.hProcess)
-            .unwrap_or_else(|e| {
-                eprintln!("[sbox-exec] ipc: open_child_image: {e:#}");
-                (0, 0)
-            });
-        eprintln!(
-            "[sbox-exec] ipc: ci peb={:#x} upp={:#x} flags={:#x} file={:#x} sect={:#x}",
-            peb, upp, upp_flags, t_file, t_sect,
-        );
-        interception::write_remote::<u32>(target, ci + 0x08, &6)?;            // State = PsCreateSuccess
-        interception::write_remote::<u32>(target, ci + 0x10, &0)?;            // OutputFlags = 0
-        interception::write_remote::<u64>(target, ci + 0x18, &t_file)?;       // FileHandle
-        interception::write_remote::<u64>(target, ci + 0x20, &t_sect)?;       // SectionHandle
-        interception::write_remote::<u64>(target, ci + 0x28, &upp)?;          // UserProcessParametersNative
-        interception::write_remote::<u32>(target, ci + 0x30, &0)?;            // UserProcessParametersWow64
-        interception::write_remote::<u32>(target, ci + 0x34, &upp_flags)?;    // CurrentParameterFlags
-        interception::write_remote::<u64>(target, ci + 0x38, &(peb as u64))?; // PebAddressNative
-        interception::write_remote::<u32>(target, ci + 0x40, &0)?;            // PebAddressWow64
-        interception::write_remote::<u64>(target, ci + 0x48, &0)?;            // ManifestAddress
-        interception::write_remote::<u32>(target, ci + 0x50, &0)?;            // ManifestSize
-    }
-    // ── PS_ATTRIBUTE_LIST @ args[10]
-    // { TotalLength:u64; Attributes[]: { Attr:u64, Size:u64, ValuePtr:u64, ReturnLength:*u64 } }
-    let al = req.args[10] as usize;
-    if al != 0 {
-        let total: u64 = interception::read_remote(target, al)?;
-        let mut off = 8usize;
-        while off + 0x20 <= total as usize {
-            let attr: u64 = interception::read_remote(target, al + off)?;
-            let size: u64 = interception::read_remote(target, al + off + 8)?;
-            let valp: u64 = interception::read_remote(target, al + off + 16)?;
-            let attr_num = (attr & 0xFFFF) as u32;
-            match attr_num {
-                // PsAttributeClientId = 3 → CLIENT_ID { pid, tid }
-                3 if valp != 0 && size >= 16 => {
-                    interception::write_remote::<u64>(target, valp as usize,
-                        &(child.dwProcessId as u64))?;
-                    interception::write_remote::<u64>(target, valp as usize + 8,
-                        &(child.dwThreadId as u64))?;
-                }
-                // PsAttributeImageInfo = 6 → SECTION_IMAGE_INFORMATION.
-                // CreateProcessInternalW reads SubSystemType (offset
-                // 0x20) and Machine (0x30) here; with the previous
-                // zero-fill cmd.exe printed "cannot be run in Win32
-                // mode". Fetch the real struct from the child we just
-                // created — the broker has full access to it.
-                6 if valp != 0 && size > 0 => {
-                    let sii = query_image_info(child.hProcess)?;
-                    let n = (size as usize).min(sii.len());
-                    eprintln!(
-                        "[sbox-exec] ipc: image_info subsys={} machine={:#x} → {} bytes",
-                        u32::from_le_bytes(sii[0x20..0x24].try_into().unwrap()),
-                        u16::from_le_bytes(sii[0x30..0x32].try_into().unwrap()),
-                        n,
-                    );
-                    let mut written = 0usize;
-                    unsafe {
-                        let _ = windows::Win32::System::Diagnostics::Debug::WriteProcessMemory(
-                            target, valp as *const c_void,
-                            sii.as_ptr() as *const c_void,
-                            n, Some(&mut written),
-                        );
-                    }
-                }
-                _ => {}
-            }
-            off += 0x20;
+/// Read a NUL-terminated wide string from `target` at `va`. Used
+/// to read `lpApplicationName` / `lpCommandLine` /
+/// `lpCurrentDirectory` from the hooked `CreateProcessInternalW`
+/// call. Returns `Ok("")` for a null pointer.
+fn read_target_wstr(target: HANDLE, va: usize) -> Result<String> {
+    if va == 0 { return Ok(String::new()); }
+    const MAX: usize = 32 * 1024;
+    let mut buf = Vec::<u16>::new();
+    let mut off = 0usize;
+    while off < MAX {
+        let chunk: [u16; 128] = interception::read_remote(target, va + off * 2)?;
+        for &w in &chunk {
+            if w == 0 { return Ok(String::from_utf16_lossy(&buf)); }
+            buf.push(w);
         }
+        off += chunk.len();
     }
-    Ok(())
-}
-
-fn remote_peb(proc: HANDLE) -> Result<usize> {
-    use windows::Wdk::System::Threading::{NtQueryInformationProcess, PROCESSINFOCLASS};
-    use windows::Win32::System::Threading::PROCESS_BASIC_INFORMATION;
-    unsafe {
-        let mut pbi: PROCESS_BASIC_INFORMATION = zeroed();
-        let mut len = 0u32;
-        let st = NtQueryInformationProcess(
-            proc, PROCESSINFOCLASS(0),
-            &mut pbi as *mut _ as *mut c_void,
-            size_of::<PROCESS_BASIC_INFORMATION>() as u32, &mut len,
-        );
-        anyhow::ensure!(st.0 >= 0, "NtQueryInformationProcess: {:#x}", st.0);
-        Ok(pbi.PebBaseAddress as usize)
-    }
-}
-
-/// `NtQueryInformationProcess(ProcessImageInformation)` →
-/// `SECTION_IMAGE_INFORMATION` (0x40 bytes on x64). Used to fill the
-/// requesting process's `PS_ATTRIBUTE_IMAGE_INFO` out-attribute.
-fn query_image_info(proc: HANDLE) -> Result<[u8; 0x40]> {
-    use windows::Wdk::System::Threading::{NtQueryInformationProcess, PROCESSINFOCLASS};
-    unsafe {
-        let mut buf = [0u8; 0x40];
-        let mut len = 0u32;
-        let st = NtQueryInformationProcess(
-            proc, PROCESSINFOCLASS(37),
-            buf.as_mut_ptr() as *mut c_void,
-            buf.len() as u32, &mut len,
-        );
-        anyhow::ensure!(st.0 >= 0,
-            "NtQueryInformationProcess(ProcessImageInformation): {:#x}", st.0);
-        Ok(buf)
-    }
-}
-
-/// Reopen `child`'s image file + SEC_IMAGE section, duplicate both
-/// into the requesting process via `ch`, and return the *target-side*
-/// handle values for `PS_CREATE_INFO.SuccessState.{FileHandle,SectionHandle}`.
-fn open_child_image(ch: &ipc::Channel, child: HANDLE) -> Result<(u64, u64)> {
-    use windows::Wdk::Foundation::OBJECT_ATTRIBUTES;
-    use windows::Wdk::System::Threading::{NtQueryInformationProcess, PROCESSINFOCLASS};
-    use windows::Win32::Foundation::{NTSTATUS, UNICODE_STRING};
-    use windows::Win32::System::Memory::SEC_IMAGE;
-    #[link(name = "ntdll")]
-    extern "system" {
-        fn NtOpenFile(h: *mut HANDLE, access: u32, oa: *const OBJECT_ATTRIBUTES,
-            iosb: *mut [usize; 2], share: u32, options: u32) -> NTSTATUS;
-        fn NtCreateSection(h: *mut HANDLE, access: u32,
-            oa: *const OBJECT_ATTRIBUTES, max: *const u64, prot: u32,
-            attrs: u32, file: HANDLE) -> NTSTATUS;
-    }
-    unsafe {
-        // ProcessImageFileName (27) → UNICODE_STRING NT path.
-        let mut buf = vec![0u8; 1024];
-        let mut len = 0u32;
-        let st = NtQueryInformationProcess(
-            child, PROCESSINFOCLASS(27),
-            buf.as_mut_ptr() as *mut c_void, buf.len() as u32, &mut len,
-        );
-        anyhow::ensure!(st.0 >= 0, "NtQueryInformationProcess(ImageFileName): {:#x}", st.0);
-        let us = &*(buf.as_ptr() as *const UNICODE_STRING);
-        let oa = OBJECT_ATTRIBUTES {
-            Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
-            RootDirectory: HANDLE::default(),
-            ObjectName: us as *const _ as *mut _,
-            Attributes: 0x40, // OBJ_CASE_INSENSITIVE
-            SecurityDescriptor: std::ptr::null_mut(),
-            SecurityQualityOfService: std::ptr::null_mut(),
-        };
-        let mut file = HANDLE::default();
-        let mut iosb = [0usize; 2];
-        // SYNCHRONIZE | FILE_READ_DATA | FILE_EXECUTE | FILE_READ_ATTRIBUTES
-        let st = NtOpenFile(&mut file, 0x00100000 | 0x0001 | 0x0020 | 0x0080,
-            &oa, &mut iosb,
-            0x07, /* FILE_SHARE_READ|WRITE|DELETE */
-            0x20  /* FILE_SYNCHRONOUS_IO_NONALERT */);
-        anyhow::ensure!(st.0 >= 0, "NtOpenFile({}): {:#x}",
-            String::from_utf16_lossy(std::slice::from_raw_parts(
-                us.Buffer.0, us.Length as usize / 2)), st.0);
-        let mut sect = HANDLE::default();
-        let st = NtCreateSection(&mut sect, 0x000F001F /* SECTION_ALL_ACCESS */,
-            std::ptr::null(), std::ptr::null(),
-            0x10 /* PAGE_EXECUTE */, SEC_IMAGE.0, file);
-        anyhow::ensure!(st.0 >= 0, "NtCreateSection: {:#x}", st.0);
-        let t_file = ch.dup_to_target(file)?;
-        let t_sect = ch.dup_to_target(sect)?;
-        let _ = CloseHandle(file);
-        let _ = CloseHandle(sect);
-        Ok((t_file, t_sect))
-    }
-}
-
-/// Chase `RTL_USER_PROCESS_PARAMETERS→CommandLine` in the target
-/// and return it as a String.
-fn read_target_cmdline(target: HANDLE, params_va: usize) -> Result<String> {
-    if params_va == 0 { bail!("null ProcessParameters"); }
-    // Layout (x64): Flags @ +0x08; CommandLine UNICODE_STRING @ +0x70
-    //   { Length:u16, MaxLength:u16, _pad:u32, Buffer:u64 }
-    #[repr(C)] #[derive(Clone, Copy)]
-    struct UStr { length: u16, max: u16, _pad: u32, buffer: u64 }
-    let flags: u32 = interception::read_remote(target, params_va + 0x08)?;
-    let us: UStr = interception::read_remote(target, params_va + 0x70)?;
-    let mut buf_va = us.buffer as usize;
-    // If not RTL_USER_PROC_PARAMS_NORMALIZED, Buffer is an offset
-    // from the struct base.
-    if flags & 0x01 == 0 { buf_va = params_va.wrapping_add(buf_va); }
-    if us.length == 0 || us.length > 32768 { bail!("CommandLine length {}", us.length); }
-    interception::read_remote_wstr(target, buf_va, us.length as usize)
+    bail!("unterminated wstr at {va:#x}")
 }
 
 /// Spawn a helper inside the AC with stdout captured (for reading the

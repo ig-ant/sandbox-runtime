@@ -1,8 +1,13 @@
-//! Inline-hook `ntdll!NtCreateUserProcess` in a suspended target so
-//! the broker performs every spawn. The injected stub spills the 11
-//! raw arguments into the IPC section, signals the broker, blocks
-//! on the response, writes the broker's process/thread handles into
-//! the caller's out-pointers, and returns the broker's NTSTATUS.
+//! Inline-hook `kernelbase!CreateProcessInternalW` so the broker
+//! performs every spawn. The hook is installed *after* the loader
+//! has run (kernelbase isn't mapped at `CREATE_SUSPENDED` time) via
+//! the `entry_trampoline` rendezvous. The injected stub spills the
+//! 12 arguments into the IPC section, signals the broker, blocks on
+//! the response, writes `PROCESS_INFORMATION` + last-error back, and
+//! returns the broker's `BOOL`. Hooking at this layer means the
+//! caller's `dwCreationFlags`/`lpStartupInfo` arrive verbatim and
+//! `CreateProcessInternalW`'s post-`NtCreateUserProcess` machinery
+//! (CSR, AppCompat, Safer, conhost) runs exactly once — in the broker.
 //!
 //! x86_64 only. arm64 falls back to Mode::AppContainer at runtime.
 
@@ -22,13 +27,14 @@ use windows::Win32::System::Memory::{
 };
 
 #[cfg(not(target_arch = "x86_64"))]
-pub fn install(_target: HANDLE, _ch: &Channel) -> Result<()> {
+pub fn install(_target: HANDLE, _ch: &Channel, _cpw: usize) -> Result<()> {
     bail!("interception: x86_64 only in this build");
 }
 
+/// Patch `kernelbase!CreateProcessInternalW` (at `cpw_va`) in
+/// `target` with an absolute jmp to a freshly-allocated stub.
 #[cfg(target_arch = "x86_64")]
-pub fn install(target: HANDLE, ch: &Channel) -> Result<()> {
-    let nt_cup = ntdll_export("NtCreateUserProcess")?;
+pub fn install(target: HANDLE, ch: &Channel, cpw_va: usize) -> Result<()> {
     let nt_set_event = ntdll_export("NtSetEvent")?;
     let nt_wait = ntdll_export("NtWaitForSingleObject")?;
 
@@ -36,15 +42,14 @@ pub fn install(target: HANDLE, ch: &Channel) -> Result<()> {
                          nt_set_event, nt_wait);
     let stub_va = alloc_remote_rx(target, &stub)?;
 
-    // Patch the export prologue with an absolute jmp to the stub.
-    // ntdll syscall stubs are tiny and the patched bytes are never
-    // re-executed — the stub returns directly to the caller.
+    // The stub never tail-calls the original, so the overwritten
+    // prologue bytes are never executed.
     let mut patch = enc_abs_jmp(stub_va);
     while patch.len() < ABS_JMP_LEN { patch.push(0x90); }
-    write_remote_bytes(target, nt_cup, &patch)?;
+    write_remote_bytes(target, cpw_va, &patch)?;
     eprintln!(
-        "[sbox-exec] interception: NtCreateUserProcess @ {:#x} → stub @ {:#x} (section @ {:#x})",
-        nt_cup, stub_va, ch.target_view,
+        "[sbox-exec] interception: CreateProcessInternalW @ {:#x} → stub @ {:#x} (section @ {:#x})",
+        cpw_va, stub_va, ch.target_view,
     );
     Ok(())
 }
@@ -56,15 +61,18 @@ fn emit_stub(
     section: usize, ev_req: u64, ev_resp: u64,
     nt_set_event: usize, nt_wait: usize,
 ) -> Vec<u8> {
-    // r10 = section base (volatile, not an arg register).
-    // Phase A: spill rcx,rdx,r8,r9 + stack args [rsp+0x28..0x58] to
-    //          section[0..0x58]. rsp is unmodified at this point so
-    //          the caller's stack-arg offsets are intact.
+    // r10 = section base.
+    // Phase A: spill rcx,rdx,r8,r9 + [rsp+0x28..0x60] (8 stack args)
+    //          to section[0..0x60].
     // Phase B: sub rsp,0x28; NtSetEvent(ev_req,0);
     //          NtWaitForSingleObject(ev_resp,0,0); add rsp,0x28.
-    // Phase C: reload r10; *[section+0]=out_process → write to *rcx
-    //          (saved at section[0]); same for thread; eax=status; ret.
-    let mut s = Vec::<u8>::with_capacity(256);
+    // Phase C: reload r10; rcx = saved lpProcessInformation
+    //          (args[10] @ section+0x50); write
+    //          {hProcess,hThread,dwProcessId,dwThreadId}; rcx =
+    //          saved phRestrictedToken (args[11] @ +0x58), if
+    //          non-null write 0; TEB→LastErrorValue = out_error;
+    //          eax = out_result; ret.
+    let mut s = Vec::<u8>::with_capacity(320);
     let mov_r10_imm = |s: &mut Vec<u8>, v: u64| {
         s.extend_from_slice(&[0x49, 0xBA]); s.extend_from_slice(&v.to_le_bytes());
     };
@@ -77,27 +85,22 @@ fn emit_stub(
 
     // ── Phase A
     mov_r10_imm(&mut s, section as u64);
-    // mov [r10+disp8], reg
     s.extend_from_slice(&[0x49, 0x89, 0x4A, 0x00]); // [r10+0]=rcx
     s.extend_from_slice(&[0x49, 0x89, 0x52, 0x08]); // [r10+8]=rdx
     s.extend_from_slice(&[0x4D, 0x89, 0x42, 0x10]); // [r10+0x10]=r8
     s.extend_from_slice(&[0x4D, 0x89, 0x4A, 0x18]); // [r10+0x18]=r9
-    // stack args 5..11 at [rsp+0x28..0x58]
-    for (i, off) in (0x28u8..=0x58).step_by(8).enumerate() {
-        // mov rax, [rsp+off]
-        s.extend_from_slice(&[0x48, 0x8B, 0x44, 0x24, off]);
-        // mov [r10+(0x20+i*8)], rax
-        s.extend_from_slice(&[0x49, 0x89, 0x42, (0x20 + i * 8) as u8]);
+    // stack args 5..12 at [rsp+0x28..0x60]
+    for (i, off) in (0x28u8..=0x60).step_by(8).enumerate() {
+        s.extend_from_slice(&[0x48, 0x8B, 0x44, 0x24, off]);          // mov rax,[rsp+off]
+        s.extend_from_slice(&[0x49, 0x89, 0x42, (0x20 + i * 8) as u8]); // mov [r10+d],rax
     }
 
     // ── Phase B
     s.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);   // sub rsp,0x28
-    // NtSetEvent(ev_req, NULL)
     mov_rcx_imm(&mut s, ev_req);
     s.extend_from_slice(&[0x31, 0xD2]);               // xor edx,edx
     mov_rax_imm(&mut s, nt_set_event as u64);
     s.extend_from_slice(&[0xFF, 0xD0]);               // call rax
-    // NtWaitForSingleObject(ev_resp, FALSE, NULL)
     mov_rcx_imm(&mut s, ev_resp);
     s.extend_from_slice(&[0x31, 0xD2]);               // xor edx,edx
     s.extend_from_slice(&[0x4D, 0x31, 0xC0]);         // xor r8,r8
@@ -107,16 +110,31 @@ fn emit_stub(
 
     // ── Phase C
     mov_r10_imm(&mut s, section as u64);
-    // rcx = [r10+0] (orig PHANDLE Process); rax = [r10+0x60]; [rcx]=rax
-    s.extend_from_slice(&[0x49, 0x8B, 0x4A, 0x00]);
-    s.extend_from_slice(&[0x49, 0x8B, 0x42, 0x60]);
-    s.extend_from_slice(&[0x48, 0x89, 0x01]);
-    // rcx = [r10+8] (orig PHANDLE Thread); rax = [r10+0x68]; [rcx]=rax
-    s.extend_from_slice(&[0x49, 0x8B, 0x4A, 0x08]);
-    s.extend_from_slice(&[0x49, 0x8B, 0x42, 0x68]);
-    s.extend_from_slice(&[0x48, 0x89, 0x01]);
-    // eax = [r10+0x70]
-    s.extend_from_slice(&[0x41, 0x8B, 0x42, 0x70]);
+    // rcx = [r10+0x50] (saved lpProcessInformation)
+    s.extend_from_slice(&[0x49, 0x8B, 0x4A, 0x50]);
+    // test rcx,rcx; jz skip_pi (+0x1D = 29 bytes of writes below)
+    s.extend_from_slice(&[0x48, 0x85, 0xC9, 0x74, 0x1D]);
+    //   [rcx+0]  = [r10+0x60] (hProcess)
+    s.extend_from_slice(&[0x49, 0x8B, 0x42, 0x60, 0x48, 0x89, 0x01]);
+    //   [rcx+8]  = [r10+0x68] (hThread)
+    s.extend_from_slice(&[0x49, 0x8B, 0x42, 0x68, 0x48, 0x89, 0x41, 0x08]);
+    //   [rcx+0x10] = dword [r10+0x70] (dwProcessId)
+    s.extend_from_slice(&[0x41, 0x8B, 0x42, 0x70, 0x89, 0x41, 0x10]);
+    //   [rcx+0x14] = dword [r10+0x74] (dwThreadId)
+    s.extend_from_slice(&[0x41, 0x8B, 0x42, 0x74, 0x89, 0x41, 0x14]);
+    // skip_pi:
+    // rcx = [r10+0x58] (saved phRestrictedToken)
+    s.extend_from_slice(&[0x49, 0x8B, 0x4A, 0x58]);
+    // test rcx,rcx; jz skip_rt
+    s.extend_from_slice(&[0x48, 0x85, 0xC9, 0x74, 0x07]);
+    //   xor rax,rax; [rcx]=rax
+    s.extend_from_slice(&[0x48, 0x31, 0xC0, 0x48, 0x89, 0x01, 0x90]);
+    // skip_rt:
+    // TEB→LastErrorValue (gs:[0x68]) = [r10+0x7c]
+    s.extend_from_slice(&[0x41, 0x8B, 0x42, 0x7C]);                  // mov eax,[r10+0x7c]
+    s.extend_from_slice(&[0x65, 0x89, 0x04, 0x25, 0x68, 0x00, 0x00, 0x00]); // mov gs:[0x68],eax
+    // eax = [r10+0x78] (BOOL)
+    s.extend_from_slice(&[0x41, 0x8B, 0x42, 0x78]);
     s.push(0xC3); // ret
 
     s
@@ -133,7 +151,7 @@ fn enc_abs_jmp(target: usize) -> Vec<u8> {
     s
 }
 
-fn ntdll_export(name: &str) -> Result<usize> {
+pub fn ntdll_export(name: &str) -> Result<usize> {
     unsafe {
         let m = GetModuleHandleW(PCWSTR(crate::util::wstr("ntdll.dll").as_ptr()))
             .context("GetModuleHandleW(ntdll)")?;
@@ -161,7 +179,7 @@ fn write_remote_bytes(proc: HANDLE, addr: usize, data: &[u8]) -> Result<()> {
     }
 }
 
-fn alloc_remote_rx(proc: HANDLE, data: &[u8]) -> Result<usize> {
+pub fn alloc_remote_rx(proc: HANDLE, data: &[u8]) -> Result<usize> {
     unsafe {
         let p = VirtualAllocEx(proc, None, data.len().max(4096),
                                MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
