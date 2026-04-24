@@ -61,6 +61,13 @@ struct SpawnCtx {
     /// `SBOX_TRACE=1`: log every brokered FS/registry/section
     /// open with path + status, including successes.
     trace: bool,
+    /// `WINSBOX_TOKEN=lockdown`: changes registry brokering
+    /// behaviour — under lockdown, KEY_ALL_ACCESS opens are
+    /// masked to KEY_READ and brokered (passthrough fails the
+    /// normal-SID check); under USER_LIMITED they passthrough
+    /// (succeeds, and brokering them all caused an
+    /// `ExitProcess`-time spinlock hang at 12e3d0d).
+    lockdown: bool,
     /// Join handles for nested service threads, so the main loop
     /// can wait for the whole tree on exit.
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
@@ -274,6 +281,7 @@ fn run_confined(pol: &Policy) -> Result<u32> {
         fs: crate::policy_engine::FsPolicy::from_policy(pol),
         hook_fs: pol.broker_fs,
         trace: std::env::var("SBOX_TRACE").is_ok(),
+        lockdown: token::spec_from_env().0.keep_enabled.is_empty(),
         threads: Mutex::new(Vec::new()),
     }));
     if let Some(ctx) = ctx.as_ref() {
@@ -555,11 +563,14 @@ fn handle_fs(ch: &ipc::Channel, target: HANDLE, req: &ipc::Wire, ctx: &Arc<Spawn
         Ok((h, info)) => {
             let th = ch.dup_to_target(h).unwrap_or(0);
             unsafe { let _ = CloseHandle(h); }
+            if ctx.trace {
+                eprintln!("[sbox-exec] fs: ok {path} access={access:#x} → h={th:#x}");
+            }
             ch.reply_fs(th, info, 0);
         }
         Err(st) => {
-            if st != 0xC0000034u32 as i32 /* OBJECT_NAME_NOT_FOUND */ {
-                eprintln!("[sbox-exec] fs: open {path}: {st:#x}");
+            if ctx.trace || (st != 0xC0000034u32 as i32 && st != 0xC000003Au32 as i32) {
+                eprintln!("[sbox-exec] fs: open {path}: {st:#x} access={access:#x}");
             }
             ch.reply_fs(0, 0, st);
         }
@@ -680,22 +691,44 @@ fn handle_reg(
     let write_bits = if req.op == ipc::OP_NTOPENSECTION {
         SEC_WRITE_BITS
     } else { KEY_WRITE_BITS };
-    if req_access & write_bits != 0 {
+    // Sections always passthrough on write. Registry under
+    // USER_LIMITED passthroughs on write (target's token
+    // succeeds; brokering all of these caused the 12e3d0d
+    // ExitProcess-spinlock hang). Registry under
+    // USER_LOCKDOWN: passthrough fails the normal-SID check
+    // (ALL APP PACKAGES has read-only on registry), so mask
+    // to KEY_READ and broker — the dup'd handle is read-only
+    // so writes through it still fail. The spinlock hang is
+    // a known risk under lockdown until the section gets a
+    // proper mutant; lockdown is opt-in via WINSBOX_TOKEN.
+    let mask_writes = ctx.lockdown && req.op != ipc::OP_NTOPENSECTION;
+    if req_access & write_bits != 0 && !mask_writes {
         if ctx.trace {
             eprintln!("[sbox-exec] {tag}: passthrough write access={req_access:#x} {leaf}");
         }
         ch.reply_fs(0, 0, ipc::FS_PASSTHROUGH);
         return;
     }
+    if mask_writes
+        && req_access & KEY_READ_INTENT == 0
+        && req_access & write_bits != 0
+    {
+        if ctx.trace {
+            eprintln!("[sbox-exec] {tag}: passthrough write-only access={req_access:#x} {leaf}");
+        }
+        ch.reply_fs(0, 0, ipc::FS_PASSTHROUGH);
+        return;
+    }
     // MAXIMUM_ALLOWED under the broker's token would resolve
-    // to write — substitute the read mask. kernelbase opens
-    // the HKLM/HKCU roots this way and every subkey hangs
-    // off the result.
-    let _ = KEY_READ_INTENT;
-    let access = if req_access & MAXIMUM_ALLOWED != 0 {
-        (if req.op == ipc::OP_NTOPENSECTION { req_access & !MAXIMUM_ALLOWED }
-         else { KEY_READ }) | (req_access & KEY_WOW64)
-    } else { req_access };
+    // to write — substitute the read mask. Under lockdown
+    // every brokered registry open uses KEY_READ regardless.
+    let access = if req.op == ipc::OP_NTOPENSECTION {
+        req_access & !MAXIMUM_ALLOWED
+    } else if mask_writes || req_access & MAXIMUM_ALLOWED != 0 {
+        KEY_READ | (req_access & KEY_WOW64)
+    } else {
+        req_access
+    };
     let root_h = if root_raw != 0 {
         match dup_from_target(target, root_raw) {
             Ok(h) => h,
