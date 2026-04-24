@@ -65,15 +65,31 @@ impl FsPolicy {
                 return Decision::Allow;
             }
         }
+        // `\Device\*`: under USER_LOCKDOWN passthrough fails
+        // (NULL restricting blocks the open), so the broker
+        // must open the ones runtimes need at init —
+        // BCryptGenRandom (`CNG`, `KsecDD`), interface enum
+        // (`Nsi`), device enum (`DeviceApi`), volume info
+        // (`MountPointManager`). This MUST be a whitelist:
+        // broker-opening `\Device\Harddisk*` etc. with the
+        // broker's full token would be a straight escape.
+        // `Afd` and `ConDrv` stay passthrough — AFD tags the
+        // endpoint with the creator *process*'s AppContainer
+        // (broker-opening yields a non-AC socket the target
+        // can't connect on); ConDrv binds to the creator's
+        // console.
+        if let Some(dev) = lower.strip_prefix(r"\device\") {
+            let head = dev.split('\\').next().unwrap_or("");
+            return match head {
+                "cng" | "ksecdd" | "nsi" | "deviceapi"
+                | "mountpointmanager" => Decision::Allow,
+                _ => Decision::AllowAsTarget,
+            };
+        }
         // Anything else that isn't a `\??\<drive>:\…`
-        // filesystem path — \Device\*, pipes, UNC, object dirs
-        // — is passed through to the target's own syscall. The
-        // lockdown+lowbox token is the boundary there (AFD
-        // checks network capability at IOCTL time, named-pipe
-        // servers' DACLs are checked against the lockdown,
-        // PhysicalDrive needs admin). The broker only mediates
-        // filesystem paths, where it is *granting* access the
-        // lockdown doesn't have and so must apply policy.
+        // filesystem path — `\??\pipe\*`, `\??\UNC\*`, object
+        // dirs — is passed through to the target's own
+        // syscall; the lockdown+lowbox token is the boundary.
         let dos = match nt_to_dos(nt_path) {
             Some(d) => d,
             None => return Decision::AllowAsTarget,
