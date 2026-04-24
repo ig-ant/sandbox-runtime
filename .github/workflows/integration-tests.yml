@@ -145,6 +145,7 @@ jobs:
         env:
           WINSBOX_PHASE: '2'
           WINSBOX_TOKEN: lockdown
+          SBOX_TRACE: '1'
 
       - name: Run tests (Windows)
         # The full suite has POSIX-shell assumptions and a Bun-on-Windows

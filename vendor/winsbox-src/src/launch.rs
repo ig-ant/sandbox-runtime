@@ -58,6 +58,9 @@ struct SpawnCtx {
     /// reads of paths the AC SID isn't granted on fail in the
     /// target with no broker involvement.
     hook_fs: bool,
+    /// `SBOX_TRACE=1`: log every brokered FS/registry/section
+    /// open with path + status, including successes.
+    trace: bool,
     /// Join handles for nested service threads, so the main loop
     /// can wait for the whole tree on exit.
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
@@ -270,6 +273,7 @@ fn run_confined(pol: &Policy) -> Result<u32> {
         stop: stop.clone(),
         fs: crate::policy_engine::FsPolicy::from_policy(pol),
         hook_fs: pol.broker_fs,
+        trace: std::env::var("SBOX_TRACE").is_ok(),
         threads: Mutex::new(Vec::new()),
     }));
     if let Some(ctx) = ctx.as_ref() {
@@ -444,8 +448,8 @@ fn serve_ipc(ch: ipc::Channel, target_raw: isize, ctx: Arc<SpawnCtx>) {
             ipc::OP_CPW => handle_cpw(&ch, target, &req, &ctx),
             ipc::OP_NTCREATEFILE | ipc::OP_NTOPENFILE =>
                 handle_fs(&ch, target, &req, &ctx),
-            ipc::OP_NTOPENKEY | ipc::OP_NTOPENKEYEX =>
-                handle_reg(&ch, target, &req),
+            ipc::OP_NTOPENKEY | ipc::OP_NTOPENKEYEX | ipc::OP_NTOPENSECTION =>
+                handle_reg(&ch, target, &req, &ctx),
             op => {
                 eprintln!("[sbox-exec] ipc: unknown op {op}");
                 ch.reply_fs(0, 0, 0xC0000002u32 as i32 /* STATUS_NOT_IMPLEMENTED */);
@@ -626,37 +630,48 @@ fn broker_open(
     }
 }
 
-/// `NtOpenKey` / `NtOpenKeyEx`: args[0]=PHANDLE,
-/// [1]=DesiredAccess, [2]=POBJECT_ATTRIBUTES,
-/// (Ex only) [3]=OpenOptions. v1: default-allow-read; deny any
-/// write bit. The broker dup's the caller's `RootDirectory`
-/// (registry handles can't be path-resolved with
-/// `GetFinalPathNameByHandle`, and default-allow-read needs no
-/// path policy anyway) and re-issues the open relative to it.
-fn handle_reg(ch: &ipc::Channel, target: HANDLE, req: &ipc::Wire) {
-    const REG_WRITE_BITS: u32 =
-        0x0002 /* KEY_SET_VALUE */ |
-        0x0004 /* KEY_CREATE_SUB_KEY */ |
-        0x0020 /* KEY_CREATE_LINK */ |
-        0x00010000 /* DELETE */ |
-        0x00040000 /* WRITE_DAC */ |
-        0x00080000 /* WRITE_OWNER */ |
-        0x40000000 /* GENERIC_WRITE */ |
-        0x10000000 /* GENERIC_ALL */ |
-        0x02000000 /* MAXIMUM_ALLOWED — would resolve to write under broker's token */;
+/// `NtOpenKey` / `NtOpenKeyEx` / `NtOpenSection`:
+/// args[0]=PHANDLE, [1]=DesiredAccess, [2]=POBJECT_ATTRIBUTES,
+/// (NtOpenKeyEx only) [3]=OpenOptions. v1: default-allow-read;
+/// passthrough on any write bit (lockdown token denies). The
+/// broker dup's the caller's `RootDirectory` and re-issues the
+/// open relative to it — no path stringification needed for
+/// default-allow-read. With `SBOX_TRACE`, logs every call so
+/// the sequence before a failure is visible.
+fn handle_reg(
+    ch: &ipc::Channel, target: HANDLE, req: &ipc::Wire, ctx: &Arc<SpawnCtx>,
+) {
+    let (tag, write_bits): (&str, u32) = match req.op {
+        ipc::OP_NTOPENSECTION => ("sec",
+            0x0002 /* SECTION_MAP_WRITE */ |
+            0x0010 /* SECTION_EXTEND_SIZE */ |
+            0x00010000 | 0x00040000 | 0x00080000 |
+            0x40000000 | 0x10000000 | 0x02000000),
+        _ => ("reg",
+            0x0002 /* KEY_SET_VALUE */ |
+            0x0004 /* KEY_CREATE_SUB_KEY */ |
+            0x0020 /* KEY_CREATE_LINK */ |
+            0x00010000 | 0x00040000 | 0x00080000 |
+            0x40000000 | 0x10000000 | 0x02000000),
+    };
     let access = req.args[1] as u32;
-    if access & REG_WRITE_BITS != 0 {
-        ch.reply_fs(0, 0, ipc::FS_PASSTHROUGH);
-        return;
-    }
     let (root_raw, leaf) = match read_target_oa_raw(target, req.args[2] as usize) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("[sbox-exec] reg: passthrough ({e:#})");
+            if ctx.trace {
+                eprintln!("[sbox-exec] {tag}: passthrough oa-read ({e:#})");
+            }
             ch.reply_fs(0, 0, ipc::FS_PASSTHROUGH);
             return;
         }
     };
+    if access & write_bits != 0 {
+        if ctx.trace {
+            eprintln!("[sbox-exec] {tag}: passthrough write access={access:#x} {leaf}");
+        }
+        ch.reply_fs(0, 0, ipc::FS_PASSTHROUGH);
+        return;
+    }
     let root_h = if root_raw != 0 {
         match dup_from_target(target, root_raw) {
             Ok(h) => h,
@@ -664,18 +679,21 @@ fn handle_reg(ch: &ipc::Channel, target: HANDLE, req: &ipc::Wire) {
         }
     } else { HANDLE::default() };
     let opts = if req.op == ipc::OP_NTOPENKEYEX { req.args[3] as u32 } else { 0 };
-    let st = broker_open_key(&leaf, root_h, access, opts);
+    let st = broker_open_handle(req.op, &leaf, root_h, access, opts);
     if root_raw != 0 { unsafe { let _ = CloseHandle(root_h); } }
     match st {
         Ok(h) => {
             let th = ch.dup_to_target(h).unwrap_or(0);
             unsafe { let _ = CloseHandle(h); }
+            if ctx.trace {
+                eprintln!("[sbox-exec] {tag}: ok root={root_raw:#x} {leaf} → h={th:#x}");
+            }
             ch.reply_fs(th, 0, 0);
         }
         Err(st) => {
-            if st == 0xC0000022u32 as i32 {
+            if ctx.trace || st == 0xC0000022u32 as i32 {
                 eprintln!(
-                    "[sbox-exec] reg: ACCESS_DENIED root={root_raw:#x} leaf={leaf} access={access:#x}",
+                    "[sbox-exec] {tag}: {st:#x} root={root_raw:#x} {leaf} access={access:#x}",
                 );
             }
             ch.reply_fs(0, 0, st);
@@ -683,8 +701,8 @@ fn handle_reg(ch: &ipc::Channel, target: HANDLE, req: &ipc::Wire) {
     }
 }
 
-fn broker_open_key(
-    leaf: &str, root: HANDLE, access: u32, opts: u32,
+fn broker_open_handle(
+    op: u64, leaf: &str, root: HANDLE, access: u32, opts: u32,
 ) -> std::result::Result<HANDLE, i32> {
     use windows::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows::Win32::Foundation::{NTSTATUS, UNICODE_STRING};
@@ -692,6 +710,8 @@ fn broker_open_key(
     extern "system" {
         fn NtOpenKeyEx(h: *mut HANDLE, access: u32,
             oa: *const OBJECT_ATTRIBUTES, opts: u32) -> NTSTATUS;
+        fn NtOpenSection(h: *mut HANDLE, access: u32,
+            oa: *const OBJECT_ATTRIBUTES) -> NTSTATUS;
     }
     unsafe {
         let mut wleaf = wstr(leaf);
@@ -710,7 +730,11 @@ fn broker_open_key(
             SecurityQualityOfService: std::ptr::null_mut(),
         };
         let mut h = HANDLE::default();
-        let st = NtOpenKeyEx(&mut h, access, &oa, opts);
+        let st = if op == ipc::OP_NTOPENSECTION {
+            NtOpenSection(&mut h, access, &oa)
+        } else {
+            NtOpenKeyEx(&mut h, access, &oa, opts)
+        };
         if st.0 < 0 { Err(st.0) } else { Ok(h) }
     }
 }

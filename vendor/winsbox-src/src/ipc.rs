@@ -35,6 +35,7 @@ pub const OP_NTCREATEFILE: u64 = 1;
 pub const OP_NTOPENFILE: u64 = 2;
 pub const OP_NTOPENKEY: u64 = 3;
 pub const OP_NTOPENKEYEX: u64 = 4;
+pub const OP_NTOPENSECTION: u64 = 5;
 
 /// Sentinel `r_status` the broker returns when the FS stub
 /// should reload its spilled args and tail-jmp to the saved
