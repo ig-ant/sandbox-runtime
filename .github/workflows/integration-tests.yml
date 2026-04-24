@@ -118,7 +118,7 @@ jobs:
         # crash in parent-proxy-tunnel.test.ts; scope to the Windows suite
         # for now. Porting the rest is tracked separately.
         if: matrix.os == 'windows'
-        run: bun test --timeout 60000 test/sandbox/windows.test.ts
+        run: bun test --timeout 25000 test/sandbox/windows.test.ts
         env:
           WINSBOX_PHASE: '1'
 

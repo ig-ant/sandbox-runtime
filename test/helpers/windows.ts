@@ -59,18 +59,12 @@ export async function makeFixture(): Promise<Fixture> {
       // tool install dirs + USERPROFILE for the compat tests (see plan
       // §"known Phase-1 limitation"). Phase 2 ignores allowRead and
       // applies allow-all-except-denyRead.
-      allowRead: [
-        os.homedir(),
-        process.cwd(),
-        process.env['ProgramFiles'] || 'C:\\Program Files',
-        process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)',
-        process.env['ProgramData'] || 'C:\\ProgramData',
-        // GH runner installs node/python/etc. under the tool cache.
-        process.env['RUNNER_TOOL_CACHE'] || 'C:\\hostedtoolcache',
-        process.env['SystemRoot'] || 'C:\\Windows',
-        allowWrite,
-        base,
-      ].filter(p => p),
+      // Phase-1 ACL grants propagate to every existing child, so
+      // broad roots (USERPROFILE, Program Files) take minutes. Keep
+      // allowRead to the small fixture tree only; system dirs are
+      // already ACL'd to ALL APPLICATION PACKAGES. Compat tests that
+      // need user-profile reads are tagged since:'2'.
+      allowRead: [base],
       denyRead: [denyRead],
       allowWrite: [allowWrite],
       denyWrite: [],
@@ -109,21 +103,44 @@ export async function runSandboxed(
     const child = spawn(wrapped, { shell: true })
     let stdout = ''
     let stderr = ''
-    child.stdout.on('data', d => (stdout += d.toString()))
-    child.stderr.on('data', d => (stderr += d.toString()))
-    const to = setTimeout(() => {
-      child.kill()
-    }, opts.timeoutMs ?? 15_000)
-    child.on('close', code => {
+    let done = false
+    child.stdout?.on('data', d => (stdout += d.toString()))
+    child.stderr?.on('data', d => (stderr += d.toString()))
+    const finish = (code: number) => {
+      if (done) return
+      done = true
       clearTimeout(to)
       SandboxManager.cleanupAfterCommand()
+      // Surface broker diagnostics in the bun test output.
+      if (stderr.trim()) {
+        for (const l of stderr.split(/\r?\n/)) {
+          if (l.trim()) console.error(`  [stderr] ${l}`)
+        }
+      }
+      if (code < 0)
+        console.error(
+          `  [timeout/error] exit=${code} stdout=${JSON.stringify(stdout.slice(0, 200))}`,
+        )
       resolve({
-        exitCode: code ?? -1,
+        exitCode: code,
         stdout,
         stderr,
         durationMs: Date.now() - start,
       })
-    })
+    }
+    const to = setTimeout(() => {
+      // child.kill() only kills the cmd.exe wrapper; sbox-exec and its
+      // tree survive and keep the pipes open. Kill the whole tree.
+      if (child.pid) {
+        spawn('taskkill', ['/T', '/F', '/PID', String(child.pid)], {
+          stdio: 'ignore',
+        })
+      }
+      // Resolve immediately on timeout regardless of pipe state.
+      finish(-2)
+    }, opts.timeoutMs ?? 15_000)
+    child.on('exit', code => finish(code ?? -1))
+    child.on('error', () => finish(-3))
   })
 }
 

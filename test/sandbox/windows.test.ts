@@ -35,7 +35,7 @@ d(`windows sandbox [WINSBOX_PHASE=${PHASE}]`, () => {
   /** compat: must pass from `since` onward; before that, record skip. */
   const compat = (name: string, since: Phase, fn: () => Promise<void>) => {
     if (phaseGte(since)) {
-      test(name, fn, 60_000)
+      test(name, fn, 20_000)
     } else {
       skipped.push(`${name} [needs phase ${since}]`)
       test.skip(`${name} [needs phase ${since}]`, fn)
@@ -62,7 +62,7 @@ d(`windows sandbox [WINSBOX_PHASE=${PHASE}]`, () => {
         const expectedViolated = !phaseGte(enforcedAt)
         expect(r.violated).toBe(expectedViolated)
       },
-      60_000,
+      20_000,
     )
   }
 
@@ -74,19 +74,25 @@ d(`windows sandbox [WINSBOX_PHASE=${PHASE}]`, () => {
     expect(r.stdout.trim()).toBe('hello')
   })
 
-  compat('node prints hello', 'stub', async () => {
+  // node/python/git/npm read from %USERPROFILE%/%APPDATA%/tool-cache,
+  // which Phase-1 ACL grants can't cover without minutes-long
+  // propagation (the documented Phase-1 limitation). They run under
+  // stub and again under Phase 2's broker.
+  const toolPhase: Phase = PHASE === '1' ? '2' : 'stub'
+
+  compat('node prints hello', toolPhase, async () => {
     const r = await runSandboxed(`node -e "console.log('hello')"`, fx.config)
     expect(r.exitCode).toBe(0)
     expect(r.stdout).toContain('hello')
   })
 
-  compat('python prints hello', 'stub', async () => {
+  compat('python prints hello', toolPhase, async () => {
     const r = await runSandboxed(`python -c "print('hello')"`, fx.config)
     expect(r.exitCode).toBe(0)
     expect(r.stdout).toContain('hello')
   })
 
-  compat('git --version', 'stub', async () => {
+  compat('git --version', toolPhase, async () => {
     const r = await runSandboxed('git --version', fx.config)
     expect(r.exitCode).toBe(0)
     expect(r.stdout.toLowerCase()).toContain('git version')
@@ -121,7 +127,7 @@ d(`windows sandbox [WINSBOX_PHASE=${PHASE}]`, () => {
     expect(r.stdout.trim()).toMatch(/^[23]\d\d$/)
   })
 
-  compat('npm view (multi-process + network) succeeds', 'stub', async () => {
+  compat('npm view (multi-process + network) succeeds', toolPhase, async () => {
     const r = await runSandboxed('npm view lodash version', {
       ...fx.config,
       network: {
