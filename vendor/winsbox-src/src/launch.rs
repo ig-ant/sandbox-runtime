@@ -467,7 +467,9 @@ fn handle_cpw(ch: &ipc::Channel, target: HANDLE, req: &ipc::Wire, ctx: &Arc<Spaw
     );
     let suspend_after = caller_flags & 0x00000004 /* CREATE_SUSPENDED */ != 0;
     let app_opt = (!app.is_empty()).then_some(app.as_str());
-    match broker_spawn(ctx, app_opt, &cmdline, cwd.as_deref(), caller_flags, &si) {
+    let mut envb = read_target_env(target, req.args[7] as usize, caller_flags, ctx);
+    match broker_spawn(ctx, app_opt, &cmdline, cwd.as_deref(),
+                       caller_flags, &si, &mut envb) {
         Ok(child) => {
             if let Err(e) = install_broker_hook(
                 child.hProcess, child.hThread, suspend_after, ctx.clone(),
@@ -677,6 +679,7 @@ fn read_target_obj_path(target: HANDLE, oa_va: usize) -> Result<String> {
 /// forwarding the caller's console-related creation flags and
 /// `STARTUPINFOW` (stdio handles already dup'd into the broker).
 /// Returns SUSPENDED so the caller can install the hook first.
+#[allow(clippy::too_many_arguments)]
 fn broker_spawn(
     ctx: &SpawnCtx,
     app: Option<&str>,
@@ -684,6 +687,7 @@ fn broker_spawn(
     cwd: Option<&str>,
     caller_flags: u32,
     si: &STARTUPINFOW,
+    envb: &mut Vec<u16>,
 ) -> Result<PROCESS_INFORMATION> {
     use windows::Win32::System::JobObjects::AssignProcessToJobObject;
     use windows::Win32::System::Threading::PROCESS_CREATION_FLAGS;
@@ -728,7 +732,6 @@ fn broker_spawn(
         let app_w = app.map(wstr);
         let app_p = app_w.as_ref().map(|w| pcwstr(w)).unwrap_or(PCWSTR::null());
         let cwd_w = wstr(cwd.unwrap_or(&ctx.cwd));
-        let mut envb = build_env_block(&ctx.env);
         let mut pi: PROCESS_INFORMATION = zeroed();
         CreateProcessAsUserW(
             ctx.primary, app_p, PWSTR(cmd.as_mut_ptr()), None, None, true,
@@ -799,6 +802,74 @@ fn close_si_handles(si: &STARTUPINFOW) {
             unsafe { let _ = CloseHandle(h); }
         }
     }
+}
+
+/// Read the environment block the brokered child should
+/// inherit. If the caller passed `lpEnvironment` use that;
+/// otherwise read the *caller*'s own environment from its
+/// `PEB→ProcessParameters→Environment` so `set FOO=bar && child`
+/// propagates. Falls back to the broker's env (with the policy
+/// extras) on any failure.
+fn read_target_env(
+    target: HANDLE, lp_env: usize, caller_flags: u32, ctx: &SpawnCtx,
+) -> Vec<u16> {
+    let read_block = |va: usize, wide: bool| -> Option<Vec<u16>> {
+        if va == 0 { return None; }
+        let mut out = Vec::<u16>::new();
+        let mut off = 0usize;
+        loop {
+            if wide {
+                let chunk: [u16; 512] =
+                    interception::read_remote(target, va + off * 2).ok()?;
+                for (i, &w) in chunk.iter().enumerate() {
+                    out.push(w);
+                    if w == 0 && out.len() >= 2 && out[out.len() - 2] == 0 {
+                        return Some(out);
+                    }
+                    if out.len() > 128 * 1024 { return None; }
+                    let _ = i;
+                }
+                off += chunk.len();
+            } else {
+                let chunk: [u8; 1024] =
+                    interception::read_remote(target, va + off).ok()?;
+                for &b in &chunk {
+                    out.push(b as u16);
+                    if b == 0 && out.len() >= 2 && out[out.len() - 2] == 0 {
+                        return Some(out);
+                    }
+                    if out.len() > 128 * 1024 { return None; }
+                }
+                off += chunk.len();
+            }
+        }
+    };
+    // Explicit lpEnvironment from the caller.
+    if lp_env != 0 {
+        let wide = caller_flags & 0x0000_0400 /* CREATE_UNICODE_ENVIRONMENT */ != 0;
+        if let Some(b) = read_block(lp_env, wide) { return b; }
+    }
+    // Inherit from the caller: PEB→ProcessParameters→Environment.
+    // PEB+0x20 = ProcessParameters; +0x80 = Environment (x64).
+    let env = (|| -> Option<Vec<u16>> {
+        use windows::Wdk::System::Threading::{NtQueryInformationProcess, PROCESSINFOCLASS};
+        use windows::Win32::System::Threading::PROCESS_BASIC_INFORMATION;
+        let mut pbi: PROCESS_BASIC_INFORMATION = unsafe { zeroed() };
+        let mut len = 0u32;
+        let st = unsafe {
+            NtQueryInformationProcess(
+                target, PROCESSINFOCLASS(0),
+                &mut pbi as *mut _ as *mut c_void,
+                size_of::<PROCESS_BASIC_INFORMATION>() as u32, &mut len,
+            )
+        };
+        if st.0 < 0 { return None; }
+        let peb = pbi.PebBaseAddress as usize;
+        let pp: u64 = interception::read_remote(target, peb + 0x20).ok()?;
+        let envp: u64 = interception::read_remote(target, pp as usize + 0x80).ok()?;
+        read_block(envp as usize, true)
+    })();
+    env.unwrap_or_else(|| build_env_block(&ctx.env))
 }
 
 /// Read a NUL-terminated wide string from `target` at `va`. Used
