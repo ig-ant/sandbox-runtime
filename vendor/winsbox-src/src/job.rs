@@ -15,6 +15,7 @@ use windows::Win32::System::JobObjects::{
 pub struct Job(HANDLE);
 
 impl Job {
+    pub fn handle(&self) -> HANDLE { self.0 }
     pub fn new() -> Result<Self> {
         unsafe {
             let h = CreateJobObjectW(None, None).context("CreateJobObjectW")?;

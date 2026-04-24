@@ -112,7 +112,46 @@ pub fn make_lockdown(base: HANDLE, il_rid: u32) -> Result<HANDLE> {
         let _ = AllocateAndInitializeSid; // keep import
         let _ = SID_IDENTIFIER_AUTHORITY { Value: [0;6] };
         set_il(out, il_rid)?;
+        // Without an explicit default DACL, objects (including child
+        // processes) created under this token get a DACL that csrss/
+        // conhost can't open, so cmd's CreateProcess fails. Grant
+        // SYSTEM + the user's logon SID + RESTRICTED.
+        if let Err(e) = set_default_dacl(out, garr) {
+            eprintln!("[sbox-exec] set_default_dacl: {e:#}");
+        }
         Ok(out)
+    }
+}
+
+fn set_default_dacl(tok: HANDLE, groups: &[SID_AND_ATTRIBUTES]) -> Result<()> {
+    use windows::Win32::Security::{
+        InitializeAcl, AddAccessAllowedAce, SetTokenInformation, TokenDefaultDacl,
+        TOKEN_DEFAULT_DACL, ACL_REVISION,
+    };
+    use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
+    unsafe {
+        let mut sids: Vec<PSID> = Vec::new();
+        for s in ["S-1-5-18" /*SYSTEM*/, "S-1-5-12" /*RESTRICTED*/] {
+            let mut p = PSID::default();
+            if ConvertStringSidToSidW(pcwstr(&wstr(s)), &mut p).is_ok() { sids.push(p); }
+        }
+        // Logon SID from the base groups.
+        for g in groups {
+            if g.Attributes & (SE_GROUP_LOGON_ID as u32) != 0 { sids.push(g.Sid); }
+        }
+        let mut buf = vec![0u8; 1024];
+        let acl = buf.as_mut_ptr() as *mut windows::Win32::Security::ACL;
+        InitializeAcl(acl, buf.len() as u32, ACL_REVISION).context("InitializeAcl")?;
+        for s in &sids {
+            AddAccessAllowedAce(acl, ACL_REVISION, 0x10000000 /*GENERIC_ALL*/, *s)
+                .context("AddAccessAllowedAce")?;
+        }
+        let tdd = TOKEN_DEFAULT_DACL { DefaultDacl: acl };
+        SetTokenInformation(
+            tok, TokenDefaultDacl, &tdd as *const _ as *const c_void,
+            size_of::<TOKEN_DEFAULT_DACL>() as u32,
+        ).context("SetTokenInformation(DefaultDacl)")?;
+        Ok(())
     }
 }
 

@@ -88,7 +88,7 @@ d(`windows sandbox [WINSBOX_PHASE=${PHASE}]`, () => {
   // lockdown primary without re-impersonation and fails. Tests that
   // exercise an EXTERNAL exe via `cmd /c` are gated on the process
   // hook (Phase 2b).
-  const BROKER_PROC_HOOK_LANDED = false
+  const BROKER_PROC_HOOK_LANDED = true
   const extCompat =
     PHASE !== '2' || BROKER_PROC_HOOK_LANDED
       ? compat

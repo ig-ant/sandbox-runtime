@@ -6,6 +6,7 @@ mod policy;
 #[cfg(windows)] mod desktop;
 #[cfg(windows)] mod netbridge;
 #[cfg(windows)] mod token;
+#[cfg(windows)] mod jobwatch;
 #[cfg(windows)] mod launch;
 
 use anyhow::{Context, Result};

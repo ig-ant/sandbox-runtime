@@ -206,11 +206,33 @@ fn run_confined(pol: &Policy) -> Result<u32> {
         .find(|p| std::path::Path::new(p).is_dir())
         .cloned()
         .unwrap_or_else(|| ac.folder.to_string_lossy().into_owned());
+    // Phase-2b (jobwatch path): re-apply the initial impersonation
+    // token to every grandchild as the Job posts NEW_PROCESS. Closes
+    // the cmd→curl/whoami gap without full ntdll interception (which
+    // remains the follow-up for adversarial targets and FS policy).
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watch_handle = if let Some(t) = tokens.as_ref() {
+        let watch = crate::jobwatch::JobWatch::attach(job.handle())?;
+        // HANDLE isn't Send; ship the raw value across the thread
+        // boundary and reconstruct. BrokerTokens (and thus the
+        // underlying handle) outlive the watch thread because we
+        // join it before tokens is dropped.
+        let initial_raw = t.initial.0 as isize;
+        let stop_c = stop.clone();
+        let relay_pid = relay_pi.as_ref().map(|p| p.dwProcessId).unwrap_or(0);
+        Some(std::thread::spawn(move || {
+            let initial = HANDLE(initial_raw as *mut c_void);
+            watch.run(initial, &[relay_pid], stop_c);
+        }))
+    } else { None };
+
     log!("launching target (cwd={}): {}", target_cwd, pol.command_line);
     let pi = spawn_in_ac(&ac, &job, desktop.as_ref(), tokens.as_ref(),
                          &pol.command_line, Some(&target_cwd), &extra_env)?;
     log!("target pid={}", pi.dwProcessId);
     unsafe { WaitForSingleObject(pi.hProcess, INFINITE); }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some(h) = watch_handle { let _ = h.join(); }
     let mut code = 0u32;
     unsafe { GetExitCodeProcess(pi.hProcess, &mut code)?; }
     log!("target exit={code:#x}");
