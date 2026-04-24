@@ -673,22 +673,29 @@ fn handle_reg(
             return;
         }
     };
-    if req_access & write_bits != 0 {
+    // Win32 routinely opens with KEY_ALL_ACCESS / MAXIMUM_ALLOWED
+    // and then only reads (`WSAStartup` on `WinSock2\Parameters`,
+    // `RegOpenKeyEx` on the HKLM/HKCU roots). Broker every open
+    // that has any read intent with the canonical read mask;
+    // the dup'd handle carries only read access, so a later
+    // `NtSetValueKey` fails ACCESS_DENIED — same effective
+    // policy as a lockdown-token deny, but the read path works.
+    // Only a pure-write request (e.g. bare KEY_SET_VALUE) is
+    // passed through for the lockdown token to deny.
+    let read_intent: u32 = match req.op {
+        ipc::OP_NTOPENSECTION =>
+            0x0001 | 0x0004 | 0x0008 | 0x80000000 | MAXIMUM_ALLOWED,
+        _ => 0x0001 /*QUERY_VALUE*/ | 0x0008 /*ENUM_SUBKEYS*/ |
+             0x0010 /*NOTIFY*/ | 0x80000000 | MAXIMUM_ALLOWED,
+    };
+    if req_access & read_intent == 0 && req_access & write_bits != 0 {
         if ctx.trace {
-            eprintln!("[sbox-exec] {tag}: passthrough write access={req_access:#x} {leaf}");
+            eprintln!("[sbox-exec] {tag}: passthrough write-only access={req_access:#x} {leaf}");
         }
         ch.reply_fs(0, 0, ipc::FS_PASSTHROUGH);
         return;
     }
-    // MAXIMUM_ALLOWED under the broker's token would resolve to
-    // write — substitute the read mask so the dup'd handle is
-    // read-only. kernelbase opens the HKLM/HKCU roots this way
-    // and every subsequent relative open hangs off the result,
-    // so passthrough (which fails under NULL restricting) breaks
-    // the whole chain.
-    let access = if req_access & MAXIMUM_ALLOWED != 0 {
-        read_mask | (req_access & KEY_WOW64)
-    } else { req_access };
+    let access = read_mask | (req_access & KEY_WOW64);
     let root_h = if root_raw != 0 {
         match dup_from_target(target, root_raw) {
             Ok(h) => h,

@@ -40,9 +40,23 @@ pub enum Restricting {
     Keep,
     /// {Logon SID, RESTRICTED} only.
     LogonAndRestricted,
+    /// {ALL APPLICATION PACKAGES, RESTRICTED, Logon SID}. Lets
+    /// the lowbox'd target pass the restricting check on
+    /// objects that grant ALL APP PACKAGES — `\Device\Afd`
+    /// (sockets), `\KnownDlls\*`, system registry/sections —
+    /// without weakening FS: user files don't grant ALL APP
+    /// PACKAGES, and the FS deny comes from deny-only enabled
+    /// groups in the *normal* check anyway. The package-
+    /// specific AC SID (S-1-15-2-<hash>) is rejected by
+    /// CreateRestrictedToken; the well-known S-1-15-2-1 is a
+    /// regular SID. RESTRICTED is kept so the broker's
+    /// per-spawn exe-dir grants resolve.
+    Lockdown,
     /// {S-1-0-0}. Chromium USER_LOCKDOWN — every access check
     /// fails the restricting pass unless the object's DACL grants
-    /// NULL SID (effectively never).
+    /// NULL SID (effectively never). Unusable for a target that
+    /// must do its own AFD opens (ours must — broker-opening
+    /// AFD yields a non-AC socket).
     Null,
 }
 
@@ -61,7 +75,7 @@ pub const USER_LIMITED: LockdownSpec = LockdownSpec {
 };
 pub const USER_LOCKDOWN: LockdownSpec = LockdownSpec {
     keep_enabled: &[],
-    restricting: Restricting::Null,
+    restricting: Restricting::Lockdown,
 };
 
 /// `WINSBOX_TOKEN=lockdown` → (USER_LOCKDOWN, Untrusted IL).
@@ -175,6 +189,19 @@ pub fn make_lockdown_with(
                 if let Some(r) = str_sid("S-1-5-12") {
                     owned_restrict.push(r);
                     v.push(SID_AND_ATTRIBUTES { Sid: r, Attributes: 0 });
+                }
+                v
+            }
+            Restricting::Lockdown => {
+                let mut v = Vec::new();
+                if let Some(l) = logon_sid {
+                    v.push(SID_AND_ATTRIBUTES { Sid: l, Attributes: 0 });
+                }
+                for s in ["S-1-15-2-1" /*ALL APP PACKAGES*/, "S-1-5-12"] {
+                    if let Some(p) = str_sid(s) {
+                        owned_restrict.push(p);
+                        v.push(SID_AND_ATTRIBUTES { Sid: p, Attributes: 0 });
+                    }
                 }
                 v
             }
