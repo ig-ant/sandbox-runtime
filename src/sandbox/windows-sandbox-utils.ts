@@ -126,7 +126,9 @@ export async function wrapCommandWithSandboxWindows(
       httpProxyPort: p.httpProxyPort,
       socksProxyPort: p.socksProxyPort,
     },
-    useAlternateDesktop: p.windowsConfig?.useAlternateDesktop ?? true,
+    // Off by default until conhost-on-alt-desktop is sorted; the Job
+    // UI restrictions already block the cross-process window vectors.
+    useAlternateDesktop: p.windowsConfig?.useAlternateDesktop ?? false,
     mode: defaultMode(p.windowsConfig),
   }
 

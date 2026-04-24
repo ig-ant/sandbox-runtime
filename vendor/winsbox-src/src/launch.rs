@@ -67,10 +67,20 @@ fn run_stub(pol: &Policy) -> Result<u32> {
     }
 }
 
+macro_rules! log { ($($a:tt)*) => { eprintln!("[sbox-exec] {}", format!($($a)*)) } }
+
 fn run_appcontainer(pol: &Policy) -> Result<u32> {
+    log!("mode=app-container");
     let ac = AppContainer::create("ac")?;
+    log!("AppContainer sid={} folder={}", ac.sid_string, ac.folder.display());
     let job = Job::new()?;
-    let desktop = if pol.use_alternate_desktop { Some(AltDesktop::new()?) } else { None };
+    log!("Job created");
+    let desktop = if pol.use_alternate_desktop {
+        match AltDesktop::new() {
+            Ok(d) => { log!("alt desktop {}", d.qualified_name()); Some(d) }
+            Err(e) => { log!("alt desktop unavailable ({e}); continuing without"); None }
+        }
+    } else { None };
     let mut acls = AclJournal::default();
 
     // The AC needs to read+execute this binary (for the inside relay)
@@ -102,54 +112,45 @@ fn run_appcontainer(pol: &Policy) -> Result<u32> {
         }
     }
 
-    // Network bridge: only if the policy carries proxy ports.
+    log!("ACLs applied: {} grants/denies", pol.allow_read.len() + pol.allow_write.len() + pol.deny_read.len() + pol.deny_write.len());
+
+    // Network bridge: only if the policy carries proxy ports. Failures
+    // here are logged but non-fatal — the AC simply has no network,
+    // which is the safe default.
     let mut extra_env = pol.env.clone();
     let mut relay_pi: Option<PROCESS_INFORMATION> = None;
-    if let (Some(hp), sp) = (pol.network.http_proxy_port, pol.network.socks_proxy_port) {
-        let (sock_dir, needs_acl) = netbridge::socket_dir(&ac.folder);
-        if needs_acl {
-            acls.grant(sock_dir.to_str().unwrap(), ac.sid, &ac.sid_string, MODIFY).ok();
-        }
-        let http_sock = sock_dir.join("h.sock");
-        let socks_sock = sock_dir.join("s.sock");
-        netbridge::spawn_outside_relay(http_sock.clone(), hp)?;
-        if let Some(spp) = sp {
-            netbridge::spawn_outside_relay(socks_sock.clone(), spp)?;
-        }
-        // Spawn the inside relay inside the AC, in this Job, and read
-        // back the loopback ports it bound.
-        let (pi, mut child_stdout) = spawn_in_ac_capture(
-            &ac, &job, desktop.as_ref(),
-            &self_exe.to_string_lossy(),
-            &["--relay-inside",
-              http_sock.to_str().unwrap(),
-              if sp.is_some() { socks_sock.to_str().unwrap() } else { "" }],
-        )?;
-        let mut ports = Vec::<u16>::new();
-        for line in BufReader::new(&mut child_stdout).lines() {
-            let line = line?;
-            if let Ok(p) = line.trim().parse::<u16>() { ports.push(p); }
-            if ports.len() >= if sp.is_some() { 2 } else { 1 } { break; }
-        }
-        relay_pi = Some(pi);
-        if let Some(p) = ports.first() {
-            for k in ["HTTP_PROXY","HTTPS_PROXY","http_proxy","https_proxy"] {
-                extra_env.push((k.into(), format!("http://127.0.0.1:{p}")));
+    if let Some(hp) = pol.network.http_proxy_port {
+        let sp = pol.network.socks_proxy_port;
+        match setup_bridge(&ac, &job, desktop.as_ref(), &mut acls, &self_exe, hp, sp) {
+            Ok((pi, ports)) => {
+                relay_pi = Some(pi);
+                log!("bridge up: ports={:?}", ports);
+                if let Some(p) = ports.first() {
+                    for k in ["HTTP_PROXY","HTTPS_PROXY","http_proxy","https_proxy"] {
+                        extra_env.push((k.into(), format!("http://127.0.0.1:{p}")));
+                    }
+                }
+                if let (Some(_), Some(p)) = (sp, ports.get(1)) {
+                    for k in ["ALL_PROXY","all_proxy"] {
+                        extra_env.push((k.into(), format!("socks5h://127.0.0.1:{p}")));
+                    }
+                }
             }
+            Err(e) => log!("bridge setup failed ({e:#}); continuing without proxy"),
         }
-        if let (Some(_), Some(p)) = (sp, ports.get(1)) {
-            for k in ["ALL_PROXY","all_proxy"] {
-                extra_env.push((k.into(), format!("socks5h://127.0.0.1:{p}")));
-            }
-        }
+    } else {
+        log!("no proxy ports in policy; skipping bridge");
     }
 
     // Launch the real target inside the AC + Job (+ alternate desktop).
+    log!("launching target: {}", pol.command_line);
     let pi = spawn_in_ac(&ac, &job, desktop.as_ref(), &pol.command_line,
                          pol.cwd.as_deref(), &extra_env)?;
+    log!("target pid={}", pi.dwProcessId);
     unsafe { WaitForSingleObject(pi.hProcess, INFINITE); }
     let mut code = 0u32;
     unsafe { GetExitCodeProcess(pi.hProcess, &mut code)?; }
+    log!("target exit={code:#x}");
     unsafe { let _ = CloseHandle(pi.hThread); let _ = CloseHandle(pi.hProcess); }
 
     if let Some(rpi) = relay_pi {
@@ -295,5 +296,60 @@ fn spawn_in_ac_capture(
         let stdout = std::fs::File::from_raw_handle(rd.0 as *mut _);
         Ok((pi, stdout))
     }
+}
+
+fn setup_bridge(
+    ac: &AppContainer,
+    job: &Job,
+    desktop: Option<&AltDesktop>,
+    acls: &mut AclJournal,
+    self_exe: &std::path::Path,
+    http_port: u16,
+    socks_port: Option<u16>,
+) -> Result<(PROCESS_INFORMATION, Vec<u16>)> {
+    let (sock_dir, needs_acl) = netbridge::socket_dir(&ac.folder);
+    if needs_acl {
+        acls.grant(sock_dir.to_str().unwrap(), ac.sid, &ac.sid_string, MODIFY)?;
+    }
+    let http_sock = sock_dir.join("h.sock");
+    let socks_sock = sock_dir.join("s.sock");
+    log!("bridge: outside relay http={} → {}", http_sock.display(), http_port);
+    netbridge::spawn_outside_relay(http_sock.clone(), http_port)?;
+    if let Some(sp) = socks_port {
+        log!("bridge: outside relay socks={} → {}", socks_sock.display(), sp);
+        netbridge::spawn_outside_relay(socks_sock.clone(), sp)?;
+    }
+
+    log!("bridge: spawning inside relay");
+    let (pi, child_stdout) = spawn_in_ac_capture(
+        ac, job, desktop,
+        self_exe.to_str().unwrap(),
+        &["--relay-inside",
+          http_sock.to_str().unwrap(),
+          if socks_port.is_some() { socks_sock.to_str().unwrap() } else { "" }],
+    )?;
+    log!("bridge: inside relay pid={}, reading ports", pi.dwProcessId);
+
+    // Read ports with a watchdog — if the relay died (e.g., AC denied
+    // it execute) the pipe never produces and we'd hang.
+    let want = if socks_port.is_some() { 2 } else { 1 };
+    let (tx, rx) = std::sync::mpsc::channel::<u16>();
+    std::thread::spawn(move || {
+        for line in BufReader::new(child_stdout).lines().flatten() {
+            if let Ok(p) = line.trim().parse::<u16>() { let _ = tx.send(p); }
+        }
+    });
+    let mut ports = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while ports.len() < want {
+        match rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+            Ok(p) => ports.push(p),
+            Err(_) => {
+                unsafe { let _ = TerminateProcess(pi.hProcess, 1); }
+                bail!("inside relay produced {}/{} ports before timeout", ports.len(), want);
+            }
+        }
+    }
+    Ok((pi, ports))
 }
 

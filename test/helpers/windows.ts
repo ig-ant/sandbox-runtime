@@ -113,7 +113,7 @@ export async function runSandboxed(
     child.stderr.on('data', d => (stderr += d.toString()))
     const to = setTimeout(() => {
       child.kill()
-    }, opts.timeoutMs ?? 30_000)
+    }, opts.timeoutMs ?? 15_000)
     child.on('close', code => {
       clearTimeout(to)
       SandboxManager.cleanupAfterCommand()
