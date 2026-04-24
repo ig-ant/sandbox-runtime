@@ -256,7 +256,7 @@ fn run_confined(pol: &Policy) -> Result<u32> {
         threads: Mutex::new(Vec::new()),
     }));
     if let Some(ctx) = ctx.as_ref() {
-        match install_broker_hook(pi.hProcess, pi.hThread, ctx.clone()) {
+        match install_broker_hook(pi.hProcess, pi.hThread, false, ctx.clone()) {
             Ok(()) => log!("interception installed on target"),
             Err(e) => {
                 log!("interception install failed ({e:#}); grandchild spawns will fail");
@@ -384,12 +384,14 @@ fn spawn_in_ac(
 /// the target continue, and spawn the per-channel service thread.
 /// Called once for the immediate target and recursively for each
 /// grandchild the broker spawns. The target must be SUSPENDED on
-/// entry; on success it is running.
+/// entry; on success it is running unless `suspend_after` (the
+/// stub re-suspends itself post-rendezvous so the *caller*'s
+/// `ResumeThread` is what releases it — honours `CREATE_SUSPENDED`).
 fn install_broker_hook(
-    target: HANDLE, thread: HANDLE, ctx: Arc<SpawnCtx>,
+    target: HANDLE, thread: HANDLE, suspend_after: bool, ctx: Arc<SpawnCtx>,
 ) -> Result<()> {
     let ch = ipc::Channel::create(target)?;
-    let sync = crate::entry_trampoline::install(target, thread)?;
+    let sync = crate::entry_trampoline::install(target, thread, suspend_after)?;
     unsafe { ResumeThread(thread); }
     if !sync.wait_loaded(15_000) {
         bail!("entry rendezvous timed out (loader hung?)");
@@ -403,9 +405,9 @@ fn install_broker_hook(
 }
 
 /// Per-channel service loop. Blocks on `ev_req`; on each request,
-/// reads the caller's `lpCommandLine` / `dwCreationFlags`, performs
-/// the spawn under the broker's token recipe (forwarding the
-/// caller's console flags), recursively installs the hook in the
+/// reads the caller's `lpCommandLine` / `dwCreationFlags` /
+/// `lpStartupInfo`, performs the spawn under the broker's token
+/// recipe forwarding those, recursively installs the hook in the
 /// new process, `DuplicateHandle`s process+thread into the
 /// requesting target, and replies with `PROCESS_INFORMATION`.
 fn serve_ipc(ch: ipc::Channel, target_raw: isize, ctx: Arc<SpawnCtx>) {
@@ -414,11 +416,12 @@ fn serve_ipc(ch: ipc::Channel, target_raw: isize, ctx: Arc<SpawnCtx>) {
         let req = match ch.wait_request(250) { Some(r) => r, None => continue };
         // CreateProcessInternalW args:
         //   [1]=lpApplicationName, [2]=lpCommandLine, [6]=dwCreationFlags,
-        //   [8]=lpCurrentDirectory, [10]=lpProcessInformation.
+        //   [8]=lpCurrentDirectory, [9]=lpStartupInfo, [10]=lpProcessInformation.
         let app = read_target_wstr(target, req.args[1] as usize).unwrap_or_default();
         let cmd = read_target_wstr(target, req.args[2] as usize).unwrap_or_default();
         let cwd = read_target_wstr(target, req.args[8] as usize).ok();
         let caller_flags = req.args[6] as u32;
+        let si = read_target_startupinfo(target, req.args[9] as usize);
         let cmdline = if !cmd.is_empty() { cmd } else { app.clone() };
         if cmdline.is_empty() {
             eprintln!("[sbox-exec] ipc: empty cmdline (app={app:?})");
@@ -426,18 +429,15 @@ fn serve_ipc(ch: ipc::Channel, target_raw: isize, ctx: Arc<SpawnCtx>) {
             continue;
         }
         eprintln!(
-            "[sbox-exec] ipc: brokered spawn: {cmdline}  (flags={caller_flags:#x} app={app:?})"
+            "[sbox-exec] ipc: brokered spawn: {cmdline}  (flags={caller_flags:#x} si.flags={:#x} app={app:?})",
+            si.dwFlags.0,
         );
+        let suspend_after = caller_flags & 0x00000004 /* CREATE_SUSPENDED */ != 0;
         let app_opt = (!app.is_empty()).then_some(app.as_str());
-        match broker_spawn(&ctx, app_opt, &cmdline, cwd.as_deref(), caller_flags) {
+        match broker_spawn(&ctx, app_opt, &cmdline, cwd.as_deref(), caller_flags, &si) {
             Ok(child) => {
-                // Recursively hook the grandchild. This resumes it
-                // (for the rendezvous), waits for its loader, patches
-                // CreateProcessInternalW, and lets it run. If the
-                // caller asked CREATE_SUSPENDED that intent is lost —
-                // acceptable for cmd/npm/node which never do.
                 if let Err(e) = install_broker_hook(
-                    child.hProcess, child.hThread, ctx.clone(),
+                    child.hProcess, child.hThread, suspend_after, ctx.clone(),
                 ) {
                     eprintln!("[sbox-exec] ipc: recurse hook failed: {e:#}; child runs unhooked");
                     unsafe { ResumeThread(child.hThread); }
@@ -449,6 +449,7 @@ fn serve_ipc(ch: ipc::Channel, target_raw: isize, ctx: Arc<SpawnCtx>) {
                 // holds it for future dup_to_target calls. Job
                 // KILL_ON_JOB_CLOSE bounds the leak.
                 unsafe { let _ = CloseHandle(child.hThread); }
+                close_si_handles(&si);
             }
             Err(e) => {
                 let gle = unsafe {
@@ -456,6 +457,7 @@ fn serve_ipc(ch: ipc::Channel, target_raw: isize, ctx: Arc<SpawnCtx>) {
                 };
                 eprintln!("[sbox-exec] ipc: brokered spawn failed: {e:#} (gle={gle})");
                 ch.reply_err(if gle != 0 { gle } else { 5 });
+                close_si_handles(&si);
             }
         }
     }
@@ -463,20 +465,23 @@ fn serve_ipc(ch: ipc::Channel, target_raw: isize, ctx: Arc<SpawnCtx>) {
 
 /// Spawn `cmdline` under the same restricted+lowbox token + Job +
 /// initial-impersonation recipe used for the immediate target,
-/// forwarding the caller's console-related creation flags. Returns
-/// SUSPENDED so the caller can install the hook first.
+/// forwarding the caller's console-related creation flags and
+/// `STARTUPINFOW` (stdio handles already dup'd into the broker).
+/// Returns SUSPENDED so the caller can install the hook first.
 fn broker_spawn(
     ctx: &SpawnCtx,
     app: Option<&str>,
     cmdline: &str,
     cwd: Option<&str>,
     caller_flags: u32,
+    si: &STARTUPINFOW,
 ) -> Result<PROCESS_INFORMATION> {
     use windows::Win32::System::JobObjects::AssignProcessToJobObject;
     use windows::Win32::System::Threading::PROCESS_CREATION_FLAGS;
     // Forward the flags that affect console/window behaviour and
     // priority; mask out the ones that would defeat brokering or
-    // duplicate work the broker does itself.
+    // duplicate work the broker does itself. CREATE_SUSPENDED is
+    // honoured by the entry-trampoline self-suspend, not here.
     const PASS_THROUGH: u32 =
         0x00000010 /* CREATE_NEW_CONSOLE */ |
         0x00000200 /* CREATE_NEW_PROCESS_GROUP */ |
@@ -492,14 +497,12 @@ fn broker_spawn(
         let app_p = app_w.as_ref().map(|w| pcwstr(w)).unwrap_or(PCWSTR::null());
         let cwd_w = wstr(cwd.unwrap_or(&ctx.cwd));
         let mut envb = build_env_block(&ctx.env);
-        let mut si: STARTUPINFOW = zeroed();
-        si.cb = size_of::<STARTUPINFOW>() as u32;
         let mut pi: PROCESS_INFORMATION = zeroed();
         CreateProcessAsUserW(
             ctx.primary, app_p, PWSTR(cmd.as_mut_ptr()), None, None, true,
             CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED | fwd,
             Some(envb.as_mut_ptr() as *mut c_void),
-            PCWSTR(cwd_w.as_ptr()), &si, &mut pi,
+            PCWSTR(cwd_w.as_ptr()), si, &mut pi,
         ).with_context(|| format!("CreateProcessAsUserW(brokered, {cmdline})"))?;
         if let Err(e) = SetThreadToken(Some(&pi.hThread), ctx.initial) {
             eprintln!("[sbox-exec] broker_spawn: SetThreadToken: {e}");
@@ -508,6 +511,61 @@ fn broker_spawn(
             .context("AssignProcessToJobObject(brokered)")?;
         let _ = ctx.ac_sid;
         Ok(pi)
+    }
+}
+
+/// Read the caller's `STARTUPINFOW` from target memory and rebuild
+/// it with stdio handles `DuplicateHandle`'d from the caller into
+/// the broker (inheritable) so the brokered child inherits the
+/// caller's redirections. String fields (lpDesktop/lpTitle) are
+/// dropped — they reference caller-VA memory and would be invalid
+/// in the broker; the broker's defaults apply instead.
+fn read_target_startupinfo(target: HANDLE, va: usize) -> STARTUPINFOW {
+    use windows::Win32::Foundation::DuplicateHandle;
+    use windows::Win32::System::Threading::{
+        GetCurrentProcess, STARTF_USESTDHANDLES,
+    };
+    let mut out: STARTUPINFOW = unsafe { zeroed() };
+    out.cb = size_of::<STARTUPINFOW>() as u32;
+    if va == 0 { return out; }
+    // STARTUPINFOW is the prefix of STARTUPINFOEXW; reading the W
+    // size is safe regardless of which the caller passed.
+    let theirs: STARTUPINFOW = match interception::read_remote(target, va) {
+        Ok(s) => s, Err(_) => return out,
+    };
+    out.dwFlags = theirs.dwFlags;
+    out.wShowWindow = theirs.wShowWindow;
+    out.dwX = theirs.dwX; out.dwY = theirs.dwY;
+    out.dwXSize = theirs.dwXSize; out.dwYSize = theirs.dwYSize;
+    out.dwXCountChars = theirs.dwXCountChars;
+    out.dwYCountChars = theirs.dwYCountChars;
+    out.dwFillAttribute = theirs.dwFillAttribute;
+    if theirs.dwFlags & STARTF_USESTDHANDLES != Default::default() {
+        let dup = |h: HANDLE| -> HANDLE {
+            if h.is_invalid() || h.0.is_null() { return h; }
+            let mut o = HANDLE::default();
+            unsafe {
+                let _ = DuplicateHandle(
+                    target, h, GetCurrentProcess(), &mut o,
+                    0, true, windows::Win32::Foundation::DUPLICATE_SAME_ACCESS,
+                );
+            }
+            o
+        };
+        out.hStdInput  = dup(theirs.hStdInput);
+        out.hStdOutput = dup(theirs.hStdOutput);
+        out.hStdError  = dup(theirs.hStdError);
+    }
+    out
+}
+
+fn close_si_handles(si: &STARTUPINFOW) {
+    use windows::Win32::System::Threading::STARTF_USESTDHANDLES;
+    if si.dwFlags & STARTF_USESTDHANDLES == Default::default() { return; }
+    for h in [si.hStdInput, si.hStdOutput, si.hStdError] {
+        if !h.is_invalid() && !h.0.is_null() {
+            unsafe { let _ = CloseHandle(h); }
+        }
     }
 }
 

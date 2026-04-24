@@ -270,8 +270,11 @@ d(`windows sandbox [WINSBOX_PHASE=${PHASE}]`, () => {
     'curl direct to denied domain (proxy env unset) is blocked',
     '1',
     async () => {
+      // http://, not https:// — under lowbox Schannel fails before
+      // the socket is even attempted, which would mask whether the
+      // network boundary itself holds.
       const r = await runSandboxed(
-        'curl.exe -sS --noproxy "*" --max-time 8 -o NUL -w "%{http_code}" https://example.org/',
+        'curl.exe -sS --noproxy "*" --max-time 8 -o NUL -w "%{http_code}" http://example.org/',
         fx.config,
       )
       // If the sandbox blocks network, curl exits non-zero; if not, we
