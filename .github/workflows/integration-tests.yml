@@ -127,6 +127,25 @@ jobs:
           vendor/winsbox-src/target/release/p11-lsa.exe
         continue-on-error: true
 
+      - name: P12 USER_LIMITED→USER_LOCKDOWN bisection (Windows)
+        if: matrix.os == 'windows'
+        run: |
+          cargo build --release --manifest-path vendor/winsbox-src/Cargo.toml --bin p12-lockdown
+          vendor/winsbox-src/target/release/p12-lockdown.exe
+        continue-on-error: true
+
+      - name: Run tests (Windows, WINSBOX_TOKEN=lockdown)
+        # Step-0 retest: now that the broker spawns every grandchild
+        # itself (CreateProcessInternalW hook), does the suite pass
+        # under full USER_LOCKDOWN? continue-on-error so a regression
+        # here surfaces in the log without blocking the default run.
+        if: matrix.os == 'windows'
+        run: bun test --timeout 25000 test/sandbox/windows.test.ts
+        continue-on-error: true
+        env:
+          WINSBOX_PHASE: '2'
+          WINSBOX_TOKEN: lockdown
+
       - name: Run tests (Windows)
         # The full suite has POSIX-shell assumptions and a Bun-on-Windows
         # crash in parent-proxy-tunnel.test.ts; scope to the Windows suite

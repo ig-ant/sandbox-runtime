@@ -113,12 +113,13 @@ macro_rules! log { ($($a:tt)*) => { eprintln!("[sbox-exec] {}", format!($($a)*))
 
 fn build_broker_tokens(ac: &AppContainer) -> Result<BrokerTokens> {
     let base = token::open_self_token()?;
-    // Phase-2a: launch at Low IL; the entry trampoline (Phase-2b)
-    // will drop to Untrusted post-loader-init. Both tokens MUST be
-    // at the same IL and lowbox-wrapped or SeTokenCanImpersonate
-    // downgrades the impersonation to Identification (PoC P5).
-    let il = token::IL_LOW;
-    let lockdown = token::make_lockdown(base, il)?;
+    // Both tokens MUST be at the same IL and lowbox-wrapped or
+    // SeTokenCanImpersonate downgrades the impersonation to
+    // Identification (PoC P5). `spec_from_env` returns
+    // (USER_LIMITED, Low) by default; WINSBOX_TOKEN=lockdown →
+    // (USER_LOCKDOWN, Untrusted) for step-0 retesting on CI.
+    let (spec, il) = token::spec_from_env();
+    let lockdown = token::make_lockdown_with(base, il, spec)?;
     let initial_r = token::make_initial(base, il)?;
     unsafe { let _ = CloseHandle(base); }
 
@@ -131,7 +132,10 @@ fn build_broker_tokens(ac: &AppContainer) -> Result<BrokerTokens> {
     let primary = token::to_primary(lock_lb)?;
     let initial = token::to_impersonation(init_lb)?;
     unsafe { let _ = CloseHandle(lock_lb); let _ = CloseHandle(init_lb); }
-    log!("broker tokens built (lockdown+lowbox primary, USER_RESTRICTED_SAME_ACCESS+lowbox impersonation, IL=Low)");
+    log!(
+        "broker tokens: primary={spec:?}+lowbox, initial=USER_RESTRICTED_SAME_ACCESS+lowbox, IL={:#x}",
+        il,
+    );
     Ok(BrokerTokens { primary, initial })
 }
 
