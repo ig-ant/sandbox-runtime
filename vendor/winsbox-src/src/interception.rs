@@ -11,7 +11,7 @@
 //!
 //! x86_64 only. arm64 falls back to Mode::AppContainer at runtime.
 
-use crate::ipc::Channel;
+use crate::ipc::StubAddrs;
 use anyhow::{anyhow, bail, Context, Result};
 use std::ffi::c_void;
 use windows::core::{PCSTR, PCWSTR};
@@ -26,39 +26,51 @@ use windows::Win32::System::Memory::{
     PAGE_READWRITE,
 };
 
-/// Whether the broker should also patch `NtCreateFile`/`NtOpenFile`.
-/// Off until the policy engine lands so the safety tests keep
-/// passing on the Phase-1 ACL boundary; flipped by the broker
-/// policy, not at compile time.
 #[cfg(not(target_arch = "x86_64"))]
-pub fn install(_target: HANDLE, _ch: &Channel, _cpw: usize, _fs: bool) -> Result<()> {
+pub fn install_fs(_target: HANDLE, _a: &StubAddrs) -> Result<()> {
+    bail!("interception: x86_64 only in this build");
+}
+#[cfg(not(target_arch = "x86_64"))]
+pub fn install_cpw(_target: HANDLE, _a: &StubAddrs, _cpw: usize) -> Result<()> {
     bail!("interception: x86_64 only in this build");
 }
 
-/// Patch `kernelbase!CreateProcessInternalW` (at `cpw_va`) and,
-/// when `hook_fs`, `ntdll!{NtCreateFile,NtOpenFile}` in `target`.
-/// All hooks share one IPC section; the stub writes the op tag
-/// at offset 0 so the broker can dispatch.
 #[cfg(target_arch = "x86_64")]
-pub fn install(target: HANDLE, ch: &Channel, cpw_va: usize, hook_fs: bool) -> Result<()> {
-    let nt_set_event = ntdll_export("NtSetEvent")?;
-    let nt_wait = ntdll_export("NtWaitForSingleObject")?;
-    let env = StubEnv {
-        section: ch.target_view as u64,
-        ev_req: ch.t_ev_req, ev_resp: ch.t_ev_resp,
-        nt_set_event: nt_set_event as u64, nt_wait: nt_wait as u64,
-    };
+fn stub_env(a: &StubAddrs) -> Result<StubEnv> {
+    Ok(StubEnv {
+        section: a.section as u64,
+        ev_req: a.ev_req, ev_resp: a.ev_resp,
+        nt_set_event: ntdll_export("NtSetEvent")? as u64,
+        nt_wait: ntdll_export("NtWaitForSingleObject")? as u64,
+    })
+}
 
+/// Patch `ntdll!{NtCreateFile,NtOpenFile}` in `target`. ntdll is
+/// mapped in a `CREATE_SUSPENDED` process, so this can run before
+/// resume — the *loader's* file opens then go through the broker
+/// too, which is what lets it read DLLs from directories the
+/// lowbox token can't (e.g. hostedtoolcache without an
+/// `ALL APPLICATION PACKAGES` ACE).
+#[cfg(target_arch = "x86_64")]
+pub fn install_fs(target: HANDLE, a: &StubAddrs) -> Result<()> {
+    let env = stub_env(a)?;
+    let ntcf = ntdll_export("NtCreateFile")?;
+    let ntof = ntdll_export("NtOpenFile")?;
+    patch_with_stub(target, "NtCreateFile", ntcf,
+                    &emit_fs_stub(&env, crate::ipc::OP_NTCREATEFILE, 11))?;
+    patch_with_stub(target, "NtOpenFile", ntof,
+                    &emit_fs_stub(&env, crate::ipc::OP_NTOPENFILE, 6))?;
+    Ok(())
+}
+
+/// Patch `kernelbase!CreateProcessInternalW` in `target`. Must run
+/// after the loader has mapped kernelbase — i.e. after the
+/// entry-trampoline rendezvous.
+#[cfg(target_arch = "x86_64")]
+pub fn install_cpw(target: HANDLE, a: &StubAddrs, cpw_va: usize) -> Result<()> {
+    let env = stub_env(a)?;
     patch_with_stub(target, "CreateProcessInternalW", cpw_va,
                     &emit_cpw_stub(&env))?;
-    if hook_fs {
-        let ntcf = ntdll_export("NtCreateFile")?;
-        let ntof = ntdll_export("NtOpenFile")?;
-        patch_with_stub(target, "NtCreateFile", ntcf,
-                        &emit_fs_stub(&env, crate::ipc::OP_NTCREATEFILE, 11))?;
-        patch_with_stub(target, "NtOpenFile", ntof,
-                        &emit_fs_stub(&env, crate::ipc::OP_NTOPENFILE, 6))?;
-    }
     Ok(())
 }
 

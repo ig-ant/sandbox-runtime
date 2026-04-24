@@ -8,11 +8,12 @@
 
 use crate::policy::Policy;
 
+// FILE_WRITE_ATTRIBUTES (0x100) and FILE_WRITE_EA (0x10) are
+// deliberately excluded — many tools request them speculatively
+// (CRT stat, PDB lookup) and they don't grant data write.
 const WRITE_BITS: u32 =
     0x00000002 /* FILE_WRITE_DATA */ |
     0x00000004 /* FILE_APPEND_DATA */ |
-    0x00000010 /* FILE_WRITE_EA */ |
-    0x00000100 /* FILE_WRITE_ATTRIBUTES */ |
     0x00010000 /* DELETE */ |
     0x00040000 /* WRITE_DAC */ |
     0x00080000 /* WRITE_OWNER */ |
@@ -54,12 +55,14 @@ impl FsPolicy {
         // device opens the lockdown token can already do never
         // reach the broker.
         if let Some(dev) = lower.strip_prefix(r"\device\") {
-            return if dev.starts_with("afd\\")
-                || dev == "afd"
-                || dev.starts_with("condrv\\")
-                || dev == "condrv"
+            return if dev.starts_with("afd")
+                || dev.starts_with("condrv")
                 || dev == "null"
-                || dev.starts_with("deviceapi\\")
+                || dev.starts_with("deviceapi")
+                || dev == "cng"
+                || dev == "ksecdd"
+                || dev == "nsi"
+                || dev.starts_with("mailslot")
             {
                 Decision::Allow
             } else {

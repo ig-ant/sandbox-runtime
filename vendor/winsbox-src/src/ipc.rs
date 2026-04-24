@@ -58,6 +58,16 @@ const _: () = assert!(size_of::<Wire>() == 0x88);
 
 pub const SECTION_SIZE: usize = 4096;
 
+/// Target-side addresses the stub emitter needs. Copyable so the
+/// broker can install hooks both before and after moving the
+/// `Channel` into its service thread.
+#[derive(Clone, Copy)]
+pub struct StubAddrs {
+    pub section: usize,
+    pub ev_req: u64,
+    pub ev_resp: u64,
+}
+
 pub struct Channel {
     pub section: HANDLE,
     /// Broker-side mapped view.
@@ -160,6 +170,14 @@ impl Channel {
     /// return the target-side value.
     pub fn dup_to_target(&self, h: HANDLE) -> Result<u64> {
         dup_into(self.target, h)
+    }
+
+    pub fn stub_env_snapshot(&self) -> StubAddrs {
+        StubAddrs {
+            section: self.target_view,
+            ev_req: self.t_ev_req,
+            ev_resp: self.t_ev_resp,
+        }
     }
 }
 

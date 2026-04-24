@@ -402,15 +402,25 @@ fn install_broker_hook(
     target: HANDLE, thread: HANDLE, suspend_after: bool, ctx: Arc<SpawnCtx>,
 ) -> Result<()> {
     let ch = ipc::Channel::create(target)?;
+    let addrs = ch.stub_env_snapshot();
+    // ntdll is already mapped in a CREATE_SUSPENDED process, so
+    // patch the FS hooks now and start servicing them *before*
+    // the loader runs — otherwise the loader can't read DLLs from
+    // directories the lowbox token isn't ACL'd for (hostedtoolcache).
+    if ctx.hook_fs {
+        interception::install_fs(target, &addrs)?;
+    }
     let sync = crate::entry_trampoline::install(target, thread, suspend_after)?;
+    let target_raw = target.0 as isize;
+    let ctx_thread = ctx.clone();
+    let _ = std::thread::spawn(move || serve_ipc(ch, target_raw, ctx_thread));
     unsafe { ResumeThread(thread); }
-    if !sync.wait_loaded(15_000) {
-        bail!("entry rendezvous timed out (loader hung?)");
+    if !sync.wait_loaded_or_exit(target, 15_000) {
+        bail!("entry rendezvous timed out (loader hung/exited)");
     }
     let cpw = crate::entry_trampoline::cpw_address()?;
-    interception::install(target, &ch, cpw, ctx.hook_fs)?;
-    let target_raw = target.0 as isize;
-    let _ = std::thread::spawn(move || serve_ipc(ch, target_raw, ctx));
+    interception::install_cpw(target, &addrs, cpw)?;
+    let _ = ctx;
     sync.go();
     Ok(())
 }
@@ -575,8 +585,10 @@ fn broker_open(req: &ipc::Wire, nt_path: &str) -> std::result::Result<(HANDLE, u
 }
 
 /// Read `OBJECT_ATTRIBUTES.ObjectName` from target memory and
-/// return the NT path. `RootDirectory`-relative opens are
-/// rejected for now (would need broker-side handle tracking).
+/// return the NT path. For `RootDirectory`-relative opens,
+/// duplicates the root handle into the broker,
+/// `GetFinalPathNameByHandle`s it, and returns
+/// `\??\<root-dos-path>\<leaf>`.
 fn read_target_obj_path(target: HANDLE, oa_va: usize) -> Result<String> {
     if oa_va == 0 { bail!("null OBJECT_ATTRIBUTES"); }
     #[repr(C)] #[derive(Clone, Copy)]
@@ -587,13 +599,49 @@ fn read_target_obj_path(target: HANDLE, oa_va: usize) -> Result<String> {
     #[repr(C)] #[derive(Clone, Copy)]
     struct UStr { len: u16, max: u16, _pad: u32, buf: u64 }
     let oa: ObjAttrs = interception::read_remote(target, oa_va)?;
-    if oa.root != 0 {
-        bail!("RootDirectory-relative open (handle={:#x})", oa.root);
+    let leaf = if oa.name == 0 {
+        String::new()
+    } else {
+        let us: UStr = interception::read_remote(target, oa.name as usize)?;
+        if us.len > 32768 { bail!("ObjectName length {}", us.len); }
+        if us.len == 0 { String::new() }
+        else { interception::read_remote_wstr(target, us.buf as usize, us.len as usize)? }
+    };
+    if oa.root == 0 {
+        if leaf.is_empty() { bail!("null ObjectName"); }
+        return Ok(leaf);
     }
-    if oa.name == 0 { bail!("null ObjectName"); }
-    let us: UStr = interception::read_remote(target, oa.name as usize)?;
-    if us.len == 0 || us.len > 32768 { bail!("ObjectName length {}", us.len); }
-    interception::read_remote_wstr(target, us.buf as usize, us.len as usize)
+    // Relative open: resolve the root directory's path. The root
+    // handle was returned by an earlier brokered open, so it's a
+    // value the broker put in the target's table; dup it back.
+    use windows::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS};
+    use windows::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
+    use windows::Win32::System::Threading::GetCurrentProcess;
+    let root = unsafe {
+        let mut h = HANDLE::default();
+        DuplicateHandle(
+            target, HANDLE(oa.root as *mut c_void),
+            GetCurrentProcess(), &mut h, 0, false, DUPLICATE_SAME_ACCESS,
+        ).context("dup RootDirectory")?;
+        h
+    };
+    let mut buf = [0u16; 1024];
+    let n = unsafe {
+        GetFinalPathNameByHandleW(root, &mut buf,
+            windows::Win32::Storage::FileSystem::FILE_NAME_NORMALIZED)
+    };
+    unsafe { let _ = CloseHandle(root); }
+    if n == 0 || n as usize >= buf.len() {
+        bail!("GetFinalPathNameByHandle on RootDirectory");
+    }
+    // Returns `\\?\C:\…`; convert to `\??\C:\…\<leaf>`.
+    let dos = String::from_utf16_lossy(&buf[..n as usize]);
+    let dos = dos.strip_prefix(r"\\?\").unwrap_or(&dos);
+    if leaf.is_empty() {
+        Ok(format!(r"\??\{dos}"))
+    } else {
+        Ok(format!(r"\??\{dos}\{leaf}"))
+    }
 }
 
 /// Spawn `cmdline` under the same restricted+lowbox token + Job +

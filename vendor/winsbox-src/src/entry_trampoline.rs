@@ -31,10 +31,13 @@ pub struct EntrySync {
 }
 impl EntrySync {
     /// Block until the target's loader has finished and the stub
-    /// has signalled. Returns false on timeout.
-    pub fn wait_loaded(&self, timeout_ms: u32) -> bool {
+    /// has signalled, OR the target process exited (loader
+    /// failed). Returns false on timeout or process exit.
+    pub fn wait_loaded_or_exit(&self, target: HANDLE, timeout_ms: u32) -> bool {
+        use windows::Win32::System::Threading::WaitForMultipleObjects;
         unsafe {
-            WaitForSingleObject(self.ev_loaded, timeout_ms)
+            let handles = [self.ev_loaded, target];
+            WaitForMultipleObjects(&handles, false, timeout_ms)
                 == windows::Win32::Foundation::WAIT_OBJECT_0
         }
     }
