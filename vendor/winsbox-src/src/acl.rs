@@ -11,6 +11,18 @@ pub struct AclJournal {
     entries: Vec<(String, String)>, // (path, sid_string)
 }
 
+/// Grant without journaling. Used for per-spawn exe-dir grants
+/// where the AC SID is per-instance and the ACE becomes inert
+/// when the AppContainer profile is deleted.
+pub fn grant_oneshot(path: &str, sid_str: &str, perm: &str) -> Result<()> {
+    let spec = if std::path::Path::new(path).is_dir() {
+        format!("*{sid_str}:(OI)(CI){perm}")
+    } else {
+        format!("*{sid_str}:{perm}")
+    };
+    run_icacls(&[path, "/grant", &spec])
+}
+
 impl AclJournal {
     pub fn grant(&mut self, path: &str, sid_str: &str, perm: &str) -> Result<()> {
         // Simple rights (F, M, RX) are BARE letters in icacls — wrapping

@@ -45,32 +45,22 @@ fn stub_env(a: &StubAddrs) -> Result<StubEnv> {
     })
 }
 
-/// Patch `ntdll!{NtCreateFile,NtOpenFile}` in `target`. ntdll is
-/// mapped in a `CREATE_SUSPENDED` process, so this can run before
-/// resume. The stub *first* tail-calls a saved copy of the
-/// original syscall stub; only if that returns
-/// `STATUS_ACCESS_DENIED` does it IPC to the broker. So loader
-/// opens that succeed under the initial-impersonation token
-/// (KnownDlls, System32, object-directory-relative) never reach
-/// the broker, and post-revert opens the lockdown token blocks
-/// (e.g. hostedtoolcache without an `ALL APPLICATION PACKAGES`
-/// ACE) get brokered.
+/// Patch `ntdll!{NtCreateFile,NtOpenFile}` in `target`. Installed
+/// post-rendezvous (after the loader has run) so the loader's
+/// own opens — which include object-directory-relative ones the
+/// broker can't resolve — go through unhooked under the initial
+/// impersonation token. Loader-time read access to the exe's
+/// own DLL directory is granted by a per-spawn ACL in
+/// `broker_spawn` instead.
 #[cfg(target_arch = "x86_64")]
 pub fn install_fs(target: HANDLE, a: &StubAddrs) -> Result<()> {
     let env = stub_env(a)?;
-    for (name, op, n_args) in [
-        ("NtCreateFile", crate::ipc::OP_NTCREATEFILE, 11usize),
-        ("NtOpenFile",   crate::ipc::OP_NTOPENFILE,    6usize),
-    ] {
-        let va = ntdll_export(name)?;
-        // PoC P6: ntdll syscall stubs are ≤24B, self-contained,
-        // end in `ret`; copy 32B and the copy is callable as-is.
-        let mut orig = [0u8; 32];
-        read_remote_bytes(target, va, &mut orig)?;
-        let saved = alloc_remote_rx(target, &orig)?;
-        patch_with_stub(target, name, va,
-                        &emit_fs_stub(&env, op, n_args, saved as u64))?;
-    }
+    let ntcf = ntdll_export("NtCreateFile")?;
+    let ntof = ntdll_export("NtOpenFile")?;
+    patch_with_stub(target, "NtCreateFile", ntcf,
+                    &emit_fs_stub(&env, crate::ipc::OP_NTCREATEFILE, 11))?;
+    patch_with_stub(target, "NtOpenFile", ntof,
+                    &emit_fs_stub(&env, crate::ipc::OP_NTOPENFILE, 6))?;
     Ok(())
 }
 
@@ -170,71 +160,33 @@ fn emit_cpw_stub(e: &StubEnv) -> Vec<u8> {
     s
 }
 
+// FOLLOW-UP: a try-original-first stub (tail-call a saved copy of
+// the syscall stub, only IPC on STATUS_ACCESS_DENIED) is the right
+// architecture — it lets the loader's object-directory-relative
+// opens and device opens succeed natively without the broker
+// having to whitelist them, and cuts IPC volume. The hand-emitted
+// version (14da6b9) AVs in-loader and needs WinDbg on a real box
+// to root-cause; until then the FS hook is installed
+// post-rendezvous and the loader's DLL-directory access is
+// covered by a per-spawn ACL grant in `broker_spawn`.
 #[cfg(target_arch = "x86_64")]
-fn emit_fs_stub(e: &StubEnv, op: u64, n_args: usize, saved_orig: u64) -> Vec<u8> {
-    let mut s = Vec::<u8>::with_capacity(384);
-    // ── Phase 0: spill args to section (so the IPC path can
-    // reload them) WITHOUT clobbering rcx/rdx/r8/r9 yet — we need
-    // those intact for the original-syscall tail-call. Use r11
-    // (volatile, not an arg) as the section pointer here so r10
-    // is free for the syscall stub's `mov r10, rcx`.
-    s.extend_from_slice(&[0x49, 0xBB]); s.extend_from_slice(&e.section.to_le_bytes()); // mov r11,sect
-    s.extend_from_slice(&[0x48, 0xB8]); s.extend_from_slice(&op.to_le_bytes());          // mov rax,op
-    s.extend_from_slice(&[0x49, 0x89, 0x03]);                                            // mov [r11],rax
-    s.extend_from_slice(&[0x49, 0x89, 0x4B, 0x08]); // [r11+0x08]=rcx
-    s.extend_from_slice(&[0x49, 0x89, 0x53, 0x10]); // [r11+0x10]=rdx
-    s.extend_from_slice(&[0x4D, 0x89, 0x43, 0x18]); // [r11+0x18]=r8
-    s.extend_from_slice(&[0x4D, 0x89, 0x4B, 0x20]); // [r11+0x20]=r9
-    for i in 4..n_args {
-        let sp_off = 0x28 + (i - 4) * 8;
-        let dst = 0x08 + i * 8;
-        s.extend_from_slice(&[0x48, 0x8B, 0x44, 0x24, sp_off as u8]);
-        s.extend_from_slice(&[0x49, 0x89, 0x43, dst as u8]);
-    }
-    // Save caller's return addr to section[0x90] (`syscall`
-    // clobbers r11, so it can't survive in a register).
-    s.extend_from_slice(&[0x48, 0x8B, 0x04, 0x24]);                              // mov rax,[rsp]
-    s.extend_from_slice(&[0x49, 0x89, 0x83, 0x90, 0x00, 0x00, 0x00]);            // mov [r11+0x90],rax
-    // ── Phase 1: try the original syscall. Args still in
-    // rcx/rdx/r8/r9 and caller's stack-arg slots intact (rsp
-    // unchanged). The kernel reads stack args at [rsp+0x28]
-    // relative to the syscall instruction, so the saved stub
-    // must see the SAME rsp we did — `call` would shift it by 8.
-    // Overwrite [rsp] with our continuation, jmp, then restore.
-    s.extend_from_slice(&[0x48, 0x8D, 0x05, 0x10, 0x00, 0x00, 0x00]);            // lea rax,[rip+16]
-    s.extend_from_slice(&[0x48, 0x89, 0x04, 0x24]);                              // mov [rsp],rax
-    s.extend_from_slice(&[0x48, 0xB8]); s.extend_from_slice(&saved_orig.to_le_bytes()); // mov rax,saved
-    s.extend_from_slice(&[0xFF, 0xE0]);                                          // jmp rax
-    // continuation: reload section, restore [rsp], test status.
-    s.extend_from_slice(&[0x49, 0xBA]); s.extend_from_slice(&e.section.to_le_bytes()); // mov r10,sect
-    s.extend_from_slice(&[0x4D, 0x8B, 0x9A, 0x90, 0x00, 0x00, 0x00]);            // mov r11,[r10+0x90]
-    s.extend_from_slice(&[0x4C, 0x89, 0x1C, 0x24]);                              // mov [rsp],r11
-    s.extend_from_slice(&[0x3D, 0x22, 0x00, 0x00, 0xC0]);                        // cmp eax,0xC0000022
-    s.extend_from_slice(&[0x74, 0x01]);                                          // je broker
-    s.push(0xC3);                                                                // ret
-    // broker:
-    // ── Phase 2: IPC. Args were spilled in Phase 0; signal/wait.
-    s.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp,0x28
-    s.extend_from_slice(&[0x48, 0xB9]); s.extend_from_slice(&e.ev_req.to_le_bytes());
-    s.extend_from_slice(&[0x31, 0xD2]);
-    s.extend_from_slice(&[0x48, 0xB8]); s.extend_from_slice(&e.nt_set_event.to_le_bytes());
-    s.extend_from_slice(&[0xFF, 0xD0]);
-    s.extend_from_slice(&[0x48, 0xB9]); s.extend_from_slice(&e.ev_resp.to_le_bytes());
-    s.extend_from_slice(&[0x31, 0xD2]);
-    s.extend_from_slice(&[0x4D, 0x31, 0xC0]);
-    s.extend_from_slice(&[0x48, 0xB8]); s.extend_from_slice(&e.nt_wait.to_le_bytes());
-    s.extend_from_slice(&[0xFF, 0xD0]);
-    s.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp,0x28
-    // ── Phase 3: write broker's reply to *FileHandle/*IoStatusBlock.
-    s.extend_from_slice(&[0x49, 0xBA]); s.extend_from_slice(&e.section.to_le_bytes()); // mov r10,sect
-    s.extend_from_slice(&[0x49, 0x8B, 0x4A, 0x08]);                   // rcx = PHANDLE
-    s.extend_from_slice(&[0x49, 0x8B, 0x42, 0x68, 0x48, 0x89, 0x01]); // *rcx = r0
-    s.extend_from_slice(&[0x49, 0x8B, 0x4A, 0x20]);                   // rcx = PIOSB
+fn emit_fs_stub(e: &StubEnv, op: u64, n_args: usize) -> Vec<u8> {
+    let mut s = Vec::<u8>::with_capacity(256);
+    emit_prologue(&mut s, e, op, n_args);
+    // ── Phase C (FS)
+    // rcx = args[0] = PHANDLE FileHandle @ +0x08; *rcx = r0 @ +0x68
+    s.extend_from_slice(&[0x49, 0x8B, 0x4A, 0x08]);
+    s.extend_from_slice(&[0x49, 0x8B, 0x42, 0x68, 0x48, 0x89, 0x01]);
+    // rcx = args[3] = PIO_STATUS_BLOCK @ +0x20
+    s.extend_from_slice(&[0x49, 0x8B, 0x4A, 0x20]);
     s.extend_from_slice(&[0x48, 0x85, 0xC9, 0x74, 0x12]);             // jz +0x12
-    s.extend_from_slice(&[0x49, 0x63, 0x82, 0x80, 0x00, 0x00, 0x00]);
+    //   [rcx+0] = sign-extended r_status @ +0x80 (iosb.Status)
+    s.extend_from_slice(&[0x49, 0x63, 0x82, 0x80, 0x00, 0x00, 0x00]); // movsxd rax,[r10+0x80]
     s.extend_from_slice(&[0x48, 0x89, 0x01]);
+    //   [rcx+8] = r1 @ +0x70 (iosb.Information)
     s.extend_from_slice(&[0x49, 0x8B, 0x42, 0x70, 0x48, 0x89, 0x41, 0x08]);
-    s.extend_from_slice(&[0x41, 0x8B, 0x82, 0x80, 0x00, 0x00, 0x00]); // eax = r_status
+    // eax = r_status @ +0x80 (NTSTATUS)
+    s.extend_from_slice(&[0x41, 0x8B, 0x82, 0x80, 0x00, 0x00, 0x00]);
     s.push(0xC3);
     s
 }

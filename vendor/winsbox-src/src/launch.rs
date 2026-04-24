@@ -45,6 +45,7 @@ impl Drop for BrokerTokens {
 /// joins all service threads before dropping anything).
 struct SpawnCtx {
     ac_sid: windows::Win32::Security::PSID,
+    ac_sid_string: String,
     job: HANDLE,
     primary: HANDLE,
     initial: HANDLE,
@@ -256,6 +257,7 @@ fn run_confined(pol: &Policy) -> Result<u32> {
     let stop = Arc::new(AtomicBool::new(false));
     let ctx = tokens.as_ref().map(|t| Arc::new(SpawnCtx {
         ac_sid: ac.sid,
+        ac_sid_string: ac.sid_string.clone(),
         job: job.handle(),
         primary: t.primary,
         initial: t.initial,
@@ -403,13 +405,6 @@ fn install_broker_hook(
 ) -> Result<()> {
     let ch = ipc::Channel::create(target)?;
     let addrs = ch.stub_env_snapshot();
-    // ntdll is already mapped in a CREATE_SUSPENDED process, so
-    // patch the FS hooks now and start servicing them *before*
-    // the loader runs — otherwise the loader can't read DLLs from
-    // directories the lowbox token isn't ACL'd for (hostedtoolcache).
-    if ctx.hook_fs {
-        interception::install_fs(target, &addrs)?;
-    }
     let sync = crate::entry_trampoline::install(target, thread, suspend_after)?;
     let target_raw = target.0 as isize;
     let ctx_thread = ctx.clone();
@@ -418,8 +413,13 @@ fn install_broker_hook(
     if !sync.wait_loaded_or_exit(target, 15_000) {
         bail!("entry rendezvous timed out (loader hung/exited)");
     }
+    // Loader done; kernelbase is mapped and the target is parked
+    // in the entry stub. Install both hooks now.
     let cpw = crate::entry_trampoline::cpw_address()?;
     interception::install_cpw(target, &addrs, cpw)?;
+    if ctx.hook_fs {
+        interception::install_fs(target, &addrs)?;
+    }
     let _ = ctx;
     sync.go();
     Ok(())
@@ -672,6 +672,24 @@ fn broker_spawn(
         0x00000020 | 0x00000040 | 0x00000080 | 0x00008000 |
         0x00000100 | 0x00100000; /* *_PRIORITY_CLASS */
     let fwd = PROCESS_CREATION_FLAGS(caller_flags & PASS_THROUGH);
+    // The loader runs under the lowbox initial token (must
+    // match the lowbox primary per SeTokenCanImpersonate), so it
+    // can only read directories ACL'd for ALL APPLICATION
+    // PACKAGES or the AC SID. Grant the AC SID + RESTRICTED on
+    // the exe's directory so static-import DLLs alongside it
+    // load. The grant is to a per-instance SID; the orphaned
+    // ACE is inert once the AC profile is deleted.
+    if let Some(app) = app {
+        if let Some(dir) = std::path::Path::new(app).parent() {
+            if let Some(d) = dir.to_str() {
+                for sid in [ctx.ac_sid_string.as_str(), "S-1-5-12"] {
+                    if let Err(e) = crate::acl::grant_oneshot(d, sid, READ_EXECUTE) {
+                        eprintln!("[sbox-exec] broker_spawn: grant {sid} on {d}: {e:#}");
+                    }
+                }
+            }
+        }
+    }
     unsafe {
         let mut cmd = wstr(cmdline);
         let app_w = app.map(wstr);
