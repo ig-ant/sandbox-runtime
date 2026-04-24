@@ -713,17 +713,29 @@ fn broker_spawn(
     // ACE is inert once the AC profile is deleted.
     if let Some(app) = app {
         if let Some(dir) = std::path::Path::new(app).parent() {
-            let d = dir.to_string_lossy();
-            // System32 / Program Files already grant
-            // ALL APPLICATION PACKAGES; icacls on them fails
-            // with Access Denied and just spams the log.
-            let lc = d.to_ascii_lowercase();
-            if !lc.starts_with(r"c:\windows")
-                && !lc.starts_with(r"c:\program files")
+            // `app` is sandboxed-caller-controlled. Gate the
+            // grant on the same policy that gates brokered
+            // reads so a confined process can't make the
+            // broker ACL an arbitrary directory by passing it
+            // as lpApplicationName. Only the AC SID is granted
+            // (per-instance, inert once the profile is
+            // deleted) — the loader runs under the *initial*
+            // token whose restricting list already includes
+            // the user SID, so the RESTRICTED grant isn't
+            // needed here and would persist on disk.
+            let nt = format!(r"\??\{}", dir.display());
+            use crate::policy_engine::Decision;
+            if matches!(ctx.fs.evaluate(&nt, 0x0001 /*FILE_READ_DATA*/),
+                        Decision::Allow)
             {
-                for sid in [ctx.ac_sid_string.as_str(), "S-1-5-12"] {
-                    let _ = crate::acl::grant_oneshot(&d, sid, READ_EXECUTE);
-                }
+                let _ = crate::acl::grant_oneshot(
+                    &dir.to_string_lossy(), &ctx.ac_sid_string, READ_EXECUTE,
+                );
+            } else {
+                eprintln!(
+                    "[sbox-exec] broker_spawn: skip exe-dir grant on {} (policy deny)",
+                    dir.display(),
+                );
             }
         }
     }
