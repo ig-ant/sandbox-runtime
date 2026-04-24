@@ -120,7 +120,7 @@ jobs:
         if: matrix.os == 'windows'
         run: bun test --timeout 25000 test/sandbox/windows.test.ts
         env:
-          WINSBOX_PHASE: '1'
+          WINSBOX_PHASE: '2'
 
       - name: Run Node.js fallback tests
         if: matrix.os != 'windows'

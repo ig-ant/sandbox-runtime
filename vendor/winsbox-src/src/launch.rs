@@ -8,12 +8,13 @@ use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Security::SECURITY_CAPABILITIES;
 use windows::Win32::System::Threading::{
-    CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
-    InitializeProcThreadAttributeList, ResumeThread, TerminateProcess,
-    UpdateProcThreadAttribute, WaitForSingleObject, CREATE_SUSPENDED,
-    CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, INFINITE,
-    LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
-    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTUPINFOEXW, STARTUPINFOW,
+    CreateProcessAsUserW, CreateProcessW, DeleteProcThreadAttributeList,
+    GetExitCodeProcess, InitializeProcThreadAttributeList, ResumeThread,
+    SetThreadToken, TerminateProcess, UpdateProcThreadAttribute,
+    WaitForSingleObject, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
+    EXTENDED_STARTUPINFO_PRESENT, INFINITE, LPPROC_THREAD_ATTRIBUTE_LIST,
+    PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+    STARTUPINFOEXW, STARTUPINFOW,
 };
 
 use crate::acl::{AclJournal, FULL, MODIFY, READ_EXECUTE};
@@ -21,12 +22,22 @@ use crate::appcontainer::AppContainer;
 use crate::desktop::AltDesktop;
 use crate::job::Job;
 use crate::netbridge;
+use crate::token;
+
+/// Pair of tokens for Mode::Broker. `primary` is the lowbox-wrapped
+/// lockdown token used for CreateProcessAsUser; `initial` is the
+/// matched impersonation token set on the main thread for loader init.
+struct BrokerTokens { primary: HANDLE, initial: HANDLE }
+impl Drop for BrokerTokens {
+    fn drop(&mut self) {
+        unsafe { let _ = CloseHandle(self.primary); let _ = CloseHandle(self.initial); }
+    }
+}
 
 pub fn run(pol: &Policy) -> Result<u32> {
     match pol.mode {
         Mode::Stub => run_stub(pol),
-        Mode::AppContainer => run_appcontainer(pol),
-        Mode::Broker => bail!("mode broker not implemented in this build"),
+        Mode::AppContainer | Mode::Broker => run_confined(pol),
     }
 }
 
@@ -69,8 +80,32 @@ fn run_stub(pol: &Policy) -> Result<u32> {
 
 macro_rules! log { ($($a:tt)*) => { eprintln!("[sbox-exec] {}", format!($($a)*)) } }
 
-fn run_appcontainer(pol: &Policy) -> Result<u32> {
-    log!("mode=app-container");
+fn build_broker_tokens(ac: &AppContainer) -> Result<BrokerTokens> {
+    let base = token::open_self_token()?;
+    // Phase-2a: launch at Low IL; the entry trampoline (Phase-2b)
+    // will drop to Untrusted post-loader-init. Both tokens MUST be
+    // at the same IL and lowbox-wrapped or SeTokenCanImpersonate
+    // downgrades the impersonation to Identification (PoC P5).
+    let il = token::IL_LOW;
+    let lockdown = token::make_lockdown(base, il)?;
+    let initial_r = token::make_initial(base, il)?;
+    unsafe { let _ = CloseHandle(base); }
+
+    let lock_lb = token::make_lowbox(lockdown, ac.sid)?;
+    let init_lb = token::make_lowbox(initial_r, ac.sid)?;
+    unsafe { let _ = CloseHandle(lockdown); let _ = CloseHandle(initial_r); }
+
+    let primary = token::to_primary(lock_lb)?;
+    // The initial token must be an impersonation token; lowbox-wrap
+    // produced one of the same type as its input (impersonation), so
+    // use it directly.
+    unsafe { let _ = CloseHandle(lock_lb); }
+    log!("broker tokens built (lockdown+lowbox primary, USER_RESTRICTED_SAME_ACCESS+lowbox initial, IL=Low)");
+    Ok(BrokerTokens { primary, initial: init_lb })
+}
+
+fn run_confined(pol: &Policy) -> Result<u32> {
+    log!("mode={:?}", pol.mode);
     let ac = AppContainer::create("ac")?;
     log!("AppContainer sid={} folder={}", ac.sid_string, ac.folder.display());
     let job = Job::new()?;
@@ -152,6 +187,17 @@ fn run_appcontainer(pol: &Policy) -> Result<u32> {
         log!("no proxy ports in policy; skipping bridge");
     }
 
+    // Mode::Broker layers a restricted lowbox token on top.
+    let tokens = if pol.mode == Mode::Broker {
+        match build_broker_tokens(&ac) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                log!("broker token build failed ({e:#}); falling back to AppContainer-only");
+                None
+            }
+        }
+    } else { None };
+
     // The AC must be able to read its cwd or cmd.exe fails with "The
     // current directory is invalid". Use the first allow_write (or the
     // AC package folder) instead of the broker's cwd, which the AC
@@ -161,8 +207,8 @@ fn run_appcontainer(pol: &Policy) -> Result<u32> {
         .cloned()
         .unwrap_or_else(|| ac.folder.to_string_lossy().into_owned());
     log!("launching target (cwd={}): {}", target_cwd, pol.command_line);
-    let pi = spawn_in_ac(&ac, &job, desktop.as_ref(), &pol.command_line,
-                         Some(&target_cwd), &extra_env)?;
+    let pi = spawn_in_ac(&ac, &job, desktop.as_ref(), tokens.as_ref(),
+                         &pol.command_line, Some(&target_cwd), &extra_env)?;
     log!("target pid={}", pi.dwProcessId);
     unsafe { WaitForSingleObject(pi.hProcess, INFINITE); }
     let mut code = 0u32;
@@ -190,6 +236,7 @@ fn spawn_in_ac(
     ac: &AppContainer,
     job: &Job,
     desktop: Option<&AltDesktop>,
+    tokens: Option<&BrokerTokens>,
     command_line: &str,
     cwd: Option<&str>,
     env: &[(String, String)],
@@ -224,13 +271,30 @@ fn spawn_in_ac(
         let cwd_w = cwd.map(wstr);
         let cwd_p = cwd_w.as_ref().map(|w| pcwstr(w)).unwrap_or(PCWSTR::null());
         let mut envb = build_env_block(env);
+        let flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED;
 
         let mut pi: PROCESS_INFORMATION = zeroed();
-        CreateProcessW(
-            None, PWSTR(cmd.as_mut_ptr()), None, None, true,
-            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
-            Some(envb.as_mut_ptr() as *mut c_void), cwd_p, &si.StartupInfo, &mut pi,
-        ).with_context(|| format!("CreateProcessW(AC, {command_line})"))?;
+        match tokens {
+            Some(t) => {
+                CreateProcessAsUserW(
+                    t.primary, None, PWSTR(cmd.as_mut_ptr()), None, None, true,
+                    flags, Some(envb.as_mut_ptr() as *mut c_void), cwd_p,
+                    &si.StartupInfo, &mut pi,
+                ).with_context(|| format!("CreateProcessAsUserW(broker, {command_line})"))?;
+                // Initial impersonation on the main thread so the
+                // loader can read DLLs under the lockdown primary.
+                if let Err(e) = SetThreadToken(Some(&pi.hThread), t.initial) {
+                    log!("SetThreadToken(initial) failed: {e}; loader may fail under lockdown");
+                }
+            }
+            None => {
+                CreateProcessW(
+                    None, PWSTR(cmd.as_mut_ptr()), None, None, true,
+                    flags, Some(envb.as_mut_ptr() as *mut c_void), cwd_p,
+                    &si.StartupInfo, &mut pi,
+                ).with_context(|| format!("CreateProcessW(AC, {command_line})"))?;
+            }
+        }
         DeleteProcThreadAttributeList(attrs);
 
         job.assign(pi.hProcess)?;

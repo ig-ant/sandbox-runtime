@@ -32,6 +32,8 @@ windows = { version = "0.58", features = [
   "Win32_Security_Isolation",
   "Win32_Storage_FileSystem",
   "Win32_Networking_WinSock",
+  "Win32_System_SystemServices",
+  "Wdk_Foundation",
 ] }
 
 [profile.release]
