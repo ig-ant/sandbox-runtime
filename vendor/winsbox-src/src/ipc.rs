@@ -7,9 +7,12 @@
 //! the spawn under its own token, `DuplicateHandle`s the results
 //! into the target, and replies.
 //!
-//! No mutex in v1 — `cmd.exe` issues spawns serially on its main
-//! thread, and there is one section per process so no cross-process
-//! contention. Add the mutex when multi-threaded targets show up.
+//! Concurrency: the section holds one request at a time. The FS
+//! stubs are now active during the loader, whose parallel worker
+//! threads issue concurrent `NtOpenFile`s, so every stub spins on
+//! `[section+LOCK_OFF]` (a word past `Wire`) before writing args
+//! and releases after reading the reply. See
+//! `interception::emit_lock_acquire`.
 
 use anyhow::{bail, Context, Result};
 use std::ffi::c_void;

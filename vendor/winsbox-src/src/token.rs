@@ -94,15 +94,16 @@ pub fn open_self_token() -> Result<HANDLE> {
     }
 }
 
-// TODO(phase-2b): cmd /c <ext.exe> under this primary still fails
-// "Access is denied" even with jobwatch re-impersonation and the
-// default DACL below. ProcMon on a real box is needed to isolate
-// which object/access fails; candidates are conhost ALPC port,
-// BaseNamedObjects, or csrss section. Chromium's recipe additionally
-// (a) creates an alternate-window-station/desktop whose DACL grants
-// the restricted SID, and (b) sets the lowbox token's saved-handle
-// list so the AC directory objects are pre-created — one of those
-// is likely the missing piece.
+// P12 (d7ef9a9): under brokered spawn the USER_LOCKDOWN blocker is
+// not a conhost/csrss object; it's that the FS hooks were installed
+// post-rendezvous, so non-KnownDll grandchildren died 0xc0000135
+// from parallel-loader worker threads running under the
+// NULL-restricting process token. install_broker_hook now patches
+// NtCreateFile/NtOpenFile before resume. P12 also showed dropping
+// `Authenticated Users` and IL→Untrusted are free; `BUILTIN\Users`
+// keys worker-thread DLL file opens; `Everyone` keys a DllMain init
+// path. The default stays USER_LIMITED until WINSBOX_TOKEN=lockdown
+// is green on CI with the pre-resume FS hooks.
 
 /// Phase-2 primary token. Defaults to USER_LIMITED (deny-only on
 /// admin/elevated groups, keep Users/Everyone/AuthUsers, drop

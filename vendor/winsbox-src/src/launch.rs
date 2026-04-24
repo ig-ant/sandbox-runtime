@@ -395,21 +395,29 @@ fn spawn_in_ac(
 
 // ─── Phase-2b broker-mediated spawn ────────────────────────────────
 
-/// Create an IPC channel for `target`, install the entry-point
-/// rendezvous, **resume** the target so its loader runs, wait for
-/// the rendezvous, patch `kernelbase!CreateProcessInternalW`, let
-/// the target continue, and spawn the per-channel service thread.
-/// Called once for the immediate target and recursively for each
-/// grandchild the broker spawns. The target must be SUSPENDED on
-/// entry; on success it is running unless `suspend_after` (the
-/// stub re-suspends itself post-rendezvous so the *caller*'s
-/// `ResumeThread` is what releases it — honours `CREATE_SUSPENDED`).
+/// Create an IPC channel for `target`, patch the ntdll FS hooks
+/// (ntdll is mapped at `CREATE_SUSPENDED`), install the
+/// entry-point rendezvous, **resume** the target so its loader
+/// runs (with FS opens already brokered — required for
+/// USER_LOCKDOWN, where parallel-loader worker threads run under
+/// the NULL-restricting process token and would otherwise
+/// `0xc0000135` on any non-KnownDll import; P12), wait for the
+/// rendezvous, patch `kernelbase!CreateProcessInternalW`, and let
+/// the target continue. Called once for the immediate target and
+/// recursively for each grandchild the broker spawns. The target
+/// must be SUSPENDED on entry; on success it is running unless
+/// `suspend_after` (the stub re-suspends itself post-rendezvous
+/// so the *caller*'s `ResumeThread` is what releases it —
+/// honours `CREATE_SUSPENDED`).
 fn install_broker_hook(
     target: HANDLE, thread: HANDLE, suspend_after: bool, ctx: Arc<SpawnCtx>,
 ) -> Result<()> {
     let ch = ipc::Channel::create(target)?;
     let addrs = ch.stub_env_snapshot();
     let sync = crate::entry_trampoline::install(target, thread, suspend_after)?;
+    if ctx.hook_fs {
+        interception::install_fs(target, &addrs)?;
+    }
     let target_raw = target.0 as isize;
     let ctx_thread = ctx.clone();
     let _ = std::thread::spawn(move || serve_ipc(ch, target_raw, ctx_thread));
@@ -418,12 +426,9 @@ fn install_broker_hook(
         bail!("entry rendezvous timed out (loader hung/exited)");
     }
     // Loader done; kernelbase is mapped and the target is parked
-    // in the entry stub. Install both hooks now.
+    // in the entry stub.
     let cpw = crate::entry_trampoline::cpw_address()?;
     interception::install_cpw(target, &addrs, cpw)?;
-    if ctx.hook_fs {
-        interception::install_fs(target, &addrs)?;
-    }
     let _ = ctx;
     sync.go();
     Ok(())

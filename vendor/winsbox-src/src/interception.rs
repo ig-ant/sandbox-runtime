@@ -46,16 +46,19 @@ fn stub_env(a: &StubAddrs) -> Result<StubEnv> {
 }
 
 /// Patch `ntdll!{NtCreateFile,NtOpenFile}` in `target`. Installed
-/// post-rendezvous (after the loader has run) so the loader's
-/// own opens — which include object-directory-relative ones the
-/// broker can't resolve — go through unhooked under the initial
-/// impersonation token. Loader-time read access to the exe's
-/// own DLL directory is granted by a per-spawn ACL in
-/// `broker_spawn` instead. A copy of the original syscall stub
-/// is saved so the broker can reply `FS_PASSTHROUGH` and the
-/// hook tail-jmps to it (the target does the open under its
-/// own token — required for `\Device\Afd` etc., where the
-/// endpoint must be created inside the target's AppContainer).
+/// **before** `ResumeThread` so the loader's own opens are
+/// brokered — under USER_LOCKDOWN the parallel-loader worker
+/// threads run under the NULL-restricting process token and
+/// fail every file open otherwise (P12 / `0xc0000135`). Loader
+/// opens the broker can't resolve (object-directory-relative,
+/// `\Device\*`) get an `FS_PASSTHROUGH` reply and the stub
+/// tail-jmps a saved 32-byte copy of the original syscall stub
+/// — those run under the initial impersonation token on the
+/// main thread, or under the lockdown token on workers (which
+/// is fine for KnownDlls section opens; non-KnownDll file opens
+/// are exactly what the broker handles). The 172f260 revert was
+/// for the try-original-first stub's in-loader AV, not for
+/// pre-loader hooking itself.
 #[cfg(target_arch = "x86_64")]
 pub fn install_fs(target: HANDLE, a: &StubAddrs) -> Result<()> {
     let env = stub_env(a)?;
@@ -102,13 +105,54 @@ struct StubEnv {
     nt_set_event: u64, nt_wait: u64,
 }
 
-/// Phase A (load r10=section; write op; spill `n_args` from
-/// rcx,rdx,r8,r9,[rsp+0x28..]) + Phase B (signal req, wait resp)
-/// + reload r10. The caller appends Phase C.
+/// Spinlock word inside the section, past `Wire` (0x88). The
+/// channel is single-slot; with the FS hooks active during the
+/// loader, parallel-loader worker threads issue concurrent
+/// `NtOpenFile`s and would otherwise overwrite each other's
+/// spilled args / steal each other's reply. Section is
+/// zero-initialised in `Channel::create`, so the lock starts
+/// released.
+const LOCK_OFF: u32 = 0x90;
+
+/// Acquire `[r10+LOCK_OFF]`. Clobbers eax, r11d. r10 must
+/// already hold the section base.
+#[cfg(target_arch = "x86_64")]
+fn emit_lock_acquire(s: &mut Vec<u8>) {
+    // mov r11d, 1
+    s.extend_from_slice(&[0x41, 0xBB, 0x01, 0x00, 0x00, 0x00]);
+    // spin:
+    //   xor eax, eax
+    s.extend_from_slice(&[0x31, 0xC0]);
+    //   lock cmpxchg [r10+LOCK_OFF], r11d
+    s.extend_from_slice(&[0xF0, 0x45, 0x0F, 0xB1, 0x9A]);
+    s.extend_from_slice(&LOCK_OFF.to_le_bytes());
+    //   je acquired (+4 over pause+jmp)
+    s.extend_from_slice(&[0x74, 0x04]);
+    //   pause
+    s.extend_from_slice(&[0xF3, 0x90]);
+    //   jmp spin (-17)
+    s.extend_from_slice(&[0xEB, 0xEF]);
+    // acquired:
+}
+
+/// Release `[r10+LOCK_OFF]`. Clobbers nothing. 11 bytes.
+#[cfg(target_arch = "x86_64")]
+fn emit_lock_release(s: &mut Vec<u8>) {
+    // mov dword [r10+LOCK_OFF], 0
+    s.extend_from_slice(&[0x41, 0xC7, 0x82]);
+    s.extend_from_slice(&LOCK_OFF.to_le_bytes());
+    s.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+}
+
+/// Phase A (load r10=section; acquire lock; write op; spill
+/// `n_args` from rcx,rdx,r8,r9,[rsp+0x28..]) + Phase B (signal
+/// req, wait resp) + reload r10. The caller appends Phase C
+/// and is responsible for `emit_lock_release` on every exit.
 #[cfg(target_arch = "x86_64")]
 fn emit_prologue(s: &mut Vec<u8>, e: &StubEnv, op: u64, n_args: usize) {
     // mov r10, section
     s.extend_from_slice(&[0x49, 0xBA]); s.extend_from_slice(&e.section.to_le_bytes());
+    emit_lock_acquire(s);
     // mov rax, op; mov [r10+0], rax
     s.extend_from_slice(&[0x48, 0xB8]); s.extend_from_slice(&op.to_le_bytes());
     s.extend_from_slice(&[0x49, 0x89, 0x02]);
@@ -165,17 +209,17 @@ fn emit_cpw_stub(e: &StubEnv) -> Vec<u8> {
     s.extend_from_slice(&[0x65, 0x89, 0x04, 0x25, 0x68, 0x00, 0x00, 0x00]);
     // eax = r_status @ +0x80 (BOOL)
     s.extend_from_slice(&[0x41, 0x8B, 0x82, 0x80, 0x00, 0x00, 0x00]);
+    emit_lock_release(&mut s);
     s.push(0xC3);
     s
 }
 
 // FOLLOW-UP: a try-original-first stub (tail-call the saved
 // copy, only IPC on STATUS_ACCESS_DENIED) would cut IPC volume
-// dramatically and let the loader be hooked too. The
-// hand-emitted version (14da6b9) AVs in-loader; needs WinDbg.
-// Until then the broker decides per-request whether to handle
-// the open itself or reply FS_PASSTHROUGH and have the stub
-// tail-jmp the saved original.
+// dramatically. The hand-emitted version (14da6b9) AVs
+// in-loader; needs WinDbg. Until then the broker decides
+// per-request whether to handle the open itself or reply
+// FS_PASSTHROUGH and have the stub tail-jmp the saved original.
 #[cfg(target_arch = "x86_64")]
 fn emit_fs_stub(e: &StubEnv, op: u64, n_args: usize, saved_orig: u64) -> Vec<u8> {
     let mut s = Vec::<u8>::with_capacity(320);
@@ -190,18 +234,19 @@ fn emit_fs_stub(e: &StubEnv, op: u64, n_args: usize, saved_orig: u64) -> Vec<u8>
     s.extend_from_slice(&[0x41, 0x8B, 0x82, 0x80, 0x00, 0x00, 0x00]); // mov eax,[r10+0x80]
     s.extend_from_slice(&[0x3D]);                                      // cmp eax, FS_PASSTHROUGH
     s.extend_from_slice(&(crate::ipc::FS_PASSTHROUGH as u32).to_le_bytes().as_slice());
-    s.extend_from_slice(&[0x75, 0x1C]);                                // jne broker_reply (+28)
-    // reload rcx/rdx/r8/r9 from section
+    s.extend_from_slice(&[0x75, 0x27]);                                // jne broker_reply (+39)
+    // reload rcx/rdx/r8/r9 from section while we still hold the
+    // lock (release would let another thread overwrite them)
     s.extend_from_slice(&[0x49, 0x8B, 0x4A, 0x08]); // mov rcx,[r10+0x08]
     s.extend_from_slice(&[0x49, 0x8B, 0x52, 0x10]); // mov rdx,[r10+0x10]
     s.extend_from_slice(&[0x4D, 0x8B, 0x42, 0x18]); // mov r8, [r10+0x18]
     s.extend_from_slice(&[0x4D, 0x8B, 0x4A, 0x20]); // mov r9, [r10+0x20]
+    emit_lock_release(&mut s);
     // mov rax, saved_orig; jmp rax — the saved stub's `ret`
     // goes to NtCreateFile's caller (our [rsp] is untouched).
     s.extend_from_slice(&[0x48, 0xB8]); s.extend_from_slice(&saved_orig.to_le_bytes());
     s.extend_from_slice(&[0xFF, 0xE0]);
-    // ↑ 4×4 + 10 + 2 = 28 bytes; jne disp = 28? Recount: 4+4+4+4+10+2 = 28 = 0x1C.
-    // (jne disp is to NEXT instruction after the block.)
+    // ↑ 4×4 + 11 + 10 + 2 = 39 = 0x27.
     // broker_reply:
     // rcx = args[0] = PHANDLE FileHandle @ +0x08; *rcx = r0 @ +0x68
     s.extend_from_slice(&[0x49, 0x8B, 0x4A, 0x08]);
@@ -214,6 +259,7 @@ fn emit_fs_stub(e: &StubEnv, op: u64, n_args: usize, saved_orig: u64) -> Vec<u8>
     s.extend_from_slice(&[0x49, 0x8B, 0x42, 0x70, 0x48, 0x89, 0x41, 0x08]);
     // eax = r_status @ +0x80 (NTSTATUS)
     s.extend_from_slice(&[0x41, 0x8B, 0x82, 0x80, 0x00, 0x00, 0x00]);
+    emit_lock_release(&mut s);
     s.push(0xC3);
     s
 }
