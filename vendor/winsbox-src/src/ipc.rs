@@ -40,6 +40,13 @@ pub const OP_NTOPENFILE: u64 = 2;
 pub const OP_NTOPENKEY: u64 = 3;
 pub const OP_NTOPENKEYEX: u64 = 4;
 pub const OP_NTOPENSECTION: u64 = 5;
+pub const OP_NTQUERYATTR: u64 = 6;
+pub const OP_NTQUERYFULLATTR: u64 = 7;
+
+/// Section offset for the `NtQuery*AttributesFile` result
+/// struct (max 56 bytes = `FILE_NETWORK_OPEN_INFORMATION`).
+/// Past `Wire` (0x88).
+pub const ATTR_OFF: usize = 0x90;
 
 /// Sentinel `r_status` the broker returns when the FS stub
 /// should reload its spilled args and tail-jmp to the saved
@@ -187,6 +194,16 @@ impl Channel {
         unsafe {
             (*self.view).r0 = handle;
             (*self.view).r1 = iosb_info;
+            (*self.view).r_status = status;
+            let _ = SetEvent(self.ev_resp);
+        }
+    }
+    /// Write the `NtQuery*AttributesFile` result struct into the
+    /// section at `ATTR_OFF` and reply with `status`.
+    pub fn reply_attr(&self, status: i32, attrs: &[u8; 56]) {
+        unsafe {
+            let dst = (self.view as *mut u8).add(ATTR_OFF);
+            std::ptr::copy_nonoverlapping(attrs.as_ptr(), dst, 56);
             (*self.view).r_status = status;
             let _ = SetEvent(self.ev_resp);
         }

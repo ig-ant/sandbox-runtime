@@ -74,6 +74,24 @@ pub fn install_fs(target: HANDLE, a: &StubAddrs) -> Result<()> {
         patch_with_stub(target, name, va,
                         &emit_fs_stub(&env, op, n_args, saved as u64))?;
     }
+    // GetFileAttributes/PathFileExists go through these — not
+    // hooking them means existence checks on paths the lockdown
+    // token can't read (third-party installs without an ALL APP
+    // PACKAGES ACE) fail, e.g. git-for-windows' bin\git.exe
+    // wrapper checking for ..\mingw64\bin\git.exe.
+    for (name, op, out_qwords) in [
+        // FILE_BASIC_INFORMATION = 40 bytes = 5 qwords;
+        // FILE_NETWORK_OPEN_INFORMATION = 56 bytes = 7.
+        ("NtQueryAttributesFile",     crate::ipc::OP_NTQUERYATTR,     5u32),
+        ("NtQueryFullAttributesFile", crate::ipc::OP_NTQUERYFULLATTR, 7u32),
+    ] {
+        let va = ntdll_export(name)?;
+        let mut orig = [0u8; 32];
+        read_remote_bytes(target, va, &mut orig)?;
+        let saved = alloc_remote_rx(target, &orig)?;
+        patch_with_stub(target, name, va,
+                        &emit_attr_stub(&env, op, out_qwords, saved as u64))?;
+    }
     Ok(())
 }
 
@@ -325,6 +343,52 @@ fn emit_handle_stub(e: &StubEnv, op: u64, n_args: usize, saved_orig: u64) -> Vec
     s.extend_from_slice(&[0x48, 0x8B, 0x4C, 0x24, 0x08]);              // mov rcx,[rsp+8]
     s.extend_from_slice(&[0x49, 0x8B, 0x42, 0x68, 0x48, 0x89, 0x01]);
     s.extend_from_slice(&[0x41, 0x8B, 0x82, 0x80, 0x00, 0x00, 0x00]);  // mov eax,[r10+0x80]
+    emit_release_keep_eax(&mut s, e);
+    s.push(0xC3);
+    s
+}
+
+/// `NtQueryAttributesFile` / `NtQueryFullAttributesFile`:
+/// args[0]=POBJECT_ATTRIBUTES, args[1]=out struct. Phase C
+/// copies `out_qwords` qwords from `[r10+ATTR_OFF]` to
+/// `*args[1]` (rdx, saved at `[rsp+0x10]`). The copy length
+/// MUST match the syscall's output struct exactly — the
+/// caller allocated that size and writing past it corrupts
+/// their stack.
+#[cfg(target_arch = "x86_64")]
+fn emit_attr_stub(e: &StubEnv, op: u64, out_qwords: u32, saved_orig: u64) -> Vec<u8> {
+    let mut s = Vec::<u8>::with_capacity(384);
+    emit_prologue(&mut s, e, op, 2);
+    s.extend_from_slice(&[0x41, 0x8B, 0x82, 0x80, 0x00, 0x00, 0x00]); // mov eax,[r10+0x80]
+    s.extend_from_slice(&[0x3D]);
+    s.extend_from_slice(&(crate::ipc::FS_PASSTHROUGH as u32).to_le_bytes().as_slice());
+    s.extend_from_slice(&[0x75, PASSTHROUGH_LEN]);                     // jne broker_reply
+    emit_passthrough(&mut s, e, saved_orig);
+    // broker_reply: rcx = args[1] = out-struct ptr (was rdx)
+    s.extend_from_slice(&[0x48, 0x8B, 0x4C, 0x24, 0x10]); // mov rcx,[rsp+0x10]
+    // Only copy on success — on failure the caller's buffer
+    // is left untouched (matches kernel behaviour) and rcx
+    // may legitimately be a probe pointer.
+    s.extend_from_slice(&[0x85, 0xC0]);                   // test eax,eax
+    let jnz_off = s.len();
+    s.extend_from_slice(&[0x75, 0x00]);                   // jnz skip (patched below)
+    let copy_start = s.len();
+    for i in 0..out_qwords {
+        let src = crate::ipc::ATTR_OFF as u32 + i * 8;
+        // mov rax, [r10 + src]   (disp32: ATTR_OFF >= 0x90 > 0x7F)
+        s.extend_from_slice(&[0x49, 0x8B, 0x82]);
+        s.extend_from_slice(&src.to_le_bytes());
+        // mov [rcx + i*8], rax   (disp8: i*8 ≤ 0x30)
+        if i == 0 {
+            s.extend_from_slice(&[0x48, 0x89, 0x01]);
+        } else {
+            s.extend_from_slice(&[0x48, 0x89, 0x41, (i * 8) as u8]);
+        }
+    }
+    let copy_len = s.len() - copy_start;
+    s[jnz_off + 1] = copy_len as u8;
+    // skip: copy clobbered rax; reload r_status.
+    s.extend_from_slice(&[0x41, 0x8B, 0x82, 0x80, 0x00, 0x00, 0x00]);
     emit_release_keep_eax(&mut s, e);
     s.push(0xC3);
     s

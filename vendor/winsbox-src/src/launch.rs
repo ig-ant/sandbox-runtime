@@ -480,6 +480,8 @@ fn serve_ipc(ch: ipc::Channel, target_raw: isize, ctx: Arc<SpawnCtx>) {
                 handle_fs(&ch, target, &req, &ctx),
             ipc::OP_NTOPENKEY | ipc::OP_NTOPENKEYEX | ipc::OP_NTOPENSECTION =>
                 handle_reg(&ch, target, &req, &ctx),
+            ipc::OP_NTQUERYATTR | ipc::OP_NTQUERYFULLATTR =>
+                handle_attr(&ch, target, &req, &ctx),
             op => {
                 eprintln!("[sbox-exec] ipc: unknown op {op}");
                 ch.reply_fs(0, 0, 0xC0000002u32 as i32 /* STATUS_NOT_IMPLEMENTED */);
@@ -676,6 +678,72 @@ fn broker_open(
         }
         if st.0 < 0 { Err(st.0) } else { Ok((h, iosb[1] as u64)) }
     }
+}
+
+/// `NtQuery{,Full}AttributesFile`: args[0]=POBJECT_ATTRIBUTES,
+/// args[1]=out struct. Read-only by definition; evaluate
+/// against the FS policy (denyRead → ACCESS_DENIED, else
+/// re-issue under the broker's token). Result struct (≤56
+/// bytes) goes back via the section at `ATTR_OFF`.
+fn handle_attr(
+    ch: &ipc::Channel, target: HANDLE, req: &ipc::Wire, ctx: &Arc<SpawnCtx>,
+) {
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtQueryAttributesFile(
+            oa: *const c_void, out: *mut [u8; 56],
+        ) -> windows::Win32::Foundation::NTSTATUS;
+        fn NtQueryFullAttributesFile(
+            oa: *const c_void, out: *mut [u8; 56],
+        ) -> windows::Win32::Foundation::NTSTATUS;
+    }
+    let path = match read_target_obj_path(target, req.args[0] as usize) {
+        Ok(p) => p,
+        Err(_) => { ch.reply_fs(0, 0, ipc::FS_PASSTHROUGH); return; }
+    };
+    use crate::policy_engine::Decision;
+    match ctx.fs.evaluate(&path, 0x0080 /* FILE_READ_ATTRIBUTES */) {
+        Decision::Deny(why) => {
+            eprintln!("[sbox-exec] attr: DENY {path} ({why})");
+            ch.reply_attr(0xC0000022u32 as i32, &[0u8; 56]);
+            return;
+        }
+        Decision::AllowAsTarget => {
+            ch.reply_fs(0, 0, ipc::FS_PASSTHROUGH);
+            return;
+        }
+        Decision::Allow => {}
+    }
+    use windows::Wdk::Foundation::OBJECT_ATTRIBUTES;
+    use windows::Win32::Foundation::UNICODE_STRING;
+    let st;
+    let mut out = [0u8; 56];
+    unsafe {
+        let mut wpath = wstr(&path);
+        if wpath.last() == Some(&0) { wpath.pop(); }
+        let us = UNICODE_STRING {
+            Length: (wpath.len() * 2) as u16,
+            MaximumLength: (wpath.len() * 2) as u16,
+            Buffer: PWSTR(wpath.as_mut_ptr()),
+        };
+        let oa = OBJECT_ATTRIBUTES {
+            Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: HANDLE::default(),
+            ObjectName: &us as *const _ as *mut _,
+            Attributes: 0x40,
+            SecurityDescriptor: std::ptr::null_mut(),
+            SecurityQualityOfService: std::ptr::null_mut(),
+        };
+        st = if req.op == ipc::OP_NTQUERYFULLATTR {
+            NtQueryFullAttributesFile(&oa as *const _ as *const c_void, &mut out)
+        } else {
+            NtQueryAttributesFile(&oa as *const _ as *const c_void, &mut out)
+        };
+    }
+    if ctx.trace {
+        eprintln!("[sbox-exec] attr: {path} → {:#x}", st.0);
+    }
+    ch.reply_attr(st.0, &out);
 }
 
 /// `NtOpenKey` / `NtOpenKeyEx` / `NtOpenSection`:
