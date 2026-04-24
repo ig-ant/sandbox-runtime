@@ -13,6 +13,10 @@ pub struct Policy {
     pub deny_write: Vec<String>,
     pub network: NetworkPolicy,
     pub use_alternate_desktop: bool,
+    /// Hook `NtCreateFile`/`NtOpenFile` so reads/writes go through
+    /// the broker's policy engine. When false (default during
+    /// bring-up) the Phase-1 ACL grants are the only FS gate.
+    pub broker_fs: bool,
     /// Phase selector understood by the launcher. Phase 0.5 only
     /// implements `Stub`; later phases add `AppContainer` / `Broker`.
     pub mode: Mode,

@@ -51,6 +51,12 @@ struct SpawnCtx {
     cwd: String,
     env: Vec<(String, String)>,
     stop: Arc<AtomicBool>,
+    fs: crate::policy_engine::FsPolicy,
+    /// Whether to install the NtCreateFile/NtOpenFile hooks. When
+    /// false the Phase-1 ACL grants are the only FS boundary and
+    /// reads of paths the AC SID isn't granted on fail in the
+    /// target with no broker involvement.
+    hook_fs: bool,
     /// Join handles for nested service threads, so the main loop
     /// can wait for the whole tree on exit.
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
@@ -253,6 +259,8 @@ fn run_confined(pol: &Policy) -> Result<u32> {
         cwd: target_cwd.clone(),
         env: extra_env.clone(),
         stop: stop.clone(),
+        fs: crate::policy_engine::FsPolicy::from_policy(pol),
+        hook_fs: pol.broker_fs,
         threads: Mutex::new(Vec::new()),
     }));
     if let Some(ctx) = ctx.as_ref() {
@@ -397,70 +405,192 @@ fn install_broker_hook(
         bail!("entry rendezvous timed out (loader hung?)");
     }
     let cpw = crate::entry_trampoline::cpw_address()?;
-    interception::install(target, &ch, cpw)?;
+    interception::install(target, &ch, cpw, ctx.hook_fs)?;
     sync.go();
     let target_raw = target.0 as isize;
     let _ = std::thread::spawn(move || serve_ipc(ch, target_raw, ctx));
     Ok(())
 }
 
-/// Per-channel service loop. Blocks on `ev_req`; on each request,
-/// reads the caller's `lpCommandLine` / `dwCreationFlags` /
-/// `lpStartupInfo`, performs the spawn under the broker's token
-/// recipe forwarding those, recursively installs the hook in the
-/// new process, `DuplicateHandle`s process+thread into the
-/// requesting target, and replies with `PROCESS_INFORMATION`.
+/// Per-channel service loop. Dispatches on `Wire.op`.
 fn serve_ipc(ch: ipc::Channel, target_raw: isize, ctx: Arc<SpawnCtx>) {
     let target = HANDLE(target_raw as *mut c_void);
     while !ctx.stop.load(Ordering::Relaxed) {
         let req = match ch.wait_request(250) { Some(r) => r, None => continue };
-        // CreateProcessInternalW args:
-        //   [1]=lpApplicationName, [2]=lpCommandLine, [6]=dwCreationFlags,
-        //   [8]=lpCurrentDirectory, [9]=lpStartupInfo, [10]=lpProcessInformation.
-        let app = read_target_wstr(target, req.args[1] as usize).unwrap_or_default();
-        let cmd = read_target_wstr(target, req.args[2] as usize).unwrap_or_default();
-        let cwd = read_target_wstr(target, req.args[8] as usize).ok();
-        let caller_flags = req.args[6] as u32;
-        let si = read_target_startupinfo(target, req.args[9] as usize);
-        let cmdline = if !cmd.is_empty() { cmd } else { app.clone() };
-        if cmdline.is_empty() {
-            eprintln!("[sbox-exec] ipc: empty cmdline (app={app:?})");
-            ch.reply_err(87 /* ERROR_INVALID_PARAMETER */);
-            continue;
-        }
-        eprintln!(
-            "[sbox-exec] ipc: brokered spawn: {cmdline}  (flags={caller_flags:#x} si.flags={:#x} app={app:?})",
-            si.dwFlags.0,
-        );
-        let suspend_after = caller_flags & 0x00000004 /* CREATE_SUSPENDED */ != 0;
-        let app_opt = (!app.is_empty()).then_some(app.as_str());
-        match broker_spawn(&ctx, app_opt, &cmdline, cwd.as_deref(), caller_flags, &si) {
-            Ok(child) => {
-                if let Err(e) = install_broker_hook(
-                    child.hProcess, child.hThread, suspend_after, ctx.clone(),
-                ) {
-                    eprintln!("[sbox-exec] ipc: recurse hook failed: {e:#}; child runs unhooked");
-                    unsafe { ResumeThread(child.hThread); }
-                }
-                let p = ch.dup_to_target(child.hProcess).unwrap_or(0);
-                let t = ch.dup_to_target(child.hThread).unwrap_or(0);
-                ch.reply_ok(p, t, child.dwProcessId, child.dwThreadId);
-                // Keep child.hProcess open: the recursive Channel
-                // holds it for future dup_to_target calls. Job
-                // KILL_ON_JOB_CLOSE bounds the leak.
-                unsafe { let _ = CloseHandle(child.hThread); }
-                close_si_handles(&si);
-            }
-            Err(e) => {
-                let gle = unsafe {
-                    windows::Win32::Foundation::GetLastError().0
-                };
-                eprintln!("[sbox-exec] ipc: brokered spawn failed: {e:#} (gle={gle})");
-                ch.reply_err(if gle != 0 { gle } else { 5 });
-                close_si_handles(&si);
+        match req.op {
+            ipc::OP_CPW => handle_cpw(&ch, target, &req, &ctx),
+            ipc::OP_NTCREATEFILE | ipc::OP_NTOPENFILE =>
+                handle_fs(&ch, target, &req, &ctx),
+            op => {
+                eprintln!("[sbox-exec] ipc: unknown op {op}");
+                ch.reply_fs(0, 0, 0xC0000002u32 as i32 /* STATUS_NOT_IMPLEMENTED */);
             }
         }
     }
+}
+
+fn handle_cpw(ch: &ipc::Channel, target: HANDLE, req: &ipc::Wire, ctx: &Arc<SpawnCtx>) {
+    // CreateProcessInternalW args:
+    //   [1]=lpApplicationName, [2]=lpCommandLine, [6]=dwCreationFlags,
+    //   [8]=lpCurrentDirectory, [9]=lpStartupInfo, [10]=lpProcessInformation.
+    let app = read_target_wstr(target, req.args[1] as usize).unwrap_or_default();
+    let cmd = read_target_wstr(target, req.args[2] as usize).unwrap_or_default();
+    let cwd = read_target_wstr(target, req.args[8] as usize).ok();
+    let caller_flags = req.args[6] as u32;
+    let si = read_target_startupinfo(target, req.args[9] as usize);
+    let cmdline = if !cmd.is_empty() { cmd } else { app.clone() };
+    if cmdline.is_empty() {
+        eprintln!("[sbox-exec] ipc: empty cmdline (app={app:?})");
+        ch.reply_cpw_err(87 /* ERROR_INVALID_PARAMETER */);
+        return;
+    }
+    eprintln!(
+        "[sbox-exec] ipc: brokered spawn: {cmdline}  (flags={caller_flags:#x} si.flags={:#x} app={app:?})",
+        si.dwFlags.0,
+    );
+    let suspend_after = caller_flags & 0x00000004 /* CREATE_SUSPENDED */ != 0;
+    let app_opt = (!app.is_empty()).then_some(app.as_str());
+    match broker_spawn(ctx, app_opt, &cmdline, cwd.as_deref(), caller_flags, &si) {
+        Ok(child) => {
+            if let Err(e) = install_broker_hook(
+                child.hProcess, child.hThread, suspend_after, ctx.clone(),
+            ) {
+                eprintln!("[sbox-exec] ipc: recurse hook failed: {e:#}; child runs unhooked");
+                unsafe { ResumeThread(child.hThread); }
+            }
+            let p = ch.dup_to_target(child.hProcess).unwrap_or(0);
+            let t = ch.dup_to_target(child.hThread).unwrap_or(0);
+            ch.reply_cpw_ok(p, t, child.dwProcessId, child.dwThreadId);
+            // Keep child.hProcess open: the recursive Channel
+            // holds it for future dup_to_target calls. Job
+            // KILL_ON_JOB_CLOSE bounds the leak.
+            unsafe { let _ = CloseHandle(child.hThread); }
+            close_si_handles(&si);
+        }
+        Err(e) => {
+            let gle = unsafe {
+                windows::Win32::Foundation::GetLastError().0
+            };
+            eprintln!("[sbox-exec] ipc: brokered spawn failed: {e:#} (gle={gle})");
+            ch.reply_cpw_err(if gle != 0 { gle } else { 5 });
+            close_si_handles(&si);
+        }
+    }
+}
+
+fn handle_fs(ch: &ipc::Channel, target: HANDLE, req: &ipc::Wire, ctx: &Arc<SpawnCtx>) {
+    // NtCreateFile/NtOpenFile args:
+    //   [0]=PHANDLE FileHandle, [1]=DesiredAccess,
+    //   [2]=POBJECT_ATTRIBUTES, [3]=PIO_STATUS_BLOCK,
+    //   create: [4]=AllocationSize [5]=FileAttributes [6]=ShareAccess
+    //           [7]=CreateDisposition [8]=CreateOptions [9]=EaBuffer [10]=EaLength
+    //   open:   [4]=ShareAccess [5]=OpenOptions
+    let access = req.args[1] as u32;
+    let oa_va = req.args[2] as usize;
+    let path = match read_target_obj_path(target, oa_va) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[sbox-exec] fs: read OBJECT_ATTRIBUTES: {e:#}");
+            ch.reply_fs(0, 0, 0xC000000Du32 as i32 /* STATUS_INVALID_PARAMETER */);
+            return;
+        }
+    };
+    use crate::policy_engine::Decision;
+    match ctx.fs.evaluate(&path, access) {
+        Decision::Deny(why) => {
+            eprintln!("[sbox-exec] fs: DENY {path} ({why}, access={access:#x})");
+            ch.reply_fs(0, 0, 0xC0000022u32 as i32 /* STATUS_ACCESS_DENIED */);
+        }
+        Decision::Allow => match broker_open(req, &path) {
+            Ok((h, info)) => {
+                let th = ch.dup_to_target(h).unwrap_or(0);
+                unsafe { let _ = CloseHandle(h); }
+                ch.reply_fs(th, info, 0);
+            }
+            Err(st) => {
+                if st != 0xC0000034u32 as i32 /* OBJECT_NAME_NOT_FOUND */ {
+                    eprintln!("[sbox-exec] fs: open {path}: {st:#x}");
+                }
+                ch.reply_fs(0, 0, st);
+            }
+        },
+    }
+}
+
+/// Issue the brokered `NtCreateFile`/`NtOpenFile` with the
+/// caller's flags under the broker's full token. Returns the
+/// broker-side handle + `IO_STATUS_BLOCK.Information`, or the raw
+/// `NTSTATUS` on failure.
+fn broker_open(req: &ipc::Wire, nt_path: &str) -> std::result::Result<(HANDLE, u64), i32> {
+    use windows::Wdk::Foundation::OBJECT_ATTRIBUTES;
+    use windows::Win32::Foundation::{NTSTATUS, UNICODE_STRING};
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtCreateFile(h: *mut HANDLE, access: u32,
+            oa: *const OBJECT_ATTRIBUTES, iosb: *mut [usize; 2],
+            alloc: *const u64, fattrs: u32, share: u32, disp: u32,
+            opts: u32, ea: *const c_void, ea_len: u32) -> NTSTATUS;
+        fn NtOpenFile(h: *mut HANDLE, access: u32,
+            oa: *const OBJECT_ATTRIBUTES, iosb: *mut [usize; 2],
+            share: u32, opts: u32) -> NTSTATUS;
+    }
+    unsafe {
+        let mut wpath = wstr(nt_path);
+        // Strip the trailing NUL — UNICODE_STRING.Length excludes it.
+        if wpath.last() == Some(&0) { wpath.pop(); }
+        let us = UNICODE_STRING {
+            Length: (wpath.len() * 2) as u16,
+            MaximumLength: (wpath.len() * 2) as u16,
+            Buffer: PWSTR(wpath.as_mut_ptr()),
+        };
+        let oa = OBJECT_ATTRIBUTES {
+            Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: HANDLE::default(),
+            ObjectName: &us as *const _ as *mut _,
+            Attributes: 0x40 /* OBJ_CASE_INSENSITIVE */,
+            SecurityDescriptor: std::ptr::null_mut(),
+            SecurityQualityOfService: std::ptr::null_mut(),
+        };
+        let mut h = HANDLE::default();
+        let mut iosb = [0usize; 2];
+        let access = req.args[1] as u32;
+        let st = if req.op == ipc::OP_NTCREATEFILE {
+            NtCreateFile(&mut h, access, &oa, &mut iosb,
+                std::ptr::null(),               // AllocationSize: ignore
+                req.args[5] as u32,             // FileAttributes
+                req.args[6] as u32,             // ShareAccess
+                req.args[7] as u32,             // CreateDisposition
+                req.args[8] as u32,             // CreateOptions
+                std::ptr::null(), 0)            // EaBuffer/Length: drop
+        } else {
+            NtOpenFile(&mut h, access, &oa, &mut iosb,
+                req.args[4] as u32,             // ShareAccess
+                req.args[5] as u32)             // OpenOptions
+        };
+        if st.0 < 0 { Err(st.0) } else { Ok((h, iosb[1] as u64)) }
+    }
+}
+
+/// Read `OBJECT_ATTRIBUTES.ObjectName` from target memory and
+/// return the NT path. `RootDirectory`-relative opens are
+/// rejected for now (would need broker-side handle tracking).
+fn read_target_obj_path(target: HANDLE, oa_va: usize) -> Result<String> {
+    if oa_va == 0 { bail!("null OBJECT_ATTRIBUTES"); }
+    #[repr(C)] #[derive(Clone, Copy)]
+    struct ObjAttrs {
+        length: u32, _pad: u32, root: u64, name: u64,
+        attrs: u32, _pad2: u32, sd: u64, sqos: u64,
+    }
+    #[repr(C)] #[derive(Clone, Copy)]
+    struct UStr { len: u16, max: u16, _pad: u32, buf: u64 }
+    let oa: ObjAttrs = interception::read_remote(target, oa_va)?;
+    if oa.root != 0 {
+        bail!("RootDirectory-relative open (handle={:#x})", oa.root);
+    }
+    if oa.name == 0 { bail!("null ObjectName"); }
+    let us: UStr = interception::read_remote(target, oa.name as usize)?;
+    if us.len == 0 || us.len > 32768 { bail!("ObjectName length {}", us.len); }
+    interception::read_remote_wstr(target, us.buf as usize, us.len as usize)
 }
 
 /// Spawn `cmdline` under the same restricted+lowbox token + Job +

@@ -27,26 +27,34 @@ use windows::Win32::System::Threading::{
     CreateEventW, GetCurrentProcess, SetEvent, WaitForSingleObject,
 };
 
-/// Section layout for the `CreateProcessInternalW` hook. The stub
-/// writes `args` (12×u64); the broker writes the `out_*` fields.
-/// Handle values are target-side; pointer values are target-VA.
+pub const OP_CPW: u64 = 0;
+pub const OP_NTCREATEFILE: u64 = 1;
+pub const OP_NTOPENFILE: u64 = 2;
+
+/// Section layout shared by every hook stub. The stub writes `op`
+/// + `args`; the broker writes the `r*` fields. Field meaning is
+/// op-dependent. Handle values are target-side; pointer values
+/// are target-VA.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Wire {
-    /// rcx,rdx,r8,r9,[rsp+0x28..0x60] — i.e. CreateProcessInternalW's
-    /// (hUserToken, lpApplicationName, lpCommandLine,
-    ///  lpProcessAttributes, lpThreadAttributes, bInheritHandles,
-    ///  dwCreationFlags, lpEnvironment, lpCurrentDirectory,
-    ///  lpStartupInfo, lpProcessInformation, phRestrictedToken).
-    pub args: [u64; 12],     // 0x00..0x60
-    pub out_process: u64,    // 0x60: target-side hProcess
-    pub out_thread: u64,     // 0x68: target-side hThread
-    pub out_pid: u32,        // 0x70
-    pub out_tid: u32,        // 0x74
-    pub out_result: u32,     // 0x78: BOOL
-    pub out_error: u32,      // 0x7c: GetLastError on failure
+    pub op: u64,             // 0x00
+    /// rcx,rdx,r8,r9,[rsp+0x28..0x60] — up to 12 raw arguments.
+    pub args: [u64; 12],     // 0x08..0x68
+    /// CPW: hProcess.    FS: out FileHandle (target-side).
+    pub r0: u64,             // 0x68
+    /// CPW: hThread.     FS: IO_STATUS_BLOCK.Information.
+    pub r1: u64,             // 0x70
+    /// CPW: dwProcessId. FS: unused.
+    pub r2: u32,             // 0x78
+    /// CPW: dwThreadId.
+    pub r3: u32,             // 0x7c
+    /// CPW: BOOL result. FS: NTSTATUS.
+    pub r_status: i32,       // 0x80
+    /// CPW: GetLastError on failure.
+    pub r_error: u32,        // 0x84
 }
-const _: () = assert!(size_of::<Wire>() == 0x80);
+const _: () = assert!(size_of::<Wire>() == 0x88);
 
 pub const SECTION_SIZE: usize = 4096;
 
@@ -119,25 +127,31 @@ impl Channel {
         }
     }
 
-    pub fn reply_ok(&self, hproc: u64, hthread: u64, pid: u32, tid: u32) {
+    pub fn reply_cpw_ok(&self, hproc: u64, hthread: u64, pid: u32, tid: u32) {
         unsafe {
-            (*self.view).out_process = hproc;
-            (*self.view).out_thread  = hthread;
-            (*self.view).out_pid     = pid;
-            (*self.view).out_tid     = tid;
-            (*self.view).out_result  = 1;
-            (*self.view).out_error   = 0;
+            (*self.view).r0 = hproc;
+            (*self.view).r1 = hthread;
+            (*self.view).r2 = pid;
+            (*self.view).r3 = tid;
+            (*self.view).r_status = 1;
+            (*self.view).r_error  = 0;
             let _ = SetEvent(self.ev_resp);
         }
     }
-    pub fn reply_err(&self, error: u32) {
+    pub fn reply_cpw_err(&self, error: u32) {
         unsafe {
-            (*self.view).out_process = 0;
-            (*self.view).out_thread  = 0;
-            (*self.view).out_pid     = 0;
-            (*self.view).out_tid     = 0;
-            (*self.view).out_result  = 0;
-            (*self.view).out_error   = error;
+            (*self.view).r0 = 0; (*self.view).r1 = 0;
+            (*self.view).r2 = 0; (*self.view).r3 = 0;
+            (*self.view).r_status = 0;
+            (*self.view).r_error  = error;
+            let _ = SetEvent(self.ev_resp);
+        }
+    }
+    pub fn reply_fs(&self, handle: u64, iosb_info: u64, status: i32) {
+        unsafe {
+            (*self.view).r0 = handle;
+            (*self.view).r1 = iosb_info;
+            (*self.view).r_status = status;
             let _ = SetEvent(self.ev_resp);
         }
     }

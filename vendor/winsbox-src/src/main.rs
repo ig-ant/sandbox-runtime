@@ -10,6 +10,7 @@ mod policy;
 #[cfg(windows)] mod ipc;
 #[cfg(windows)] mod interception;
 #[cfg(windows)] mod entry_trampoline;
+#[cfg(windows)] mod policy_engine;
 #[cfg(windows)] mod launch;
 
 use anyhow::{Context, Result};
