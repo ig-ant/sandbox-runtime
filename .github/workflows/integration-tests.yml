@@ -113,6 +113,13 @@ jobs:
         if: matrix.os != 'windows'
         run: npm test
 
+      - name: P10 grandchild matrix (Windows)
+        if: matrix.os == 'windows'
+        run: |
+          cargo build --release --manifest-path vendor/winsbox-src/Cargo.toml --bin p10-grandchild
+          vendor/winsbox-src/target/release/p10-grandchild.exe
+        continue-on-error: true
+
       - name: Run tests (Windows)
         # The full suite has POSIX-shell assumptions and a Bun-on-Windows
         # crash in parent-proxy-tunnel.test.ts; scope to the Windows suite

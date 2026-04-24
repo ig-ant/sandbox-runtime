@@ -9,6 +9,10 @@ default-run = "sbox-exec"
 name = "sbox-exec"
 path = "src/main.rs"
 
+[[bin]]
+name = "p10-grandchild"
+path = "src/bin/p10_grandchild.rs"
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
@@ -37,6 +41,7 @@ windows = { version = "0.58", features = [
   "Win32_System_Diagnostics_ToolHelp",
   "Win32_System_Diagnostics_Debug",
   "Wdk_Foundation",
+  "Win32_System_RemoteDesktop",
 ] }
 
 [profile.release]
