@@ -13,6 +13,10 @@ path = "src/main.rs"
 name = "p10-grandchild"
 path = "src/bin/p10_grandchild.rs"
 
+[[bin]]
+name = "p11-lsa"
+path = "src/bin/p11_lsa.rs"
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
@@ -46,6 +50,8 @@ windows = { version = "0.58", features = [
   "Wdk_System_Threading",
   "Win32_System_Kernel",
   "Win32_System_RemoteDesktop",
+  "Win32_Security_Authentication_Identity",
+  "Win32_Security_Credentials",
 ] }
 
 [profile.release]

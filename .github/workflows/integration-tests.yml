@@ -120,6 +120,13 @@ jobs:
           vendor/winsbox-src/target/release/p10-grandchild.exe
         continue-on-error: true
 
+      - name: P11 LSA-under-lowbox capability matrix (Windows)
+        if: matrix.os == 'windows'
+        run: |
+          cargo build --release --manifest-path vendor/winsbox-src/Cargo.toml --bin p11-lsa
+          vendor/winsbox-src/target/release/p11-lsa.exe
+        continue-on-error: true
+
       - name: Run tests (Windows)
         # The full suite has POSIX-shell assumptions and a Bun-on-Windows
         # crash in parent-proxy-tunnel.test.ts; scope to the Windows suite
