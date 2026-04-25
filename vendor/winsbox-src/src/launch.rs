@@ -571,7 +571,7 @@ fn handle_cpw(ch: &ipc::Channel, target: HANDLE, req: &ipc::Wire, ctx: &Arc<Spaw
     let cwd = read_target_wstr(target, req.args[8] as usize)
         .ok().filter(|s| !s.is_empty());
     let caller_flags = req.args[6] as u32;
-    let si = read_target_startupinfo(target, req.args[9] as usize);
+    let (si, reserved2) = read_target_startupinfo(target, req.args[9] as usize);
     let cmdline = if !cmd.is_empty() { cmd } else { app.clone() };
     if cmdline.is_empty() {
         eprintln!("[sbox-exec] ipc: empty cmdline (app={app:?})");
@@ -579,14 +579,14 @@ fn handle_cpw(ch: &ipc::Channel, target: HANDLE, req: &ipc::Wire, ctx: &Arc<Spaw
         return;
     }
     eprintln!(
-        "[sbox-exec] ipc: brokered spawn: {cmdline}  (flags={caller_flags:#x} si.flags={:#x} app={app:?})",
-        si.dwFlags.0,
+        "[sbox-exec] ipc: brokered spawn: {cmdline}  (flags={caller_flags:#x} si.flags={:#x} cbReserved2={} app={app:?})",
+        si.dwFlags.0, reserved2.len(),
     );
     let suspend_after = caller_flags & 0x00000004 /* CREATE_SUSPENDED */ != 0;
     let app_opt = (!app.is_empty()).then_some(app.as_str());
     let mut envb = read_target_env(target, req.args[7] as usize, caller_flags, ctx);
-    match broker_spawn(ctx, app_opt, &cmdline, cwd.as_deref(),
-                       caller_flags, &si, &mut envb) {
+    match broker_spawn(ctx, target, app_opt, &cmdline, cwd.as_deref(),
+                       caller_flags, &si, &reserved2, &mut envb) {
         Ok(child) => {
             if let Err(e) = install_broker_hook(
                 child.hProcess, child.hThread, suspend_after, ctx.clone(),
@@ -601,7 +601,6 @@ fn handle_cpw(ch: &ipc::Channel, target: HANDLE, req: &ipc::Wire, ctx: &Arc<Spaw
             // holds it for future dup_to_target calls. Job
             // KILL_ON_JOB_CLOSE bounds the leak.
             unsafe { let _ = CloseHandle(child.hThread); }
-            close_si_handles(&si);
         }
         Err(e) => {
             let gle = unsafe {
@@ -609,7 +608,6 @@ fn handle_cpw(ch: &ipc::Channel, target: HANDLE, req: &ipc::Wire, ctx: &Arc<Spaw
             };
             eprintln!("[sbox-exec] ipc: brokered spawn failed: {e:#} (gle={gle})");
             ch.reply_cpw_err(if gle != 0 { gle } else { 5 });
-            close_si_handles(&si);
         }
     }
 }
@@ -1344,15 +1342,19 @@ fn read_target_obj_path(target: HANDLE, oa_va: usize) -> Result<String> {
 #[allow(clippy::too_many_arguments)]
 fn broker_spawn(
     ctx: &SpawnCtx,
+    parent: HANDLE,
     app: Option<&str>,
     cmdline: &str,
     cwd: Option<&str>,
     caller_flags: u32,
     si: &STARTUPINFOW,
+    reserved2: &[u8],
     envb: &mut Vec<u16>,
 ) -> Result<PROCESS_INFORMATION> {
     use windows::Win32::System::JobObjects::AssignProcessToJobObject;
-    use windows::Win32::System::Threading::PROCESS_CREATION_FLAGS;
+    use windows::Win32::System::Threading::{
+        PROCESS_CREATION_FLAGS, PROC_THREAD_ATTRIBUTE_PARENT_PROCESS,
+    };
     // Forward the flags that affect console/window behaviour and
     // priority; mask out the ones that would defeat brokering or
     // duplicate work the broker does itself. CREATE_SUSPENDED is
@@ -1406,41 +1408,82 @@ fn broker_spawn(
         let app_w = app.map(wstr);
         let app_p = app_w.as_ref().map(|w| pcwstr(w)).unwrap_or(PCWSTR::null());
         let cwd_w = wstr(cwd.unwrap_or(&ctx.cwd));
+
+        // PROC_THREAD_ATTRIBUTE_PARENT_PROCESS = the sandboxed
+        // caller, so the child inherits the *caller's*
+        // inheritable handles (with the same values), device
+        // map, and Job. This is what makes Cygwin fork()
+        // work: the handle values inside child_info_fork
+        // (passed via lpReserved2) and STARTUPINFO.hStd* are
+        // caller-table values that become valid in the child
+        // without rewriting. The caller's primary token is
+        // already the lockdown token, so token inheritance is
+        // a no-op vs. the explicit hToken; SetThreadToken
+        // below still applies the initial impersonation.
+        let mut sz = 0usize;
+        let _ = InitializeProcThreadAttributeList(
+            LPPROC_THREAD_ATTRIBUTE_LIST::default(), 1, 0, &mut sz);
+        let mut attr_buf = vec![0u8; sz.max(1)];
+        let attrs = LPPROC_THREAD_ATTRIBUTE_LIST(attr_buf.as_mut_ptr() as *mut c_void);
+        InitializeProcThreadAttributeList(attrs, 1, 0, &mut sz)
+            .context("InitializeProcThreadAttributeList")?;
+        let parent_h = parent;
+        UpdateProcThreadAttribute(
+            attrs, 0, PROC_THREAD_ATTRIBUTE_PARENT_PROCESS as usize,
+            Some(&parent_h as *const _ as *const c_void),
+            size_of::<HANDLE>(), None, None,
+        ).context("UpdateProcThreadAttribute(PARENT_PROCESS)")?;
+
+        let mut six: STARTUPINFOEXW = zeroed();
+        six.StartupInfo = *si;
+        six.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+        six.lpAttributeList = attrs;
+        if !reserved2.is_empty() {
+            six.StartupInfo.cbReserved2 = reserved2.len() as u16;
+            six.StartupInfo.lpReserved2 = reserved2.as_ptr() as *mut u8;
+        }
+
         let mut pi: PROCESS_INFORMATION = zeroed();
         CreateProcessAsUserW(
             ctx.primary, app_p, PWSTR(cmd.as_mut_ptr()), None, None, true,
-            CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED | fwd,
+            CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT | fwd,
             Some(envb.as_mut_ptr() as *mut c_void),
-            PCWSTR(cwd_w.as_ptr()), si, &mut pi,
+            PCWSTR(cwd_w.as_ptr()), &six.StartupInfo, &mut pi,
         ).with_context(|| format!("CreateProcessAsUserW(brokered, {cmdline})"))?;
+        DeleteProcThreadAttributeList(attrs);
         if let Err(e) = SetThreadToken(Some(&pi.hThread), ctx.initial) {
             eprintln!("[sbox-exec] broker_spawn: SetThreadToken: {e}");
         }
-        AssignProcessToJobObject(ctx.job, pi.hProcess)
-            .context("AssignProcessToJobObject(brokered)")?;
+        // PARENT_PROCESS makes the child inherit the caller's
+        // Job (= ctx.job), so explicit assignment is usually
+        // redundant; tolerate ALREADY_ASSIGNED.
+        if let Err(e) = AssignProcessToJobObject(ctx.job, pi.hProcess) {
+            eprintln!("[sbox-exec] broker_spawn: AssignProcessToJobObject: {e} (likely already in job via PARENT_PROCESS)");
+        }
         let _ = ctx.ac_sid;
         Ok(pi)
     }
 }
 
-/// Read the caller's `STARTUPINFOW` from target memory and rebuild
-/// it with stdio handles `DuplicateHandle`'d from the caller into
-/// the broker (inheritable) so the brokered child inherits the
-/// caller's redirections. String fields (lpDesktop/lpTitle) are
-/// dropped — they reference caller-VA memory and would be invalid
-/// in the broker; the broker's defaults apply instead.
-fn read_target_startupinfo(target: HANDLE, va: usize) -> STARTUPINFOW {
-    use windows::Win32::Foundation::DuplicateHandle;
-    use windows::Win32::System::Threading::{
-        GetCurrentProcess, STARTF_USESTDHANDLES,
-    };
+/// Read the caller's `STARTUPINFOW` from target memory.
+/// `broker_spawn` sets `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` to
+/// the caller, so the brokered child inherits the *caller's*
+/// inheritable handles with the SAME values — `hStd*` and the
+/// handles inside `lpReserved2` (Cygwin's `child_info_fork`)
+/// are therefore kept as the caller's raw values, not dup'd
+/// into the broker. String fields (lpDesktop/lpTitle) are
+/// dropped — they reference caller-VA memory and would be
+/// invalid in the broker; the broker's defaults apply instead.
+/// Returns the rebuilt `STARTUPINFOW` and a broker-owned copy
+/// of the `lpReserved2` buffer (empty if `cbReserved2 == 0`).
+fn read_target_startupinfo(target: HANDLE, va: usize) -> (STARTUPINFOW, Vec<u8>) {
     let mut out: STARTUPINFOW = unsafe { zeroed() };
     out.cb = size_of::<STARTUPINFOW>() as u32;
-    if va == 0 { return out; }
+    if va == 0 { return (out, Vec::new()); }
     // STARTUPINFOW is the prefix of STARTUPINFOEXW; reading the W
     // size is safe regardless of which the caller passed.
     let theirs: STARTUPINFOW = match interception::read_remote(target, va) {
-        Ok(s) => s, Err(_) => return out,
+        Ok(s) => s, Err(_) => return (out, Vec::new()),
     };
     out.dwFlags = theirs.dwFlags;
     out.wShowWindow = theirs.wShowWindow;
@@ -1449,33 +1492,29 @@ fn read_target_startupinfo(target: HANDLE, va: usize) -> STARTUPINFOW {
     out.dwXCountChars = theirs.dwXCountChars;
     out.dwYCountChars = theirs.dwYCountChars;
     out.dwFillAttribute = theirs.dwFillAttribute;
-    if theirs.dwFlags & STARTF_USESTDHANDLES != Default::default() {
-        let dup = |h: HANDLE| -> HANDLE {
-            if h.is_invalid() || h.0.is_null() { return h; }
-            let mut o = HANDLE::default();
-            unsafe {
-                let _ = DuplicateHandle(
-                    target, h, GetCurrentProcess(), &mut o,
-                    0, true, windows::Win32::Foundation::DUPLICATE_SAME_ACCESS,
-                );
-            }
-            o
-        };
-        out.hStdInput  = dup(theirs.hStdInput);
-        out.hStdOutput = dup(theirs.hStdOutput);
-        out.hStdError  = dup(theirs.hStdError);
-    }
-    out
-}
-
-fn close_si_handles(si: &STARTUPINFOW) {
-    use windows::Win32::System::Threading::STARTF_USESTDHANDLES;
-    if si.dwFlags & STARTF_USESTDHANDLES == Default::default() { return; }
-    for h in [si.hStdInput, si.hStdOutput, si.hStdError] {
-        if !h.is_invalid() && !h.0.is_null() {
-            unsafe { let _ = CloseHandle(h); }
+    // Caller-table handle values: valid in the brokered child
+    // via PARENT_PROCESS inheritance.
+    out.hStdInput  = theirs.hStdInput;
+    out.hStdOutput = theirs.hStdOutput;
+    out.hStdError  = theirs.hStdError;
+    // lpReserved2: Cygwin/MSYS2 fork() passes child_info_fork
+    // here (parent pid, heap section handle, fork-sync events,
+    // stack/heap bounds for the section-remap dance). Copy the
+    // buffer; the handle VALUES inside it are caller-table and
+    // become valid in the child via PARENT_PROCESS. Cap at 64K
+    // (Cygwin's struct is ~1KB; the cap bounds a hostile
+    // caller).
+    let cb = theirs.cbReserved2 as usize;
+    let reserved2 = if cb > 0 && cb <= 65536 && !theirs.lpReserved2.is_null() {
+        let mut buf = vec![0u8; cb];
+        match interception::read_remote_bytes(
+            target, theirs.lpReserved2 as usize, &mut buf,
+        ) {
+            Ok(()) => buf,
+            Err(_) => Vec::new(),
         }
-    }
+    } else { Vec::new() };
+    (out, reserved2)
 }
 
 /// Read the environment block the brokered child should

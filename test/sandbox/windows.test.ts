@@ -187,7 +187,7 @@ d(`windows sandbox [WINSBOX_PHASE=${PHASE}]`, () => {
   // The other candidate is the broker's injected stub pages
   // colliding with the parent's section-remap. Gated until
   // lpReserved2 is forwarded.
-  const MSYS2_FORK_LANDED = false
+  const MSYS2_FORK_LANDED = true
   const msys2ForkCompat =
     PHASE === 'stub' || MSYS2_FORK_LANDED
       ? msys2Compat

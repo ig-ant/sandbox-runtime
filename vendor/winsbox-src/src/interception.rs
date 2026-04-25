@@ -22,6 +22,7 @@ use windows::Win32::System::Diagnostics::Debug::{
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::System::Memory::{
     VirtualAllocEx, VirtualProtectEx, MEM_COMMIT, MEM_RESERVE,
+    VIRTUAL_ALLOCATION_TYPE,
     PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_PROTECTION_FLAGS,
     PAGE_READWRITE,
 };
@@ -450,8 +451,15 @@ fn write_remote_bytes(proc: HANDLE, addr: usize, data: &[u8]) -> Result<()> {
 
 pub fn alloc_remote_rx(proc: HANDLE, data: &[u8]) -> Result<usize> {
     unsafe {
+        // MEM_TOP_DOWN: Cygwin fork() remaps the parent's
+        // heap/data sections at the SAME VA in the child;
+        // stub/trampoline/section pages allocated low could
+        // collide. Top-down keeps them in high address space
+        // the Cygwin heap won't reach.
+        const MEM_TOP_DOWN: VIRTUAL_ALLOCATION_TYPE =
+            VIRTUAL_ALLOCATION_TYPE(0x00100000);
         let p = VirtualAllocEx(proc, None, data.len().max(4096),
-                               MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                               MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN, PAGE_READWRITE);
         if p.is_null() { bail!("VirtualAllocEx: {:?}", GetLastError()); }
         let mut n = 0usize;
         WriteProcessMemory(proc, p, data.as_ptr() as *const c_void,

@@ -266,9 +266,12 @@ fn map_into_target(section: HANDLE, target: HANDLE) -> Result<usize> {
         let mut base: *mut c_void = std::ptr::null_mut();
         let mut size: usize = 0;
         let mut off: i64 = 0;
+        // MEM_TOP_DOWN: keep the IPC section out of the
+        // address range Cygwin's fork() remaps the parent's
+        // heap into.
         let st = NtMapViewOfSection(
             section, target, &mut base, 0, 0, &mut off, &mut size,
-            2 /* ViewUnmap */, 0, PAGE_READWRITE.0,
+            2 /* ViewUnmap */, 0x00100000 /* MEM_TOP_DOWN */, PAGE_READWRITE.0,
         );
         if st.0 < 0 { bail!("NtMapViewOfSection: {:#x}", st.0); }
         Ok(base as usize)
