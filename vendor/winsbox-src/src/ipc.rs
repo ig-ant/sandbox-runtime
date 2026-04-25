@@ -42,6 +42,8 @@ pub const OP_NTOPENKEYEX: u64 = 4;
 pub const OP_NTOPENSECTION: u64 = 5;
 pub const OP_NTQUERYATTR: u64 = 6;
 pub const OP_NTQUERYFULLATTR: u64 = 7;
+pub const OP_NTCREATEDIROBJ: u64 = 8;
+pub const OP_NTOPENDIROBJ: u64 = 9;
 
 /// Section offset for the `NtQuery*AttributesFile` result
 /// struct (max 56 bytes = `FILE_NETWORK_OPEN_INFORMATION`).

@@ -156,7 +156,7 @@ d(`windows sandbox [WINSBOX_PHASE=${PHASE}]`, () => {
   // `\Sessions\<N>\AppContainerNamedObjects\<AC-SID>\msys-*`.
   // Until then this is a documented platform limitation
   // alongside the lowbox/Schannel one.
-  const MSYS2_BNO_REDIRECT_LANDED = false
+  const MSYS2_BNO_REDIRECT_LANDED = true
   const msys2Compat =
     PHASE === 'stub' || MSYS2_BNO_REDIRECT_LANDED
       ? toolCompat
@@ -173,6 +173,26 @@ d(`windows sandbox [WINSBOX_PHASE=${PHASE}]`, () => {
     const r = await runSandboxed(`"${bash}" -c "echo hello"`, fx.config)
     expect(r.exitCode).toBe(0)
     expect(r.stdout).toContain('hello')
+  })
+
+  // Pipes + Cygwin fork(): the heaviest msys-2.0.dll path.
+  // fork() does CreateProcess(self, SUSPENDED) → broker hook →
+  // child opens the SAME redirected directory → finds the
+  // parent's shared section → section-remap dance (handle-
+  // based, no path lookup). If this works, most bash scripts
+  // do.
+  msys2Compat('bash (msys2) ls | head', toolPhase, async () => {
+    const bash = `${process.env.ProgramFiles}\\Git\\bin\\bash.exe`
+    if (!fs.existsSync(bash)) {
+      console.warn(`  [skip] ${bash} not found`)
+      return
+    }
+    const r = await runSandboxed(
+      `"${bash}" -c "ls /usr/bin | head -3"`,
+      fx.config,
+    )
+    expect(r.exitCode).toBe(0)
+    expect(r.stdout.trim().split(/\r?\n/).length).toBeGreaterThanOrEqual(1)
   })
 
   extCompat('curl.exe --version', 'stub', async () => {

@@ -370,18 +370,81 @@ pub fn to_impersonation(token: HANDLE) -> Result<HANDLE> {
     }
 }
 
-pub fn make_lowbox(token: HANDLE, package_sid: PSID) -> Result<HANDLE> {
+pub fn make_lowbox(
+    token: HANDLE, package_sid: PSID, saved_handles: &[HANDLE],
+) -> Result<HANDLE> {
     unsafe {
         let mut out = HANDLE::default();
         let mut oa: OBJECT_ATTRIBUTES = zeroed();
         oa.Length = size_of::<OBJECT_ATTRIBUTES>() as u32;
+        let mut hs: Vec<HANDLE> = saved_handles.to_vec();
         let st = NtCreateLowBoxToken(
             &mut out, token, 0x02000000 /* MAXIMUM_ALLOWED */,
             &mut oa, package_sid, 0, std::ptr::null_mut(),
-            0, std::ptr::null_mut(),
+            hs.len() as u32,
+            if hs.is_empty() { std::ptr::null_mut() } else { hs.as_mut_ptr() },
         );
         anyhow::ensure!(st.0 >= 0, "NtCreateLowBoxToken: {:#x}", st.0);
         Ok(out)
+    }
+}
+
+/// Pre-create the AppContainer's named-object root
+/// (`\Sessions\<sess>\AppContainerNamedObjects\<sid>` and its
+/// `RPC Control` subdir) so (a) the lowbox token's saved-handle
+/// list can reference them — makes kernelbase's
+/// `BaseGetNamedObjectDirectory` resolve to the per-AC namespace
+/// — and (b) the broker can redirect MSYS2/Cygwin's hardcoded
+/// `\BaseNamedObjects\…` creates there (`handle_dirobj`). The
+/// returned handles must be kept alive for the broker's
+/// lifetime (closing them lets the directories be torn down).
+pub fn create_ac_bno(sid_str: &str) -> Result<(String, Vec<HANDLE>)> {
+    use windows::Win32::Foundation::UNICODE_STRING;
+    use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtCreateDirectoryObject(
+            h: *mut HANDLE, access: u32, oa: *const OBJECT_ATTRIBUTES,
+        ) -> NTSTATUS;
+        fn RtlInitUnicodeString(
+            dst: *mut UNICODE_STRING, src: windows::core::PCWSTR,
+        );
+    }
+    unsafe {
+        let mut sess = 0u32;
+        let _ = ProcessIdToSessionId(GetCurrentProcessId(), &mut sess);
+        let base = format!(
+            r"\Sessions\{sess}\AppContainerNamedObjects\{sid_str}"
+        );
+        let paths = [base.clone(), format!(r"{base}\RPC Control")];
+        let mut handles = Vec::new();
+        for p in &paths {
+            let wp = wstr(p);
+            let mut us: UNICODE_STRING = zeroed();
+            RtlInitUnicodeString(&mut us, pcwstr(&wp));
+            let oa = OBJECT_ATTRIBUTES {
+                Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+                RootDirectory: HANDLE::default(),
+                ObjectName: &us as *const _ as *mut _,
+                Attributes: 0x40 | 0x80, // OBJ_CASE_INSENSITIVE | OBJ_OPENIF
+                SecurityDescriptor: std::ptr::null_mut(),
+                SecurityQualityOfService: std::ptr::null_mut(),
+            };
+            let mut h = HANDLE::default();
+            let st = NtCreateDirectoryObject(
+                &mut h, 0x000F000F /* DIRECTORY_ALL_ACCESS */, &oa,
+            );
+            anyhow::ensure!(
+                st.0 >= 0,
+                "NtCreateDirectoryObject({p}): {:#x}", st.0,
+            );
+            handles.push(h);
+            // wp must outlive RtlInitUnicodeString's borrow into oa,
+            // which it does (oa is consumed by the syscall above).
+            std::mem::drop(wp);
+        }
+        Ok((base, handles))
     }
 }
 

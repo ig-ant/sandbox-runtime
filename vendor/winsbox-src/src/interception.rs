@@ -108,9 +108,14 @@ pub fn install_fs(target: HANDLE, a: &StubAddrs) -> Result<()> {
 pub fn install_reg(target: HANDLE, a: &StubAddrs) -> Result<()> {
     let env = stub_env(a)?;
     for (name, op, n_args) in [
-        ("NtOpenKey",     crate::ipc::OP_NTOPENKEY,     3usize),
-        ("NtOpenKeyEx",   crate::ipc::OP_NTOPENKEYEX,   4usize),
-        ("NtOpenSection", crate::ipc::OP_NTOPENSECTION, 3usize),
+        ("NtOpenKey",               crate::ipc::OP_NTOPENKEY,      3usize),
+        ("NtOpenKeyEx",             crate::ipc::OP_NTOPENKEYEX,    4usize),
+        ("NtOpenSection",           crate::ipc::OP_NTOPENSECTION,  3usize),
+        // MSYS2/Cygwin hardcode `\BaseNamedObjects\…` for
+        // their shared-state directory; the broker rewrites
+        // to the per-AC namespace.
+        ("NtCreateDirectoryObject", crate::ipc::OP_NTCREATEDIROBJ, 3usize),
+        ("NtOpenDirectoryObject",   crate::ipc::OP_NTOPENDIROBJ,   3usize),
     ] {
         let va = ntdll_export(name)?;
         let mut orig = [0u8; 32];

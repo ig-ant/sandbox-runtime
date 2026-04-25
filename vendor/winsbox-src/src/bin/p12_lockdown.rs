@@ -151,8 +151,8 @@ fn main() {
             let lock = token::make_lockdown_with(base, var.il, var.spec)?;
             let init = token::make_initial(base, var.il)?;
             unsafe { let _ = CloseHandle(base); }
-            let lock_lb = token::make_lowbox(lock, ac.sid)?;
-            let init_lb = token::make_lowbox(init, ac.sid)?;
+            let lock_lb = token::make_lowbox(lock, ac.sid, &[])?;
+            let init_lb = token::make_lowbox(init, ac.sid, &[])?;
             unsafe { let _ = CloseHandle(lock); let _ = CloseHandle(init); }
             let primary = token::to_primary(lock_lb)?;
             let initial = token::to_impersonation(init_lb)?;

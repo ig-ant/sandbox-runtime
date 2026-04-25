@@ -30,10 +30,25 @@ use std::sync::{atomic::AtomicBool, atomic::Ordering, Arc, Mutex};
 /// Pair of tokens for Mode::Broker. `primary` is the lowbox-wrapped
 /// lockdown token used for CreateProcessAsUser; `initial` is the
 /// matched impersonation token set on the main thread for loader init.
-struct BrokerTokens { primary: HANDLE, initial: HANDLE }
+struct BrokerTokens {
+    primary: HANDLE,
+    initial: HANDLE,
+    /// `\Sessions\<N>\AppContainerNamedObjects\<AC-SID>` — the
+    /// per-AC named-object root the broker pre-created.
+    /// `handle_dirobj` redirects `\BaseNamedObjects\…` here.
+    ac_bno_path: String,
+    /// Directory-object handles for the AC BNO root + its
+    /// `RPC Control` subdir. Kept open for the broker's
+    /// lifetime so the directories aren't torn down.
+    _bno_handles: Vec<HANDLE>,
+}
 impl Drop for BrokerTokens {
     fn drop(&mut self) {
-        unsafe { let _ = CloseHandle(self.primary); let _ = CloseHandle(self.initial); }
+        unsafe {
+            let _ = CloseHandle(self.primary);
+            let _ = CloseHandle(self.initial);
+            for h in self._bno_handles.drain(..) { let _ = CloseHandle(h); }
+        }
     }
 }
 
@@ -45,6 +60,9 @@ impl Drop for BrokerTokens {
 /// joins all service threads before dropping anything).
 struct SpawnCtx {
     ac_sid: windows::Win32::Security::PSID,
+    /// Per-AC named-object root for `handle_dirobj`'s
+    /// `\BaseNamedObjects\…` → per-AC redirect.
+    ac_bno_path: String,
     ac_sid_string: String,
     job: HANDLE,
     primary: HANDLE,
@@ -135,18 +153,23 @@ fn build_broker_tokens(ac: &AppContainer) -> Result<BrokerTokens> {
 
     // NtCreateLowBoxToken needs a primary input and yields a primary;
     // dup the initial-side result to impersonation for SetThreadToken.
-    let lock_lb = token::make_lowbox(lockdown, ac.sid)?;
-    let init_lb = token::make_lowbox(initial_r, ac.sid)?;
+    // Pre-create the per-AC BNO root so the saved-handle list
+    // makes kernelbase's BaseGetNamedObjectDirectory resolve
+    // there, and so handle_dirobj has somewhere to redirect
+    // MSYS2/Cygwin's hardcoded \BaseNamedObjects\… creates.
+    let (ac_bno_path, bno_handles) = token::create_ac_bno(&ac.sid_string)?;
+    let lock_lb = token::make_lowbox(lockdown, ac.sid, &bno_handles)?;
+    let init_lb = token::make_lowbox(initial_r, ac.sid, &bno_handles)?;
     unsafe { let _ = CloseHandle(lockdown); let _ = CloseHandle(initial_r); }
 
     let primary = token::to_primary(lock_lb)?;
     let initial = token::to_impersonation(init_lb)?;
     unsafe { let _ = CloseHandle(lock_lb); let _ = CloseHandle(init_lb); }
     log!(
-        "broker tokens: primary={spec:?}+lowbox, initial=USER_RESTRICTED_SAME_ACCESS+lowbox, IL={:#x}",
+        "broker tokens: primary={spec:?}+lowbox, initial=USER_RESTRICTED_SAME_ACCESS+lowbox, IL={:#x}; ac_bno={ac_bno_path}",
         il,
     );
-    Ok(BrokerTokens { primary, initial })
+    Ok(BrokerTokens { primary, initial, ac_bno_path, _bno_handles: bno_handles })
 }
 
 fn run_confined(pol: &Policy) -> Result<u32> {
@@ -310,6 +333,7 @@ fn run_confined(pol: &Policy) -> Result<u32> {
     let stop = Arc::new(AtomicBool::new(false));
     let ctx = tokens.as_ref().map(|t| Arc::new(SpawnCtx {
         ac_sid: ac.sid,
+        ac_bno_path: t.ac_bno_path.clone(),
         ac_sid_string: ac.sid_string.clone(),
         job: job.handle(),
         primary: t.primary,
@@ -513,6 +537,8 @@ fn serve_ipc(ch: ipc::Channel, target_raw: isize, ctx: Arc<SpawnCtx>) {
                 handle_reg(&ch, target, &req, &ctx),
             ipc::OP_NTQUERYATTR | ipc::OP_NTQUERYFULLATTR =>
                 handle_attr(&ch, target, &req, &ctx),
+            ipc::OP_NTCREATEDIROBJ | ipc::OP_NTOPENDIROBJ =>
+                handle_dirobj(&ch, target, &req, &ctx),
             op => {
                 eprintln!("[sbox-exec] ipc: unknown op {op}");
                 ch.reply_fs(0, 0, 0xC0000002u32 as i32 /* STATUS_NOT_IMPLEMENTED */);
@@ -775,6 +801,127 @@ fn handle_attr(
         eprintln!("[sbox-exec] attr: {path} → {:#x}", st.0);
     }
     ch.reply_attr(st.0, &out);
+}
+
+/// `NtCreateDirectoryObject` / `NtOpenDirectoryObject`:
+/// args[0]=PHANDLE, [1]=DesiredAccess, [2]=POBJECT_ATTRIBUTES.
+/// MSYS2/Cygwin hardcode `\BaseNamedObjects\msys-…` (and the
+/// per-session `\Sessions\<N>\BaseNamedObjects\…`) for their
+/// shared-state namespace; lowbox denies create under the
+/// global BNO. Rewrite to the per-AC root the broker
+/// pre-created in `build_broker_tokens`, broker-issue with
+/// `OBJ_OPENIF`, dup the handle. Everything Cygwin creates
+/// underneath is `RootDirectory`-relative to that handle, so
+/// no further hooking is needed for the subtree. Anything
+/// that isn't a global/session BNO path is passed through —
+/// the lockdown token is the boundary there.
+fn handle_dirobj(
+    ch: &ipc::Channel, target: HANDLE, req: &ipc::Wire, ctx: &Arc<SpawnCtx>,
+) {
+    use windows::Wdk::Foundation::OBJECT_ATTRIBUTES;
+    use windows::Win32::Foundation::{NTSTATUS, UNICODE_STRING};
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtCreateDirectoryObject(
+            h: *mut HANDLE, access: u32, oa: *const OBJECT_ATTRIBUTES,
+        ) -> NTSTATUS;
+        fn NtOpenDirectoryObject(
+            h: *mut HANDLE, access: u32, oa: *const OBJECT_ATTRIBUTES,
+        ) -> NTSTATUS;
+    }
+    let access = req.args[1] as u32;
+    let (root_raw, leaf) = match read_target_oa_raw(target, req.args[2] as usize) {
+        Ok(r) => r,
+        Err(_) => { ch.reply_fs(0, 0, ipc::FS_PASSTHROUGH); return; }
+    };
+    // Only redirect absolute global/session BNO paths. Anything
+    // RootDirectory-relative or under a different namespace is
+    // the target's own concern.
+    let suffix = if root_raw == 0 {
+        bno_suffix(&leaf)
+    } else { None };
+    let suffix = match suffix {
+        Some(s) => s,
+        None => {
+            if ctx.trace {
+                eprintln!("[sbox-exec] dirobj: passthrough root={root_raw:#x} {leaf}");
+            }
+            ch.reply_fs(0, 0, ipc::FS_PASSTHROUGH);
+            return;
+        }
+    };
+    let redirected = if suffix.is_empty() {
+        ctx.ac_bno_path.clone()
+    } else {
+        format!(r"{}\{}", ctx.ac_bno_path, suffix)
+    };
+    let st;
+    let mut h = HANDLE::default();
+    unsafe {
+        let mut wpath = wstr(&redirected);
+        if wpath.last() == Some(&0) { wpath.pop(); }
+        let us = UNICODE_STRING {
+            Length: (wpath.len() * 2) as u16,
+            MaximumLength: (wpath.len() * 2) as u16,
+            Buffer: PWSTR(wpath.as_mut_ptr()),
+        };
+        let oa = OBJECT_ATTRIBUTES {
+            Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: HANDLE::default(),
+            ObjectName: &us as *const _ as *mut _,
+            // OBJ_OPENIF so a second MSYS2 process's create
+            // finds the first one's directory.
+            Attributes: 0x40 | 0x80,
+            SecurityDescriptor: std::ptr::null_mut(),
+            SecurityQualityOfService: std::ptr::null_mut(),
+        };
+        st = if req.op == ipc::OP_NTCREATEDIROBJ {
+            NtCreateDirectoryObject(&mut h, access, &oa)
+        } else {
+            NtOpenDirectoryObject(&mut h, access, &oa)
+        };
+    }
+    if ctx.trace || st.0 < 0 {
+        eprintln!(
+            "[sbox-exec] dirobj: {leaf} → {redirected}: {:#x} access={access:#x}",
+            st.0,
+        );
+    }
+    if st.0 < 0 {
+        ch.reply_fs(0, 0, st.0);
+        return;
+    }
+    let th = ch.dup_to_target(h).unwrap_or(0);
+    unsafe { let _ = CloseHandle(h); }
+    ch.reply_fs(th, 0, 0);
+}
+
+/// Strip the global/session BNO prefix and return the suffix
+/// (possibly empty). `\BaseNamedObjects`,
+/// `\BaseNamedObjects\X`, `\Sessions\<N>\BaseNamedObjects`,
+/// `\Sessions\<N>\BaseNamedObjects\X`. Returns `None` for
+/// anything else.
+fn bno_suffix(leaf: &str) -> Option<String> {
+    let lower = leaf.to_ascii_lowercase();
+    let strip = |orig: &str, lower: &str, prefix: &str| -> Option<String> {
+        if lower == prefix {
+            return Some(String::new());
+        }
+        let p = format!("{prefix}\\");
+        lower.strip_prefix(&p).map(|_| orig[p.len()..].to_string())
+    };
+    if let Some(s) = strip(leaf, &lower, r"\basenamedobjects") {
+        return Some(s);
+    }
+    // \Sessions\<N>\BaseNamedObjects[\…]
+    if let Some(rest) = lower.strip_prefix(r"\sessions\") {
+        if let Some(slash) = rest.find('\\') {
+            let after_n = &rest[slash..]; // includes leading '\'
+            let orig_after_n = &leaf[r"\sessions\".len() + slash..];
+            return strip(orig_after_n, after_n, r"\basenamedobjects");
+        }
+    }
+    None
 }
 
 /// `NtOpenKey` / `NtOpenKeyEx` / `NtOpenSection`:

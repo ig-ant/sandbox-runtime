@@ -153,13 +153,13 @@ fn main() {
                 let lb = if v.lowbox_handles {
                     make_lowbox_with_handles(lock, ac.sid, &ac.sid_string)?
                 } else {
-                    token::make_lowbox(lock, ac.sid)?
+                    token::make_lowbox(lock, ac.sid, &[])?
                 };
                 unsafe { let _ = CloseHandle(lock); }
                 lb
             } else { lock };
             let initial_src = if v.use_lowbox || v.lowbox_initial {
-                let lb = token::make_lowbox(init, ac.sid)?;
+                let lb = token::make_lowbox(init, ac.sid, &[])?;
                 unsafe { let _ = CloseHandle(init); }
                 lb
             } else { init };
