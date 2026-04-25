@@ -881,12 +881,10 @@ fn handle_dirobj(
             NtOpenDirectoryObject(&mut h, access, &oa)
         };
     }
-    if ctx.trace || st.0 < 0 {
-        eprintln!(
-            "[sbox-exec] dirobj: {leaf} → {redirected}: {:#x} access={access:#x}",
-            st.0,
-        );
-    }
+    eprintln!(
+        "[sbox-exec] dirobj: {leaf} → {redirected}: {:#x} access={access:#x}",
+        st.0,
+    );
     if st.0 < 0 {
         ch.reply_fs(0, 0, st.0);
         return;
@@ -896,11 +894,14 @@ fn handle_dirobj(
     ch.reply_fs(th, 0, 0);
 }
 
-/// Strip the global/session BNO prefix and return the suffix
-/// (possibly empty). `\BaseNamedObjects`,
-/// `\BaseNamedObjects\X`, `\Sessions\<N>\BaseNamedObjects`,
-/// `\Sessions\<N>\BaseNamedObjects\X`. Returns `None` for
-/// anything else.
+/// Strip a global/session/BNOLINKS named-object prefix and
+/// return the suffix (possibly empty). Matches:
+///   \BaseNamedObjects[\X]
+///   \Sessions\<N>\BaseNamedObjects[\X]
+///   \Sessions\BNOLINKS\<N>[\X]   (symlink to the above —
+///                                 Cygwin's get_shared_parent_dir
+///                                 uses this form first)
+/// Returns `None` for anything else.
 fn bno_suffix(leaf: &str) -> Option<String> {
     let lower = leaf.to_ascii_lowercase();
     let strip = |orig: &str, lower: &str, prefix: &str| -> Option<String> {
@@ -913,12 +914,22 @@ fn bno_suffix(leaf: &str) -> Option<String> {
     if let Some(s) = strip(leaf, &lower, r"\basenamedobjects") {
         return Some(s);
     }
-    // \Sessions\<N>\BaseNamedObjects[\…]
-    if let Some(rest) = lower.strip_prefix(r"\sessions\") {
-        if let Some(slash) = rest.find('\\') {
-            let after_n = &rest[slash..]; // includes leading '\'
-            let orig_after_n = &leaf[r"\sessions\".len() + slash..];
-            return strip(orig_after_n, after_n, r"\basenamedobjects");
+    if let Some(rest_l) = lower.strip_prefix(r"\sessions\") {
+        let rest_o = &leaf[r"\sessions\".len()..];
+        // BNOLINKS\<N>[\…]
+        if let Some(after_l) = rest_l.strip_prefix("bnolinks\\") {
+            let after_o = &rest_o["bnolinks\\".len()..];
+            // skip the session-id component
+            return match after_l.find('\\') {
+                Some(i) => Some(after_o[i + 1..].to_string()),
+                None => Some(String::new()),
+            };
+        }
+        // <N>\BaseNamedObjects[\…]
+        if let Some(slash) = rest_l.find('\\') {
+            let after_n_l = &rest_l[slash..];
+            let after_n_o = &rest_o[slash..];
+            return strip(after_n_o, after_n_l, r"\basenamedobjects");
         }
     }
     None
