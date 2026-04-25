@@ -145,6 +145,21 @@ d(`windows sandbox [WINSBOX_PHASE=${PHASE}]`, () => {
     expect(r.stdout.toLowerCase()).toContain('git version')
   })
 
+  // Git for Windows' bash.exe is the MSYS2 runtime: msys-2.0.dll,
+  // Cygwin-style fork() (CreateProcess + section remap), POSIX
+  // path translation, \Device\NamedPipe\msys-* IPC. Exercises a
+  // very different code path from the native-Win32 tools above.
+  toolCompat('bash (msys2) prints hello', toolPhase, async () => {
+    const bash = `${process.env.ProgramFiles}\\Git\\bin\\bash.exe`
+    if (!fs.existsSync(bash)) {
+      console.warn(`  [skip] ${bash} not found`)
+      return
+    }
+    const r = await runSandboxed(`"${bash}" -c "echo hello"`, fx.config)
+    expect(r.exitCode).toBe(0)
+    expect(r.stdout).toContain('hello')
+  })
+
   extCompat('curl.exe --version', 'stub', async () => {
     const r = await runSandboxed('curl.exe --version', fx.config)
     expect(r.exitCode).toBe(0)

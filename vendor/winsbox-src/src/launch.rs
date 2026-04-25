@@ -11,7 +11,7 @@ use windows::Win32::System::Threading::{
     CreateProcessAsUserW, CreateProcessW, DeleteProcThreadAttributeList,
     GetExitCodeProcess, InitializeProcThreadAttributeList, ResumeThread,
     SetThreadToken, TerminateProcess, UpdateProcThreadAttribute,
-    WaitForSingleObject, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
+    WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
     EXTENDED_STARTUPINFO_PRESENT, INFINITE, LPPROC_THREAD_ATTRIBUTE_LIST,
     PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
     STARTUPINFOEXW, STARTUPINFOW,
@@ -417,9 +417,16 @@ fn spawn_in_ac(
                     si_plain.lpDesktop = PWSTR(dw.as_ptr() as *mut u16);
                     std::mem::forget(dw);
                 }
+                // CREATE_NO_WINDOW: stdio is always pipes in
+                // broker mode, so the conhost window is
+                // vestigial; on the alternate desktop conhost/
+                // user32 init stalls without an explicit DACL
+                // (265e5b0). No-window sidesteps that and
+                // propagates to grandchildren via console
+                // inheritance + the OR in broker_spawn.
                 CreateProcessAsUserW(
                     t.primary, None, PWSTR(cmd.as_mut_ptr()), None, None, true,
-                    CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
+                    CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED | CREATE_NO_WINDOW,
                     Some(envb.as_mut_ptr() as *mut c_void), cwd_p,
                     &si_plain, &mut pi,
                 ).with_context(|| format!("CreateProcessAsUserW(broker, {command_line})"))?;
@@ -1085,6 +1092,15 @@ fn broker_spawn(
         let app_p = app_w.as_ref().map(|w| pcwstr(w)).unwrap_or(PCWSTR::null());
         let cwd_w = wstr(cwd.unwrap_or(&ctx.cwd));
         let mut pi: PROCESS_INFORMATION = zeroed();
+        // OR in CREATE_NO_WINDOW regardless of caller flags
+        // — brokered children are always non-interactive
+        // (stdio dup'd from the caller, never a console
+        // window), and on the alt-desktop conhost-window
+        // creation stalls without it. If the caller passed
+        // CREATE_NEW_CONSOLE/DETACHED_PROCESS those win.
+        let fwd = if fwd.0 & (0x00000010 | 0x00000008) == 0 {
+            fwd | CREATE_NO_WINDOW
+        } else { fwd };
         CreateProcessAsUserW(
             ctx.primary, app_p, PWSTR(cmd.as_mut_ptr()), None, None, true,
             CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED | fwd,
