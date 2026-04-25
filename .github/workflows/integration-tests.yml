@@ -146,6 +146,15 @@ jobs:
           WINSBOX_PHASE: '2'
           WINSBOX_TOKEN: lockdown
 
+      - name: Run tests (Windows, lockdown + alt-desktop)
+        if: matrix.os == 'windows'
+        run: bun test --timeout 25000 test/sandbox/windows.test.ts
+        continue-on-error: true
+        env:
+          WINSBOX_PHASE: '2'
+          WINSBOX_TOKEN: lockdown
+          WINSBOX_ALTDESKTOP: '1'
+
       - name: Run tests (Windows)
         # The full suite has POSIX-shell assumptions and a Bun-on-Windows
         # crash in parent-proxy-tunnel.test.ts; scope to the Windows suite

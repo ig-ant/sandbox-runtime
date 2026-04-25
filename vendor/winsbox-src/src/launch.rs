@@ -155,7 +155,9 @@ fn run_confined(pol: &Policy) -> Result<u32> {
     log!("AppContainer sid={} folder={}", ac.sid_string, ac.folder.display());
     let job = Job::new()?;
     log!("Job created");
-    let desktop = if pol.use_alternate_desktop {
+    let desktop = if pol.use_alternate_desktop
+        || std::env::var("WINSBOX_ALTDESKTOP").is_ok()
+    {
         match AltDesktop::new() {
             Ok(d) => { log!("alt desktop {}", d.qualified_name()); Some(d) }
             Err(e) => { log!("alt desktop unavailable ({e}); continuing without"); None }
