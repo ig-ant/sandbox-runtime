@@ -86,6 +86,15 @@ struct SpawnCtx {
     /// (succeeds, and brokering them all caused an
     /// `ExitProcess`-time spinlock hang at 12e3d0d).
     lockdown: bool,
+    /// Lower-cased leaf names of named pipes the broker
+    /// created via `handle_named_pipe`. The broker only
+    /// opens the *client* end (NtCreateFile on
+    /// `\??\pipe\<leaf>`) for leaves in this set — brokering
+    /// arbitrary `msys-*`/`cygwin-*` client opens would let
+    /// the sandbox connect to an *unsandboxed* host
+    /// MSYS2/Cygwin process's signal pipe (NULL-DACL'd by
+    /// design) and inject signals.
+    broker_pipes: Mutex<std::collections::HashSet<String>>,
     /// Join handles for nested service threads, so the main loop
     /// can wait for the whole tree on exit.
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
@@ -345,6 +354,7 @@ fn run_confined(pol: &Policy) -> Result<u32> {
         hook_fs: pol.broker_fs,
         trace: std::env::var("SBOX_TRACE").is_ok(),
         lockdown: std::env::var("WINSBOX_TOKEN").as_deref() == Ok("lockdown"),
+        broker_pipes: Mutex::new(std::collections::HashSet::new()),
         threads: Mutex::new(Vec::new()),
     }));
     if let Some(ctx) = ctx.as_ref() {
@@ -625,7 +635,20 @@ fn handle_fs(ch: &ipc::Channel, target: HANDLE, req: &ipc::Wire, ctx: &Arc<Spawn
         }
     };
     use crate::policy_engine::Decision;
-    match ctx.fs.evaluate(&path, access) {
+    // Client-end open of a pipe whose server end this broker
+    // created (Cygwin/MSYS2 sigwait & pty pipes). The pipe's
+    // DACL is the broker's default so the lowbox target can't
+    // passthrough-open it; the broker can. Restricted to the
+    // recorded set so the sandbox cannot reach a *host*
+    // process's `msys-*` pipe via the broker.
+    let lower = path.to_ascii_lowercase();
+    let is_own_pipe = lower
+        .strip_prefix(r"\??\pipe\")
+        .or_else(|| lower.strip_prefix(r"\device\namedpipe\"))
+        .is_some_and(|leaf| ctx.broker_pipes.lock().unwrap().contains(leaf));
+    let decision = if is_own_pipe { Decision::Allow }
+                   else { ctx.fs.evaluate(&path, access) };
+    match decision {
         Decision::Deny(why) => {
             eprintln!("[sbox-exec] fs: DENY {path} ({why}, access={access:#x})");
             ch.reply_fs(0, 0, 0xC0000022u32 as i32 /* STATUS_ACCESS_DENIED */);
@@ -922,11 +945,20 @@ fn handle_named_pipe(
             timeout: *const i64,
         ) -> NTSTATUS;
     }
-    let path = match read_target_obj_path(target, req.args[2] as usize) {
-        Ok(p) => p,
-        Err(_) => { ch.reply_fs(0, 0, ipc::FS_PASSTHROUGH); return; }
+    // CreateNamedPipeW opens `\??\pipe\` first and passes
+    // that handle as RootDirectory with ObjectName = just
+    // the leaf, so read_target_obj_path (which
+    // GetFinalPathNameByHandle's the root) fails. Use the
+    // raw OA reader and either dup the root or absolutise.
+    let (root_raw, name) = match read_target_oa_raw(target, req.args[2] as usize) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[sbox-exec] pipe: oa-read failed ({e:#}); passthrough");
+            ch.reply_fs(0, 0, ipc::FS_PASSTHROUGH);
+            return;
+        }
     };
-    // Only broker the Cygwin/MSYS2 pipe shapes
+    // Only broker the Cygwin/MSYS2 leaf shapes
     // (`msys-<hash>-<pid>-sigwait`, `cygwin-…-pty…`, etc.).
     // Brokering arbitrary pipe names under the broker's full
     // token would let the sandbox squat well-known names
@@ -935,23 +967,27 @@ fn handle_named_pipe(
     // connects. Anything else passthroughs — if the lowbox
     // token can create it, fine; if not, the deny is the
     // intended boundary.
-    let lower = path.to_ascii_lowercase();
-    let leaf = lower
+    let lower = name.to_ascii_lowercase();
+    // Leaf might be the bare name (RootDirectory = pipe-FS
+    // handle) or an absolute path.
+    let leaf_l: &str = lower
         .strip_prefix(r"\??\pipe\")
-        .or_else(|| lower.strip_prefix(r"\device\namedpipe\"));
-    let allowed = leaf.is_some_and(|l|
-        (l.starts_with("msys-") || l.starts_with("cygwin-"))
-        && !l.contains('\\')
-        && l.bytes().all(|b|
-            b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
-    );
+        .or_else(|| lower.strip_prefix(r"\device\namedpipe\"))
+        .unwrap_or(&lower);
+    let allowed = (leaf_l.starts_with("msys-") || leaf_l.starts_with("cygwin-"))
+        && !leaf_l.contains('\\')
+        && leaf_l.bytes().all(|b|
+            b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.');
     if !allowed {
-        if ctx.trace {
-            eprintln!("[sbox-exec] pipe: passthrough non-cygwin {path}");
-        }
+        eprintln!("[sbox-exec] pipe: passthrough non-cygwin root={root_raw:#x} {name}");
         ch.reply_fs(0, 0, ipc::FS_PASSTHROUGH);
         return;
     }
+    // Always re-issue with the absolute path so the
+    // allowlist above is what bounds the namespace, not
+    // whatever the caller's RootDirectory points at.
+    let path = format!(r"\??\pipe\{}", &name[name.len() - leaf_l.len()..]);
+    let _ = root_raw;
     let st;
     let mut h = HANDLE::default();
     let mut iosb = [0usize; 2];
@@ -999,6 +1035,10 @@ fn handle_named_pipe(
         ch.reply_fs(0, 0, st.0);
         return;
     }
+    // Record the leaf so handle_fs will broker the client-end
+    // NtCreateFile for *this* pipe (and only this one — see
+    // SpawnCtx::broker_pipes).
+    ctx.broker_pipes.lock().unwrap().insert(leaf_l.to_string());
     let th = ch.dup_to_target(h).unwrap_or(0);
     unsafe { let _ = CloseHandle(h); }
     ch.reply_fs(th, iosb[1] as u64, 0);
