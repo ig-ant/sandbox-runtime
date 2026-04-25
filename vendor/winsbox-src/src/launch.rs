@@ -624,12 +624,29 @@ fn handle_fs(ch: &ipc::Channel, target: HANDLE, req: &ipc::Wire, ctx: &Arc<Spawn
     let path = match read_target_obj_path(target, oa_va) {
         Ok(p) => p,
         Err(e) => {
-            // RootDirectory that isn't a file handle, or other
-            // shapes the broker can't resolve — let the target
-            // do the open itself under its own token.
-            eprintln!("[sbox-exec] fs: passthrough ({e:#})");
-            ch.reply_fs(0, 0, ipc::FS_PASSTHROUGH);
-            return;
+            // RootDirectory that isn't a file handle.
+            // Cygwin's fhandler_pipe::nt_create opens the
+            // client end RootDirectory-relative to
+            // `\Device\NamedPipe\` (which
+            // GetFinalPathNameByHandle can't resolve). If
+            // the leaf is a pipe the broker created, broker
+            // the client open via the absolute path so the
+            // target gets a handle to its own pipe.
+            // Otherwise passthrough.
+            if let Ok((_root, leaf)) = read_target_oa_raw(target, oa_va) {
+                let leaf_l = leaf.to_ascii_lowercase();
+                if ctx.broker_pipes.lock().unwrap().contains(&leaf_l) {
+                    format!(r"\??\pipe\{leaf}")
+                } else {
+                    eprintln!("[sbox-exec] fs: passthrough ({e:#})");
+                    ch.reply_fs(0, 0, ipc::FS_PASSTHROUGH);
+                    return;
+                }
+            } else {
+                eprintln!("[sbox-exec] fs: passthrough ({e:#})");
+                ch.reply_fs(0, 0, ipc::FS_PASSTHROUGH);
+                return;
+            }
         }
     };
     use crate::policy_engine::Decision;
@@ -956,11 +973,10 @@ fn handle_named_pipe(
             return;
         }
     };
-    // Only broker the Cygwin/MSYS2 leaf shapes
-    // (`msys-<hash>-<pid>-sigwait`, `cygwin-…-pty…`, etc.).
-    // Brokering arbitrary pipe names under the broker's full
-    // token would let the sandbox squat well-known names
-    // (e.g. `\\.\pipe\InitShutdown`) before the legitimate
+    // Only broker the Cygwin/MSYS2 leaf shapes. Brokering
+    // arbitrary pipe names under the broker's full token
+    // would let the sandbox squat well-known names
+    // (`\\.\pipe\InitShutdown` etc.) before the legitimate
     // server, then `ImpersonateNamedPipeClient` whoever
     // connects. Anything else passthroughs — if the lowbox
     // token can create it, fine; if not, the deny is the
@@ -972,11 +988,7 @@ fn handle_named_pipe(
         .strip_prefix(r"\??\pipe\")
         .or_else(|| lower.strip_prefix(r"\device\namedpipe\"))
         .unwrap_or(&lower);
-    let allowed = (leaf_l.starts_with("msys-") || leaf_l.starts_with("cygwin-"))
-        && !leaf_l.contains('\\')
-        && leaf_l.bytes().all(|b|
-            b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.');
-    if !allowed {
+    if !is_cygwin_pipe_leaf(leaf_l) {
         eprintln!("[sbox-exec] pipe: passthrough non-cygwin root={root_raw:#x} {name}");
         ch.reply_fs(0, 0, ipc::FS_PASSTHROUGH);
         return;
@@ -1040,6 +1052,31 @@ fn handle_named_pipe(
     let th = ch.dup_to_target(h).unwrap_or(0);
     unsafe { let _ = CloseHandle(h); }
     ch.reply_fs(th, iosb[1] as u64, 0);
+}
+
+/// Cygwin/MSYS2 pipe-name shapes the broker will create on
+/// the target's behalf. Two forms:
+///   `msys-<16hex>-<pid>-…` / `cygwin-<16hex>-…` —
+///     sigproc_init's signal pipe, ptys
+///   `<16hex>-<pid>-pipe-…` —
+///     fhandler_pipe::nt_create uses the bare
+///     `installation_key` (no `msys-` prefix)
+/// Single path component, ASCII alnum/-/_/. only — keeps
+/// the sandbox off well-known host names
+/// (`InitShutdown`, `lsass`, etc.) which never match.
+fn is_cygwin_pipe_leaf(leaf_lower: &str) -> bool {
+    if leaf_lower.contains('\\') { return false; }
+    if !leaf_lower.bytes().all(|b|
+        b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+    { return false; }
+    if leaf_lower.starts_with("msys-") || leaf_lower.starts_with("cygwin-") {
+        return true;
+    }
+    // bare installation_key: 16 hex chars then `-`
+    let bytes = leaf_lower.as_bytes();
+    bytes.len() > 17
+        && bytes[16] == b'-'
+        && bytes[..16].iter().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Strip a global/session/BNOLINKS named-object prefix and
