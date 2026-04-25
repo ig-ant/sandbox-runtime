@@ -64,6 +64,20 @@ impl FsPolicy {
             ) {
                 return Decision::Allow;
             }
+            // Cygwin/MSYS2 signal & pty pipes: the server end
+            // is broker-created in handle_named_pipe (so the
+            // pipe's DACL is the broker's default, which the
+            // lowbox token can't open). Broker the client-end
+            // NtCreateFile too. Allowlisted to the same shapes
+            // as handle_named_pipe so the sandbox can't reach
+            // arbitrary host pipes via the broker.
+            if let Some(p) = rest.strip_prefix("pipe\\") {
+                if (p.starts_with("msys-") || p.starts_with("cygwin-"))
+                    && !p.contains('\\')
+                {
+                    return Decision::Allow;
+                }
+            }
         }
         // `\Device\*`: under USER_LOCKDOWN passthrough fails
         // (NULL restricting blocks the open), so the broker
