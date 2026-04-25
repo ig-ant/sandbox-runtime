@@ -64,8 +64,15 @@ fn stub_env(a: &StubAddrs) -> Result<StubEnv> {
 pub fn install_fs(target: HANDLE, a: &StubAddrs) -> Result<()> {
     let env = stub_env(a)?;
     for (name, op, n_args) in [
-        ("NtCreateFile", crate::ipc::OP_NTCREATEFILE, 11usize),
-        ("NtOpenFile",   crate::ipc::OP_NTOPENFILE,    6usize),
+        ("NtCreateFile",          crate::ipc::OP_NTCREATEFILE,      11usize),
+        ("NtOpenFile",            crate::ipc::OP_NTOPENFILE,         6usize),
+        // Cygwin's signal pipe (`\\.\pipe\msys-<hash>-<pid>-
+        // sigwait`) — lowbox denies create on the global pipe
+        // namespace for some SD shapes; broker it. 14 args
+        // but Wire holds 12 — broker passes 0/NULL for
+        // OutboundQuota/DefaultTimeout, which are Cygwin's
+        // values anyway.
+        ("NtCreateNamedPipeFile", crate::ipc::OP_NTCREATENAMEDPIPE, 12usize),
     ] {
         let va = ntdll_export(name)?;
         let mut orig = [0u8; 32];

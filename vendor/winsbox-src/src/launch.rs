@@ -539,6 +539,8 @@ fn serve_ipc(ch: ipc::Channel, target_raw: isize, ctx: Arc<SpawnCtx>) {
                 handle_attr(&ch, target, &req, &ctx),
             ipc::OP_NTCREATEDIROBJ | ipc::OP_NTOPENDIROBJ =>
                 handle_dirobj(&ch, target, &req, &ctx),
+            ipc::OP_NTCREATENAMEDPIPE =>
+                handle_named_pipe(&ch, target, &req, &ctx),
             op => {
                 eprintln!("[sbox-exec] ipc: unknown op {op}");
                 ch.reply_fs(0, 0, 0xC0000002u32 as i32 /* STATUS_NOT_IMPLEMENTED */);
@@ -892,6 +894,89 @@ fn handle_dirobj(
     let th = ch.dup_to_target(h).unwrap_or(0);
     unsafe { let _ = CloseHandle(h); }
     ch.reply_fs(th, 0, 0);
+}
+
+/// `NtCreateNamedPipeFile`: same args[0..3] shape as
+/// `NtCreateFile` (PHANDLE/Access/POA/PIOSB) so
+/// `emit_fs_stub`'s Phase C works. 14 args; Wire holds 12 —
+/// args[12]=OutboundQuota and args[13]=DefaultTimeout
+/// default to 0/NULL (Cygwin passes those anyway). Lowbox
+/// denies create on the global `\Device\NamedPipe`
+/// namespace under some SD shapes (Cygwin's signal pipe
+/// hits this with `sec_all_nih`); the broker re-issues
+/// under its own token. The pipe name is per-PID
+/// (`msys-<hash>-<pid>-sigwait`) so an unsandboxed MSYS2
+/// won't connect to it.
+fn handle_named_pipe(
+    ch: &ipc::Channel, target: HANDLE, req: &ipc::Wire, ctx: &Arc<SpawnCtx>,
+) {
+    use windows::Wdk::Foundation::OBJECT_ATTRIBUTES;
+    use windows::Win32::Foundation::{NTSTATUS, UNICODE_STRING};
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtCreateNamedPipeFile(
+            h: *mut HANDLE, access: u32, oa: *const OBJECT_ATTRIBUTES,
+            iosb: *mut [usize; 2], share: u32, disp: u32, opts: u32,
+            pipe_type: u32, read_mode: u32, completion: u32,
+            max_inst: u32, in_quota: u32, out_quota: u32,
+            timeout: *const i64,
+        ) -> NTSTATUS;
+    }
+    let path = match read_target_obj_path(target, req.args[2] as usize) {
+        Ok(p) => p,
+        Err(_) => { ch.reply_fs(0, 0, ipc::FS_PASSTHROUGH); return; }
+    };
+    // Only broker pipe paths; anything else passthrough.
+    let lower = path.to_ascii_lowercase();
+    if !lower.starts_with(r"\??\pipe\")
+        && !lower.starts_with(r"\device\namedpipe\")
+    {
+        ch.reply_fs(0, 0, ipc::FS_PASSTHROUGH);
+        return;
+    }
+    let st;
+    let mut h = HANDLE::default();
+    let mut iosb = [0usize; 2];
+    unsafe {
+        let mut wpath = wstr(&path);
+        if wpath.last() == Some(&0) { wpath.pop(); }
+        let us = UNICODE_STRING {
+            Length: (wpath.len() * 2) as u16,
+            MaximumLength: (wpath.len() * 2) as u16,
+            Buffer: PWSTR(wpath.as_mut_ptr()),
+        };
+        let oa = OBJECT_ATTRIBUTES {
+            Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: HANDLE::default(),
+            ObjectName: &us as *const _ as *mut _,
+            Attributes: 0x40,
+            SecurityDescriptor: std::ptr::null_mut(),
+            SecurityQualityOfService: std::ptr::null_mut(),
+        };
+        st = NtCreateNamedPipeFile(
+            &mut h, req.args[1] as u32, &oa, &mut iosb,
+            req.args[4] as u32,  // ShareAccess
+            req.args[5] as u32,  // CreateDisposition
+            req.args[6] as u32,  // CreateOptions
+            req.args[7] as u32,  // NamedPipeType
+            req.args[8] as u32,  // ReadMode
+            req.args[9] as u32,  // CompletionMode
+            req.args[10] as u32, // MaximumInstances
+            req.args[11] as u32, // InboundQuota
+            0,                   // OutboundQuota (Wire only holds 12)
+            std::ptr::null(),    // DefaultTimeout
+        );
+    }
+    if ctx.trace || st.0 < 0 {
+        eprintln!("[sbox-exec] pipe: {path}: {:#x}", st.0);
+    }
+    if st.0 < 0 {
+        ch.reply_fs(0, 0, st.0);
+        return;
+    }
+    let th = ch.dup_to_target(h).unwrap_or(0);
+    unsafe { let _ = CloseHandle(h); }
+    ch.reply_fs(th, iosb[1] as u64, 0);
 }
 
 /// Strip a global/session/BNOLINKS named-object prefix and
