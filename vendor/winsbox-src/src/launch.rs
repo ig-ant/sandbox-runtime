@@ -982,11 +982,18 @@ fn handle_named_pipe(
             req.args[10] as u32, // MaximumInstances
             req.args[11] as u32, // InboundQuota
             0,                   // OutboundQuota (Wire only holds 12)
-            std::ptr::null(),    // DefaultTimeout
+            // DefaultTimeout must be non-NULL or
+            // STATUS_INVALID_PARAMETER. -50ms relative
+            // (CreateNamedPipeW's NMPWAIT default).
+            &(-500_000i64),
         );
     }
     if ctx.trace || st.0 < 0 {
-        eprintln!("[sbox-exec] pipe: {path}: {:#x}", st.0);
+        eprintln!(
+            "[sbox-exec] pipe: {path}: {:#x} a4={:#x} a5={:#x} a6={:#x} a7={:#x} a8={:#x} a9={:#x} a10={:#x} a11={:#x}",
+            st.0, req.args[4], req.args[5], req.args[6], req.args[7],
+            req.args[8], req.args[9], req.args[10], req.args[11],
+        );
     }
     if st.0 < 0 {
         ch.reply_fs(0, 0, st.0);
