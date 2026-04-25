@@ -926,11 +926,29 @@ fn handle_named_pipe(
         Ok(p) => p,
         Err(_) => { ch.reply_fs(0, 0, ipc::FS_PASSTHROUGH); return; }
     };
-    // Only broker pipe paths; anything else passthrough.
+    // Only broker the Cygwin/MSYS2 pipe shapes
+    // (`msys-<hash>-<pid>-sigwait`, `cygwin-…-pty…`, etc.).
+    // Brokering arbitrary pipe names under the broker's full
+    // token would let the sandbox squat well-known names
+    // (e.g. `\\.\pipe\InitShutdown`) before the legitimate
+    // server, then `ImpersonateNamedPipeClient` whoever
+    // connects. Anything else passthroughs — if the lowbox
+    // token can create it, fine; if not, the deny is the
+    // intended boundary.
     let lower = path.to_ascii_lowercase();
-    if !lower.starts_with(r"\??\pipe\")
-        && !lower.starts_with(r"\device\namedpipe\")
-    {
+    let leaf = lower
+        .strip_prefix(r"\??\pipe\")
+        .or_else(|| lower.strip_prefix(r"\device\namedpipe\"));
+    let allowed = leaf.is_some_and(|l|
+        (l.starts_with("msys-") || l.starts_with("cygwin-"))
+        && !l.contains('\\')
+        && l.bytes().all(|b|
+            b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+    );
+    if !allowed {
+        if ctx.trace {
+            eprintln!("[sbox-exec] pipe: passthrough non-cygwin {path}");
+        }
         ch.reply_fs(0, 0, ipc::FS_PASSTHROUGH);
         return;
     }
