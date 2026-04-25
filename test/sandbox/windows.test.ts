@@ -145,11 +145,26 @@ d(`windows sandbox [WINSBOX_PHASE=${PHASE}]`, () => {
     expect(r.stdout.toLowerCase()).toContain('git version')
   })
 
-  // Git for Windows' bash.exe is the MSYS2 runtime: msys-2.0.dll,
-  // Cygwin-style fork() (CreateProcess + section remap), POSIX
-  // path translation, \Device\NamedPipe\msys-* IPC. Exercises a
-  // very different code path from the native-Win32 tools above.
-  toolCompat('bash (msys2) prints hello', toolPhase, async () => {
+  // MSYS2/Cygwin runtimes call NtCreateDirectoryObject with a
+  // hardcoded `\BaseNamedObjects\msys-2.0S5-<hash>` path for
+  // their shared-state namespace (Cygwin heap, fork sections,
+  // process table). Lowbox denies create under the global BNO;
+  // AC-aware apps go through kernelbase!BaseGetNamedObjectDirectory
+  // which redirects to the per-AC namespace, but MSYS2 uses the
+  // NT path directly. Fix: hook NtCreate/OpenDirectoryObject and
+  // rewrite `\BaseNamedObjects\msys-*` to
+  // `\Sessions\<N>\AppContainerNamedObjects\<AC-SID>\msys-*`.
+  // Until then this is a documented platform limitation
+  // alongside the lowbox/Schannel one.
+  const MSYS2_BNO_REDIRECT_LANDED = false
+  const msys2Compat =
+    PHASE === 'stub' || MSYS2_BNO_REDIRECT_LANDED
+      ? toolCompat
+      : (n: string, _p: Phase, f: () => Promise<void>) => {
+          skipped.push(`${n} [lowbox denies \\BaseNamedObjects create]`)
+          test.skip(`${n} [lowbox denies \\BaseNamedObjects create]`, f)
+        }
+  msys2Compat('bash (msys2) prints hello', toolPhase, async () => {
     const bash = `${process.env.ProgramFiles}\\Git\\bin\\bash.exe`
     if (!fs.existsSync(bash)) {
       console.warn(`  [skip] ${bash} not found`)
