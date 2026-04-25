@@ -113,27 +113,6 @@ jobs:
         if: matrix.os != 'windows'
         run: npm test
 
-      - name: P10 grandchild matrix (Windows)
-        if: matrix.os == 'windows'
-        run: |
-          cargo build --release --manifest-path vendor/winsbox-src/Cargo.toml --bin p10-grandchild
-          vendor/winsbox-src/target/release/p10-grandchild.exe
-        continue-on-error: true
-
-      - name: P11 LSA-under-lowbox capability matrix (Windows)
-        if: matrix.os == 'windows'
-        run: |
-          cargo build --release --manifest-path vendor/winsbox-src/Cargo.toml --bin p11-lsa
-          vendor/winsbox-src/target/release/p11-lsa.exe
-        continue-on-error: true
-
-      - name: P12 USER_LIMITED→USER_LOCKDOWN bisection (Windows)
-        if: matrix.os == 'windows'
-        run: |
-          cargo build --release --manifest-path vendor/winsbox-src/Cargo.toml --bin p12-lockdown
-          vendor/winsbox-src/target/release/p12-lockdown.exe
-        continue-on-error: true
-
       - name: Run tests (Windows, WINSBOX_TOKEN=lockdown)
         # Step-0 retest: now that the broker spawns every grandchild
         # itself (CreateProcessInternalW hook), does the suite pass
