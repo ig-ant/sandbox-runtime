@@ -123,7 +123,10 @@ pub fn install_reg(target: HANDLE, a: &StubAddrs) -> Result<()> {
 }
 #[cfg(not(target_arch = "x86_64"))]
 pub fn install_reg(_target: HANDLE, _a: &StubAddrs) -> Result<()> {
-    Ok(())
+    anyhow::bail!(
+        "broker interception not implemented for {}; use mode=AppContainerAcl",
+        std::env::consts::ARCH,
+    )
 }
 
 /// Patch `kernelbase!CreateProcessInternalW` in `target`. Must run

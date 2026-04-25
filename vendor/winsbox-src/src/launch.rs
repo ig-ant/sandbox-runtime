@@ -267,6 +267,21 @@ fn run_confined(pol: &Policy) -> Result<u32> {
     // gave a false green when CreateRestrictedToken rejected the
     // package SID in the restricting list.
     let tokens = if pol.mode == Mode::Broker {
+        // Fail-closed on architectures without interception
+        // thunks. The token/lowbox/Job/IL/deny-ACEs are
+        // arch-independent and would still bound the target,
+        // but `broker_fs` skips the allowRead ACL grants on the
+        // assumption the FS hooks cover them — without hooks
+        // the target can't read what it should be able to.
+        // mode=AppContainerAcl is the arch-independent
+        // fallback.
+        #[cfg(not(target_arch = "x86_64"))]
+        anyhow::bail!(
+            "mode=Broker requires interception thunks not yet implemented for {}; \
+             use mode=AppContainerAcl",
+            std::env::consts::ARCH,
+        );
+        #[allow(unreachable_code)]
         Some(build_broker_tokens(&ac).context("broker token build")?)
     } else { None };
 

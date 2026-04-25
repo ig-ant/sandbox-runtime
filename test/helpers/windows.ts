@@ -138,7 +138,7 @@ export async function runSandboxed(
       }
       // Resolve immediately on timeout regardless of pipe state.
       finish(-2)
-    }, opts.timeoutMs ?? 15_000)
+    }, opts.timeoutMs ?? 18_000)
     child.on('exit', code => finish(code ?? -1))
     child.on('error', () => finish(-3))
   })
