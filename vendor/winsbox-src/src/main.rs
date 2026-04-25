@@ -6,7 +6,6 @@ mod policy;
 #[cfg(windows)] mod desktop;
 #[cfg(windows)] mod netbridge;
 #[cfg(windows)] mod token;
-#[cfg(windows)] mod jobwatch;
 #[cfg(windows)] mod ipc;
 #[cfg(windows)] mod interception;
 #[cfg(windows)] mod entry_trampoline;
