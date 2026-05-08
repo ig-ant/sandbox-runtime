@@ -108,22 +108,78 @@ pub fn install_cpw(
     Ok(())
 }
 
-// ─── Patch primitive ───────────────────────────────────────────────
+// ─── Patch primitive + ABS_JMP template (Phase I) ─────────────────
+//
+// Phase I rationale (mirrors interception_x64.rs): the patched-in
+// 16-byte sequence used to be hand-encoded as four little-endian u32s
+// of opcode bits, hiding the actual instructions. We now emit the
+// instructions via `global_asm!` and copy from the resulting template,
+// patching the embedded literal at install time.
+//
+// The shape is the standard ARM64 "absolute jump via literal":
+//   LDR X16, target_literal   — load the 8-byte target VA into X16
+//   BR  X16                   — branch (no link) to the address in X16
+//   target_literal:
+//     .quad 0xCC..CC          — the literal, patched at install time
+//
+// All ARM64 instructions are 4-byte fixed-width and position-
+// independent (PC-relative literal load + register-indirect branch),
+// so the template is freely relocatable: we copy it to any VA in the
+// remote process and it still works. The runtime byte-patch step
+// fills in the .quad with the actual hook target.
+
+core::arch::global_asm!(
+    ".section .text",
+    ".p2align 4",
+    ".global abs_jmp_template_arm64_start",
+    ".global abs_jmp_template_arm64_end",
+    "abs_jmp_template_arm64_start:",
+    "    ldr x16, abs_jmp_template_arm64_literal",
+    "    br  x16",
+    "abs_jmp_template_arm64_literal:",
+    "    .quad 0xCCCCCCCCCCCCCCCC", // patched at install time
+    "abs_jmp_template_arm64_end:",
+);
+
+extern "C" {
+    static abs_jmp_template_arm64_start: u8;
+    static abs_jmp_template_arm64_end: u8;
+}
 
 pub const ABS_JMP_LEN: usize = 16;
 
+/// Offset of the embedded literal inside the template:
+///   bytes 0..4:  LDR X16, target_literal  (PC+8 in this layout)
+///   bytes 4..8:  BR X16
+///   bytes 8..16: .quad <target VA>        (← patched here)
+const ABS_JMP_LITERAL_OFFSET: usize = 8;
+
 /// Encode the ARM64 16-byte absolute-jump:
-///   00: 50 00 00 58   LDR  X16, .+8
-///   04: 00 02 1F D6   BR   X16
-///   08: <target-VA[31:0]>
-///   0C: <target-VA[63:32]>
+///   00: LDR X16, .+8       (PC-relative literal load)
+///   04: BR  X16             (branch to address in X16)
+///   08..10: <target VA, little-endian>
+///
+/// Returns a fixed-size array because every caller writes exactly
+/// `ABS_JMP_LEN` bytes; no NOP-padding pass is needed.
 pub fn enc_abs_jmp(target: usize) -> [u8; ABS_JMP_LEN] {
+    // SAFETY: `abs_jmp_template_arm64_{start,end}` are linker-visible
+    // labels emitted by the global_asm! block above. We only read
+    // their byte representation here.
+    let (start, end) = unsafe {
+        (
+            &abs_jmp_template_arm64_start as *const u8,
+            &abs_jmp_template_arm64_end as *const u8,
+        )
+    };
+    let len = unsafe { end.offset_from(start) as usize };
+    debug_assert_eq!(
+        len, ABS_JMP_LEN,
+        "abs_jmp template length drift: expected {ABS_JMP_LEN} got {len}"
+    );
     let mut out = [0u8; ABS_JMP_LEN];
-    // LDR X16, [PC, #8] — opcode 0x58000050 (little-endian)
-    out[0..4].copy_from_slice(&0x58000050u32.to_le_bytes());
-    // BR X16 — opcode 0xD61F0200 (little-endian)
-    out[4..8].copy_from_slice(&0xD61F0200u32.to_le_bytes());
-    out[8..16].copy_from_slice(&(target as u64).to_le_bytes());
+    out.copy_from_slice(unsafe { core::slice::from_raw_parts(start, ABS_JMP_LEN) });
+    out[ABS_JMP_LITERAL_OFFSET..ABS_JMP_LITERAL_OFFSET + 8]
+        .copy_from_slice(&(target as u64).to_le_bytes());
     out
 }
 
@@ -132,4 +188,41 @@ fn patch_with_abs_jmp(target: HANDLE, name: &str, va: usize, dest: usize) -> Res
     write_remote_bytes(target, va, &patch)?;
     eprintln!("[sbox-exec] interception(arm64): {name} @ {va:#x} → cdylib @ {dest:#x}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Round-trip: the encoded sequence must match the reference
+    /// little-endian opcodes for `LDR X16, .+8` (`0x58000050`) and
+    /// `BR X16` (`0xD61F0200`), with the target VA at offset 8.
+    #[test]
+    fn enc_abs_jmp_round_trip() {
+        let target: usize = 0x1234_5678_9ABC_DEF0;
+        let bytes = enc_abs_jmp(target);
+        assert_eq!(bytes.len(), ABS_JMP_LEN);
+        // LDR X16, [PC, #8]
+        assert_eq!(&bytes[0..4], &0x58000050u32.to_le_bytes());
+        // BR X16
+        assert_eq!(&bytes[4..8], &0xD61F0200u32.to_le_bytes());
+        // Embedded literal target VA
+        assert_eq!(&bytes[8..16], &(target as u64).to_le_bytes());
+    }
+
+    /// Template length must match the install-time patch slot.
+    /// `patch_with_abs_jmp` writes exactly `ABS_JMP_LEN` bytes;
+    /// any toolchain drift here would either overrun or under-run
+    /// the remote write.
+    #[test]
+    fn abs_jmp_template_len_matches_constant() {
+        let (start, end) = unsafe {
+            (
+                &abs_jmp_template_arm64_start as *const u8,
+                &abs_jmp_template_arm64_end as *const u8,
+            )
+        };
+        let len = unsafe { end.offset_from(start) as usize };
+        assert_eq!(len, ABS_JMP_LEN);
+    }
 }

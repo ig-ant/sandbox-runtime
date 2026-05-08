@@ -117,11 +117,107 @@ fn patch_with_abs_jmp(target: HANDLE, name: &str, va: usize, dest: usize) -> Res
     Ok(())
 }
 
+// ─── ABS_JMP template (Phase I) ────────────────────────────────────
+//
+// Phase I rationale: the patched-in 12-byte sequence used to be
+// hand-encoded as `Vec::extend_from_slice(&[0x48, 0xB8, …, 0xFF, 0xE0])`,
+// which hides the actual instructions behind their opcode bytes. Per
+// the user's standing directive, any assembly we emit should live in
+// `asm!` / `global_asm!` form so the toolchain checks it semantically.
+//
+// We declare a `global_asm!` template containing the exact two
+// instructions we want patched in (`movabs rax, imm64; jmp rax`) and
+// expose its start/end as `extern "C"` symbols. `enc_abs_jmp` then:
+//   1. Computes the template length from `end - start` (asserted
+//      against `ABS_JMP_LEN` to catch toolchain drift).
+//   2. Copies the template bytes verbatim.
+//   3. Patches the imm64 at the known offset (after the REX.W + opcode
+//      prefix = 2 bytes).
+//
+// The runtime byte-patch step is unavoidable: we are constructing
+// code for *another* process at a target VA we won't know until
+// installation time. The win is that the source for the instruction
+// shape now reads as assembly, not as hex.
+
+core::arch::global_asm!(
+    ".section .text",
+    ".p2align 4",
+    ".global abs_jmp_template_x64_start",
+    ".global abs_jmp_template_x64_end",
+    "abs_jmp_template_x64_start:",
+    "    movabs rax, 0xCCCCCCCCCCCCCCCC", // imm64 patched at install time
+    "    jmp rax",
+    "abs_jmp_template_x64_end:",
+);
+
+extern "C" {
+    static abs_jmp_template_x64_start: u8;
+    static abs_jmp_template_x64_end: u8;
+}
+
 const ABS_JMP_LEN: usize = 12;
+
+/// Offset of the imm64 inside the template:
+///   byte 0: 0x48  (REX.W)
+///   byte 1: 0xB8  (`mov rax, imm64` opcode)
+///   bytes 2..10: imm64 (little-endian)
+///   bytes 10..12: 0xFF 0xE0 (`jmp rax`)
+const ABS_JMP_IMM_OFFSET: usize = 2;
+
 fn enc_abs_jmp(target: usize) -> Vec<u8> {
-    let mut s = Vec::with_capacity(12);
-    s.extend_from_slice(&[0x48, 0xB8]);
-    s.extend_from_slice(&(target as u64).to_le_bytes());
-    s.extend_from_slice(&[0xFF, 0xE0]);
-    s
+    // SAFETY: `abs_jmp_template_x64_{start,end}` are linker-visible
+    // labels emitted by the global_asm! block above. They live in the
+    // `.text` section of *this* binary; we never execute through them
+    // here — we just read them as bytes to copy into the remote process.
+    let (start, end) = unsafe {
+        (
+            &abs_jmp_template_x64_start as *const u8,
+            &abs_jmp_template_x64_end as *const u8,
+        )
+    };
+    let len = unsafe { end.offset_from(start) as usize };
+    debug_assert_eq!(
+        len, ABS_JMP_LEN,
+        "abs_jmp template length drift: expected {ABS_JMP_LEN} got {len}"
+    );
+    let mut v = unsafe { core::slice::from_raw_parts(start, len) }.to_vec();
+    v[ABS_JMP_IMM_OFFSET..ABS_JMP_IMM_OFFSET + 8]
+        .copy_from_slice(&(target as u64).to_le_bytes());
+    v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Round-trip: `enc_abs_jmp(target)` should produce a 12-byte
+    /// sequence whose bytes match the reference encoding
+    /// `48 B8 <target_le8> FF E0`. This catches toolchain drift in
+    /// either the template emission *or* the imm-patch offset.
+    #[test]
+    fn enc_abs_jmp_round_trip() {
+        let target: usize = 0x1234_5678_9ABC_DEF0;
+        let bytes = enc_abs_jmp(target);
+        assert_eq!(bytes.len(), ABS_JMP_LEN);
+        assert_eq!(&bytes[0..2], &[0x48, 0xB8]);
+        assert_eq!(&bytes[2..10], &(target as u64).to_le_bytes());
+        assert_eq!(&bytes[10..12], &[0xFF, 0xE0]);
+    }
+
+    /// Template length must match the install-time patch slot.
+    /// Several broker call sites assume exactly 12 bytes are written
+    /// (`patch_with_abs_jmp` pads up to `ABS_JMP_LEN` with NOPs); the
+    /// passthrough thunk likewise snapshots 32 bytes specifically
+    /// because the patch will only overwrite the first 12.
+    #[test]
+    fn abs_jmp_template_len_matches_constant() {
+        let (start, end) = unsafe {
+            (
+                &abs_jmp_template_x64_start as *const u8,
+                &abs_jmp_template_x64_end as *const u8,
+            )
+        };
+        let len = unsafe { end.offset_from(start) as usize };
+        assert_eq!(len, ABS_JMP_LEN);
+    }
 }
