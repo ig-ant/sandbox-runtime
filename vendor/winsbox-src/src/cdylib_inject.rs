@@ -204,6 +204,44 @@ impl CdylibSession {
         }
         Ok(r)
     }
+
+    /// Broker-side wake event. Used by callers that orchestrate the
+    /// entry-trampoline rendezvous themselves (Phase D) — they need
+    /// to wait on this event after dispatching the LoadLibraryW
+    /// remote thread, separately from `trigger`'s integrated wait.
+    pub fn wake_event(&self) -> HANDLE { self.event }
+
+    /// In-target VA of the staged dll-path string. Used as the arg
+    /// to `LoadLibraryW` when the caller dispatches its own remote
+    /// thread.
+    pub fn dll_path_va(&self) -> *mut c_void { self.dll_path_va }
+}
+
+/// Phase-D helper: dispatch a `LoadLibraryW(dll_path_va)` remote
+/// thread in `target` and return the thread handle. Used by the
+/// integrated cdylib injection path that orchestrates entry-trampoline
+/// rendezvous + cdylib load + hook install in one synchronous flow.
+///
+/// Caller is responsible for waiting on `session.wake_event()` and
+/// closing the returned thread handle.
+pub fn dispatch_load_library(
+    session: &CdylibSession, target: HANDLE,
+) -> Result<HANDLE> {
+    unsafe {
+        let load_library_w = {
+            let m = GetModuleHandleW(PCWSTR(wstr("kernel32.dll").as_ptr()))
+                .context("GetModuleHandleW(kernel32)")?;
+            GetProcAddress(m, PCSTR(b"LoadLibraryW\0".as_ptr()))
+                .ok_or_else(|| anyhow!("GetProcAddress(LoadLibraryW)"))?
+        };
+        let start: LPTHREAD_START_ROUTINE =
+            Some(std::mem::transmute(load_library_w));
+        let th = CreateRemoteThread(
+            target, None, 0, start,
+            Some(session.dll_path_va), 0, None,
+        ).context("CreateRemoteThread(LoadLibraryW)")?;
+        Ok(th)
+    }
 }
 
 /// Build the env-var entry the caller must include in the env block
@@ -511,6 +549,122 @@ pub fn trigger_async(
         drop(session);
         res
     })
+}
+
+/// Phase-D: walk the target's PEB→Ldr→InLoadOrderModuleList to find
+/// the base address of a module by case-insensitive base-name match
+/// (e.g. `"ac_cdylib.dll"`). Returns `Err` if the module isn't loaded
+/// (caller should retry — DllMain may not have signalled the wake
+/// event before the module table is updated).
+///
+/// Layout (x64): each `LDR_DATA_TABLE_ENTRY` starts with two
+/// `LIST_ENTRY` links (`InLoadOrderLinks` at +0x00,
+/// `InMemoryOrderLinks` at +0x10). `DllBase` is at +0x30,
+/// `BaseDllName` (UNICODE_STRING) is at +0x58. The Ldr's
+/// `InLoadOrderModuleList` head is at `PEB_LDR_DATA + 0x10`. PEB+0x18
+/// holds the `PEB_LDR_DATA*`.
+pub fn find_target_module_base(target: HANDLE, name: &str) -> Result<usize> {
+    use windows::Wdk::System::Threading::{NtQueryInformationProcess, PROCESSINFOCLASS};
+    use windows::Win32::System::Threading::PROCESS_BASIC_INFORMATION;
+    unsafe {
+        let mut pbi: PROCESS_BASIC_INFORMATION = zeroed();
+        let mut ret = 0u32;
+        let st = NtQueryInformationProcess(
+            target,
+            PROCESSINFOCLASS(0),
+            &mut pbi as *mut _ as *mut c_void,
+            size_of::<PROCESS_BASIC_INFORMATION>() as u32,
+            &mut ret,
+        );
+        if st.0 < 0 {
+            bail!("NtQueryInformationProcess: {:#x}", st.0);
+        }
+        let peb = pbi.PebBaseAddress as usize;
+
+        let read_usize = |va: usize| -> Result<usize> {
+            let mut v: usize = 0;
+            let mut n = 0usize;
+            ReadProcessMemory(
+                target, va as *const c_void,
+                &mut v as *mut _ as *mut c_void, size_of::<usize>(), Some(&mut n),
+            ).with_context(|| format!("ReadProcessMemory(usize) @ {va:#x}"))?;
+            Ok(v)
+        };
+
+        let ldr = read_usize(peb + 0x18)?;
+        let head = ldr + 0x10; // InLoadOrderModuleList LIST_ENTRY head
+        let want = name.to_ascii_lowercase();
+
+        let mut node = read_usize(head)?; // first Flink
+        let mut steps = 0usize;
+        while node != head && steps < 1024 {
+            // `node` points at the LIST_ENTRY embedded at offset 0 of
+            // the LDR_DATA_TABLE_ENTRY (InLoadOrderLinks).
+            let entry = node;
+            // DllBase @ entry + 0x30
+            let dll_base = read_usize(entry + 0x30)?;
+            // BaseDllName UNICODE_STRING @ entry + 0x58 (Length: u16 @ +0,
+            // MaximumLength: u16 @ +2, _pad: u32 @ +4, Buffer: usize @ +8).
+            let mut len_buf = [0u8; 2];
+            let mut n = 0usize;
+            ReadProcessMemory(
+                target, (entry + 0x58) as *const c_void,
+                len_buf.as_mut_ptr() as *mut c_void, 2, Some(&mut n),
+            ).context("read BaseDllName.Length")?;
+            let bname_len = u16::from_le_bytes(len_buf) as usize;
+            let bname_buf = read_usize(entry + 0x58 + 8)?;
+            if bname_len > 0 && bname_len <= 1024 && bname_buf != 0 {
+                let mut wbuf = vec![0u16; bname_len / 2];
+                ReadProcessMemory(
+                    target, bname_buf as *const c_void,
+                    wbuf.as_mut_ptr() as *mut c_void, bname_len, Some(&mut n),
+                ).context("read BaseDllName.Buffer")?;
+                let s = String::from_utf16_lossy(&wbuf).to_ascii_lowercase();
+                if s == want {
+                    return Ok(dll_base);
+                }
+            }
+            node = read_usize(entry)?; // Flink
+            steps += 1;
+        }
+        bail!("module {name:?} not found in target Ldr (walked {steps} entries)");
+    }
+}
+
+/// Compute the in-target VA of an export symbol given the broker-side
+/// loaded module. Loads the cdylib in-broker (idempotent — same path
+/// returns the same HMODULE), uses `GetProcAddress` to resolve the
+/// export's broker VA, computes its RVA against the broker-side base,
+/// and adds the target-side base. Robust against per-process ASLR.
+///
+/// `dll_path` is passed to `LoadLibraryExW(LOAD_LIBRARY_AS_DATAFILE)`
+/// so the cdylib's `DllMain` doesn't run in the broker — we only need
+/// its export table.
+///
+/// Actually `LOAD_LIBRARY_AS_DATAFILE` skips relocations *and* exports
+/// (loader doesn't process the export directory), so plain
+/// `LoadLibraryW` is the right call. The broker is a small short-lived
+/// process; the extra DllMain run there is harmless because the cdylib
+/// reads `AC_CDYLIB_BUFFER` from the env, which the broker hasn't set
+/// — the cdylib's `run_attach` early-returns and IPC fields stay
+/// zeroed, which is the correct behaviour for the broker.
+pub fn resolve_target_export(
+    _target: HANDLE, dll_path: &Path, target_module_base: usize, export_name: &str,
+) -> Result<usize> {
+    unsafe {
+        let path_w = wstr(&dll_path.to_string_lossy());
+        let m = windows::Win32::System::LibraryLoader::LoadLibraryW(PCWSTR(path_w.as_ptr()))
+            .with_context(|| format!("LoadLibraryW({})", dll_path.display()))?;
+        let cname = std::ffi::CString::new(export_name)
+            .map_err(|e| anyhow!("CString({export_name}): {e}"))?;
+        let p = GetProcAddress(m, PCSTR(cname.as_ptr() as *const u8))
+            .ok_or_else(|| anyhow!("GetProcAddress({export_name})"))?;
+        let broker_va = p as usize;
+        let broker_base = m.0 as usize;
+        let rva = broker_va.checked_sub(broker_base)
+            .ok_or_else(|| anyhow!("export {export_name} below broker base"))?;
+        Ok(target_module_base + rva)
+    }
 }
 
 // ─── helpers ───────────────────────────────────────────────────────

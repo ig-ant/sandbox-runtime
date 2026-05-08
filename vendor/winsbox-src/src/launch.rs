@@ -104,11 +104,12 @@ struct SpawnCtx {
 unsafe impl Send for SpawnCtx {}
 unsafe impl Sync for SpawnCtx {}
 
-pub fn run(pol: &Policy) -> Result<u32> {
-    match pol.mode {
-        Mode::Stub => run_stub(pol),
-        Mode::AppContainer | Mode::Broker => run_confined(pol),
-    }
+pub fn run(pol: &Policy, manifest_dir: &std::path::Path) -> Result<u32> {
+    // Phase D-3: the policy schema no longer carries a mode field.
+    // Default = AppContainer + cdylib + ACL stamps. `WINSBOX_LEGACY_BROKER=1`
+    // selects the pre-D inline-asm-stub broker path during the
+    // staged rollback (removed in D-4 once cdylib-mode bash works).
+    run_confined(pol, manifest_dir)
 }
 
 fn build_env_block(extra: &[(String, String)]) -> Vec<u16> {
@@ -125,28 +126,9 @@ fn build_env_block(extra: &[(String, String)]) -> Vec<u16> {
     out
 }
 
-fn run_stub(pol: &Policy) -> Result<u32> {
-    unsafe {
-        let mut cmd = wstr(&pol.command_line);
-        let cwd_w = pol.cwd.as_deref().map(wstr);
-        let cwd = cwd_w.as_ref().map(|w| pcwstr(w)).unwrap_or(PCWSTR::null());
-        let mut env = build_env_block(&pol.env);
-        let mut si: STARTUPINFOW = zeroed();
-        si.cb = size_of::<STARTUPINFOW>() as u32;
-        let mut pi: PROCESS_INFORMATION = zeroed();
-        CreateProcessW(
-            None, PWSTR(cmd.as_mut_ptr()), None, None, true,
-            CREATE_UNICODE_ENVIRONMENT, Some(env.as_mut_ptr() as *mut c_void),
-            cwd, &si, &mut pi,
-        ).with_context(|| format!("CreateProcessW({})", pol.command_line))?;
-        WaitForSingleObject(pi.hProcess, INFINITE);
-        let mut code = 0u32;
-        GetExitCodeProcess(pi.hProcess, &mut code)?;
-        let _ = CloseHandle(pi.hThread);
-        let _ = CloseHandle(pi.hProcess);
-        Ok(code)
-    }
-}
+// Phase D-3: `run_stub` (no AC, no broker, just CreateProcessW) was
+// removed; every run path goes through `run_confined`. Callers wanting
+// a true no-sandbox run can shell out directly.
 
 macro_rules! log { ($($a:tt)*) => { eprintln!("[sbox-exec] {}", format!($($a)*)) } }
 
@@ -183,10 +165,45 @@ fn build_broker_tokens(ac: &AppContainer) -> Result<BrokerTokens> {
     Ok(BrokerTokens { primary, initial, ac_bno_path, _bno_handles: bno_handles })
 }
 
-fn run_confined(pol: &Policy) -> Result<u32> {
-    log!("mode={:?}", pol.mode);
+fn run_confined(pol: &Policy, manifest_dir: &std::path::Path) -> Result<u32> {
+    let mode = Mode::from_env();
+    log!("mode={:?} (legacy_broker={})",
+         mode, mode == Mode::Broker);
     let ac = AppContainer::create("ac")?;
     log!("AppContainer sid={} folder={}", ac.sid_string, ac.folder.display());
+
+    // ── Phase D-2: ACL stamping. Build a PolicyStamp from the policy's
+    //    allow_*/deny_* fields, hash it against the on-disk manifest,
+    //    skip if unchanged, otherwise apply + save. Skipped under
+    //    legacy-broker mode: that path keeps the inline-asm IPC stubs
+    //    + AclJournal grants for backward compatibility while the
+    //    cdylib path's bash workload is being verified (D-4 deletes
+    //    the legacy path).
+    //
+    //    The stamp targets the per-instance AC SID. With the current
+    //    AppContainer naming (process-id-suffixed) the SID changes
+    //    every run, so the manifest hash will mismatch and we always
+    //    re-stamp. Stable AC SIDs are a follow-up; the wiring below
+    //    is correct shape and becomes a real fast path once the SID
+    //    stops being per-instance.
+    //
+    //    On exit the stamp is reverted (Drop on `stamp_holder`),
+    //    matching the existing AclJournal lifecycle. The plan calls
+    //    out that revert is "only on full uninstall, not per-session";
+    //    that aligns with stable-SID stamping. Until then per-session
+    //    revert is the safe default — leaving stamps from a deleted
+    //    AC profile around would be lint.
+    let stamp_holder = if mode == Mode::Broker {
+        None
+    } else {
+        match maybe_apply_stamps(pol, &ac, manifest_dir) {
+            Ok(holder) => Some(holder),
+            Err(e) => {
+                log!("stamp apply failed ({e:#}); continuing without policy stamps");
+                None
+            }
+        }
+    };
     let job = Job::new()?;
     log!("Job created");
     let desktop = if pol.use_alternate_desktop
@@ -208,65 +225,48 @@ fn run_confined(pol: &Policy) -> Result<u32> {
         }
     }
 
-    // Filesystem policy → ACEs (Phase-1 mechanism). When the FS
-    // broker is active:
-    //  - allowRead grants are skipped — the broker opens read
-    //    paths under its own token, and reads always go via
-    //    NtCreateFile/NtOpenFile (hooked).
-    //  - allowWrite still gets the AC-SID grant: libuv issues
-    //    RootDirectory-relative writes that the broker can't
-    //    path-resolve and passes through; without the on-disk
-    //    ACE the target's lowbox token can't complete those
-    //    (npm cacache copyfile, 460f267). The RESTRICTED grant
-    //    is dropped — the broker covers the restricting check
-    //    and the persistent S-1-5-12 ACE was undesirable
-    //    anyway. Halves the icacls count.
-    //  - denyRead/denyWrite stay regardless: under
-    //    USER_LIMITED a raw NtCreateFile bypassing the hook
-    //    would otherwise succeed via the enabled `Users`
-    //    group, so the on-disk ACE is the security boundary.
-    const RESTRICTED_SID: &str = "S-1-5-12";
-    let ac_sid = ac.sid_string.clone();
-    let both = [ac_sid.as_str(), RESTRICTED_SID];
-    let grant_sids: &[&str] = if pol.broker_fs { &both[..1] } else { &both };
-    let mut acl_op = |op: &str, p: &str, perm: &str, deny: bool, sids: &[&str]| {
-        for sid in sids {
-            let r = if deny { acls.deny(p, sid, perm) }
-                    else    { acls.grant(p, sid, perm) };
-            if let Err(e) = r { log!("ACL {op} {p} ({sid}): {e:#}"); }
+    // Phase D-3: legacy AclJournal allow/deny grants only fire under
+    // the staged-rollback Mode::Broker path. The default AppContainer
+    // path uses Phase D-2's PolicyStamp (above) for read/write/deny
+    // policy. The legacy_broker path keeps the icacls behaviour intact
+    // while bash workloads are being verified end-to-end on cdylib.
+    if mode == Mode::Broker {
+        const RESTRICTED_SID: &str = "S-1-5-12";
+        let ac_sid = ac.sid_string.clone();
+        let both = [ac_sid.as_str(), RESTRICTED_SID];
+        // legacy: broker_fs implied, allowRead handled by FS hooks.
+        let grant_sids: &[&str] = &both[..1];
+        let mut acl_op = |op: &str, p: &str, perm: &str, deny: bool, sids: &[&str]| {
+            for sid in sids {
+                let r = if deny { acls.deny(p, sid, perm) }
+                        else    { acls.grant(p, sid, perm) };
+                if let Err(e) = r { log!("ACL {op} {p} ({sid}): {e:#}"); }
+            }
+        };
+        for p in &pol.allow_write {
+            let leaf = std::path::Path::new(p).file_name()
+                .map(|f| f.to_string_lossy().to_ascii_uppercase()).unwrap_or_default();
+            if matches!(leaf.as_str(), "NUL" | "CON" | "PRN" | "AUX") { continue; }
+            std::fs::create_dir_all(p).ok();
+            acl_op("allow-write", p, MODIFY, false, grant_sids);
         }
-    };
-    if !pol.broker_fs {
-        for p in &pol.allow_read {
+        for p in &pol.deny_write {
             if std::path::Path::new(p).exists() {
-                acl_op("allow-read", p, READ_EXECUTE, false, grant_sids);
+                acl_op("deny-write", p, MODIFY, true, &both);
             }
         }
-    }
-    for p in &pol.allow_write {
-        let leaf = std::path::Path::new(p).file_name()
-            .map(|f| f.to_string_lossy().to_ascii_uppercase()).unwrap_or_default();
-        if matches!(leaf.as_str(), "NUL" | "CON" | "PRN" | "AUX") { continue; }
-        std::fs::create_dir_all(p).ok();
-        acl_op("allow-write", p, MODIFY, false, grant_sids);
-    }
-    for p in &pol.deny_write {
-        if std::path::Path::new(p).exists() {
-            acl_op("deny-write", p, MODIFY, true, &both);
+        for p in &pol.deny_read {
+            if std::path::Path::new(p).exists() {
+                acl_op("deny-read", p, FULL, true, &both);
+                log!("icacls {p}:\n{}", crate::acl::dump(p).trim_end());
+            }
         }
+        log!(
+            "ACLs (legacy-broker): allow-write {} deny {}",
+            pol.allow_write.len(),
+            pol.deny_read.len() + pol.deny_write.len(),
+        );
     }
-    for p in &pol.deny_read {
-        if std::path::Path::new(p).exists() {
-            acl_op("deny-read", p, FULL, true, &both);
-            log!("icacls {p}:\n{}", crate::acl::dump(p).trim_end());
-        }
-    }
-    log!(
-        "ACLs: {} allow-grants {} {} denies",
-        if pol.broker_fs { "skipped (broker_fs)," } else { "applied," },
-        pol.allow_read.len() + pol.allow_write.len(),
-        pol.deny_read.len() + pol.deny_write.len(),
-    );
 
     // Network bridge: only if the policy carries proxy ports. Failures
     // here are logged but non-fatal — the AC simply has no network,
@@ -296,23 +296,16 @@ fn run_confined(pol: &Policy) -> Result<u32> {
         log!("no proxy ports in policy; skipping bridge");
     }
 
-    // Mode::Broker layers a restricted lowbox token on top. Hard
-    // error on failure — silently degrading to AppContainer-only
-    // gave a false green when CreateRestrictedToken rejected the
-    // package SID in the restricting list.
-    let tokens = if pol.mode == Mode::Broker {
-        // Fail-closed on architectures without interception
-        // thunks. The token/lowbox/Job/IL/deny-ACEs are
-        // arch-independent and would still bound the target,
-        // but `broker_fs` skips the allowRead ACL grants on the
-        // assumption the FS hooks cover them — without hooks
-        // the target can't read what it should be able to.
-        // mode=AppContainerAcl is the arch-independent
-        // fallback.
+    // Phase D-3: legacy-broker mode layers a restricted lowbox token
+    // on top. Hard error on failure — silently degrading to
+    // AppContainer-only gave a false green when CreateRestrictedToken
+    // rejected the package SID in the restricting list. Removed in D-4
+    // once the cdylib path's bash workload is verified.
+    let tokens = if mode == Mode::Broker {
         #[cfg(not(target_arch = "x86_64"))]
         anyhow::bail!(
-            "mode=Broker requires interception thunks not yet implemented for {}; \
-             use mode=AppContainerAcl",
+            "WINSBOX_LEGACY_BROKER=1 requires x86_64 interception thunks; \
+             unset WINSBOX_LEGACY_BROKER to use the cdylib path on {}",
             std::env::consts::ARCH,
         );
         #[allow(unreachable_code)]
@@ -358,29 +351,34 @@ fn run_confined(pol: &Policy) -> Result<u32> {
     }
 
     log!("launching target (cwd={}): {}", target_cwd, pol.command_line);
-    // For cdylib injection we need to control the resume manually
-    // so prepare() (env patch + buffer write) runs while the target
-    // is still suspended. The legacy AC path resumes inside
-    // spawn_in_ac (resume=true).
+    // Both cdylib mode and Mode::Broker manage resume manually; only
+    // the bare AppContainer (Mode::AppContainer + no cdylib) lets
+    // spawn_in_ac resume the target itself.
     let resume_in_spawn = tokens.is_none() && !cdylib_active;
     let pi = spawn_in_ac(&ac, &job, desktop.as_ref(), tokens.as_ref(),
                          &pol.command_line, Some(&target_cwd), &extra_env,
                          /*resume=*/ resume_in_spawn)?;
     log!("target pid={}", pi.dwProcessId);
 
-    // Cdylib injection: stamp + prepare while still suspended,
-    // then resume + trigger_async. Failures here are non-fatal —
-    // the target launches normally; we just don't have the cdylib
-    // loaded (matches the policy-opt-in contract).
-    let mut cdylib_join: Option<std::thread::JoinHandle<Result<cdylib_inject::CdylibReport>>>
-        = None;
-    let mut cdylib_stamp: Option<(PolicyStamp, windows::Win32::Security::PSID)> = None;
+    // Cdylib injection: full Phase-D pipeline — stamp, IPC channel,
+    // BNO precreate, entry-trampoline rendezvous, LoadLibraryW,
+    // resolve cdylib hook entries, install the 5 compat hooks via
+    // slim dispatchers, spawn serve_ipc. On any failure the target
+    // continues without the cdylib (workloads that need it segfault
+    // in DLL_PROCESS_ATTACH per P13 — but that's a clean failure).
+    let mut cdylib_inj: Option<CdylibInjection> = None;
+    let mut cdylib_ctx: Option<Arc<SpawnCtx>> = None;
+    let mut cdylib_stop: Option<Arc<AtomicBool>> = None;
     if cdylib_active {
         let dll_path = cdylib_request.as_ref().unwrap();
-        match try_inject_cdylib(&ac, dll_path, pi.hProcess, pi.hThread) {
-            Ok((stamp, sid_owned, join)) => {
-                cdylib_stamp = Some((stamp, sid_owned));
-                cdylib_join = Some(join);
+        match try_inject_cdylib_full(
+            &ac, dll_path, pi.hProcess, pi.hThread,
+            &job, &target_cwd, &extra_env, pol,
+        ) {
+            Ok((inj, ctx, stop)) => {
+                cdylib_inj = Some(inj);
+                cdylib_ctx = Some(ctx);
+                cdylib_stop = Some(stop);
             }
             Err(e) => {
                 log!("cdylib injection setup failed ({e:#}); resuming target without cdylib");
@@ -396,7 +394,7 @@ fn run_confined(pol: &Policy) -> Result<u32> {
     // immediate target (so the loader survives), recursively
     // installs the hook in the grandchild, and DuplicateHandle's
     // the result back. One service thread per channel.
-    let stop = Arc::new(AtomicBool::new(false));
+    let stop_broker = Arc::new(AtomicBool::new(false));
     let ctx = tokens.as_ref().map(|t| Arc::new(SpawnCtx {
         ac_sid: ac.sid,
         ac_bno_path: t.ac_bno_path.clone(),
@@ -406,9 +404,12 @@ fn run_confined(pol: &Policy) -> Result<u32> {
         initial: t.initial,
         cwd: target_cwd.clone(),
         env: extra_env.clone(),
-        stop: stop.clone(),
+        stop: stop_broker.clone(),
         fs: crate::policy_engine::FsPolicy::from_policy(pol),
-        hook_fs: pol.broker_fs,
+        // Legacy-broker mode: always hook FS. Phase D-3 removed the
+        // policy.broker_fs field — the env-var-gated legacy path is
+        // either fully on or doesn't run at all.
+        hook_fs: true,
         trace: std::env::var("SBOX_TRACE").is_ok(),
         lockdown: std::env::var("WINSBOX_TOKEN").as_deref() == Ok("lockdown"),
         broker_pipes: Mutex::new(std::collections::HashSet::new()),
@@ -425,23 +426,16 @@ fn run_confined(pol: &Policy) -> Result<u32> {
     }
 
     unsafe { WaitForSingleObject(pi.hProcess, INFINITE); }
-    stop.store(true, Ordering::Relaxed);
+    stop_broker.store(true, Ordering::Relaxed);
+    if let Some(ref s) = cdylib_stop { s.store(true, Ordering::Relaxed); }
     if let Some(ctx) = ctx {
         for h in ctx.threads.lock().unwrap().drain(..) { let _ = h.join(); }
     }
-    if let Some(j) = cdylib_join {
-        match j.join() {
-            Ok(Ok(_)) => {} // already logged inside trigger
-            Ok(Err(e)) => log!("cdylib injection result: {e:#}"),
-            Err(_) => log!("cdylib injection thread panicked"),
-        }
+    if let Some(ctx) = cdylib_ctx.as_ref() {
+        for h in ctx.threads.lock().unwrap().drain(..) { let _ = h.join(); }
     }
-    if let Some((stamp, sid)) = cdylib_stamp.take() {
-        if let Err(e) = stamp.revert(sid) {
-            log!("cdylib stamp revert: {e:#}");
-        }
-        free_psid(sid);
-    }
+    drop(cdylib_ctx);
+    drop(cdylib_inj);
     let mut code = 0u32;
     unsafe { GetExitCodeProcess(pi.hProcess, &mut code)?; }
     log!("target exit={code:#x}");
@@ -455,47 +449,162 @@ fn run_confined(pol: &Policy) -> Result<u32> {
         }
     }
     drop(acls); // revert before AC profile delete (Drop on `ac`)
+    drop(stamp_holder); // revert policy stamps before AC profile delete
     drop(desktop);
     drop(job);
     Ok(code)
 }
 
-/// Phase-B: stamp the cdylib's parent dir for AC RX, prepare the
-/// section/event/buffer in the target, resume, and dispatch the
-/// LoadLibraryW remote thread (asynchronously waits for the cdylib
-/// wake event in a background thread).
+/// Phase D-2: holder for the policy stamps applied at startup.
+/// On Drop, reverts the stamps so a per-instance AC SID's ACE doesn't
+/// linger past its profile (the profile gets `DeleteAppContainerProfile`'d
+/// on `AppContainer::Drop`, which orphans any ACE keyed to the SID —
+/// not strictly broken but ugly).
+struct StampHolder {
+    stamp: PolicyStamp,
+    sid_owned: windows::Win32::Security::PSID,
+}
+impl Drop for StampHolder {
+    fn drop(&mut self) {
+        if let Err(e) = self.stamp.revert(self.sid_owned) {
+            eprintln!("[sbox-exec] policy-stamp revert: {e:#}");
+        }
+        free_psid(self.sid_owned);
+    }
+}
+
+/// Phase D-2: build a `PolicyStamp` from the policy's allow_*/deny_*
+/// fields, compare its hash against the manifest at
+/// `<manifest_dir>/<ac_sid>.json`, and apply when the hash differs.
+/// The manifest write happens after a successful apply so a crash
+/// mid-walk leaves the manifest at the previous (correct) state and
+/// the next run replays.
 ///
-/// Returns the PolicyStamp + owned PSID (caller reverts on cleanup)
-/// and the JoinHandle for the wait thread.
+/// Returns a `StampHolder` whose `Drop` reverts the stamps. The caller
+/// holds it for the AC's lifetime; revert sequencing matters only if
+/// the same SID is reused across AC profiles, which the per-instance
+/// naming today forbids.
 ///
-/// **The target must be SUSPENDED on entry** — we patch its env
-/// block in place. We resume the main thread internally before
-/// dispatching the LoadLibraryW remote thread.
-fn try_inject_cdylib(
+/// **Phase E precondition for enforcement**: the AC must run under
+/// a *restricted* token that strips Everyone / Users / etc. so the
+/// AC SID is the only relevant pass on the access-check. The current
+/// default-mode AC token (CreateProcessW + SECURITY_CAPABILITIES) is
+/// *unrestricted* — Everyone:(I)(RX) inherited from `%TEMP%` etc. lets
+/// the AC read denied paths despite the explicit DENY ACE for the AC
+/// SID. The legacy-broker path uses `make_lockdown_with` to build the
+/// restricted token; Phase E hoists that into the default cdylib path.
+fn maybe_apply_stamps(
+    pol: &Policy, ac: &AppContainer, manifest_dir: &std::path::Path,
+) -> Result<StampHolder> {
+    let stamp = PolicyStamp {
+        allow_read: pol.allow_read.iter().map(std::path::PathBuf::from).collect(),
+        allow_write: pol.allow_write.iter().map(std::path::PathBuf::from).collect(),
+        deny_read: pol.deny_read.iter().map(std::path::PathBuf::from).collect(),
+        deny_write: pol.deny_write.iter().map(std::path::PathBuf::from).collect(),
+        ..Default::default()
+    };
+    let want_hash = crate::stamp_manifest::hash_policy(&stamp);
+    let store = crate::stamp_manifest::ManifestStore::new(manifest_dir.to_path_buf());
+
+    let sid_owned = psid_from_string(&ac.sid_string)
+        .with_context(|| format!("psid_from_string({})", ac.sid_string))?;
+
+    // Skip-on-match fast path. With per-instance AC SIDs the manifest
+    // file name (sanitized SID) is different every run so we never hit
+    // this; once stable SIDs land, the warm-restart path becomes <100ms
+    // (just hashing + a fs::read).
+    match store.load(&ac.sid_string) {
+        Ok(Some(prev)) if !store.diff(&prev, want_hash) => {
+            log!("policy-stamp: hash unchanged ({:#x}); skipping apply", want_hash);
+            return Ok(StampHolder { stamp, sid_owned });
+        }
+        Ok(Some(prev)) => log!(
+            "policy-stamp: hash {:#x} → {:#x} (re-applying)",
+            prev.policy_hash, want_hash,
+        ),
+        Ok(None) => log!("policy-stamp: no manifest for SID; first apply"),
+        Err(e) => log!("policy-stamp: manifest load failed ({e:#}); re-applying"),
+    }
+
+    let stats = stamp.apply(sid_owned).map_err(|e| {
+        // Free the SID on apply failure — caller never holds the holder.
+        free_psid(sid_owned);
+        e
+    })?;
+    log!(
+        "policy-stamp: {} stamped, {} skipped (idempotent), {} denies emitted, \
+         {} denies omitted, {} ms",
+        stats.roots_stamped, stats.roots_skipped_idempotent,
+        stats.denies_emitted, stats.denies_omitted_unnecessary, stats.elapsed_ms,
+    );
+
+    let manifest = crate::stamp_manifest::StampManifest::from_policy(
+        ac.sid_string.clone(), &stamp,
+    );
+    if let Err(e) = store.save(&manifest) {
+        log!("policy-stamp: manifest save failed ({e:#}); next run will re-apply");
+    }
+
+    Ok(StampHolder { stamp, sid_owned })
+}
+
+/// Phase-D return value: everything `run_confined` needs to keep
+/// alive for the duration of the AC's lifetime + revert on exit.
+struct CdylibInjection {
+    stamp: PolicyStamp,
+    sid_owned: windows::Win32::Security::PSID,
+    /// Diagnostic copy of the cdylib's report-back struct.
+    /// Logged at injection time; retained here for future use.
+    #[allow(dead_code)]
+    report: Option<cdylib_inject::CdylibReport>,
+    /// BNO directory handles created by `token::create_ac_bno`.
+    /// Kept open so the per-AC namespace (cygwin BNO redirect target
+    /// in `handle_dirobj`) doesn't get torn down.
+    _bno_handles: Vec<HANDLE>,
+}
+
+impl Drop for CdylibInjection {
+    fn drop(&mut self) {
+        unsafe {
+            for h in self._bno_handles.drain(..) { let _ = CloseHandle(h); }
+        }
+        let _ = self.stamp.revert(self.sid_owned);
+        free_psid(self.sid_owned);
+    }
+}
+
+/// Phase D: full cdylib injection + IPC channel + hook installation.
+///
+/// Replaces the Phase-B "report-back smoke" path with the production
+/// flow: stamp → IPC channel → BNO precreate → entry-trampoline
+/// rendezvous → resume → cdylib LoadLibraryW → wait → resolve hook
+/// addresses in the target → patch ntdll/kernelbase → release entry
+/// stub → spawn `serve_ipc` thread.
+///
+/// **The target must be SUSPENDED on entry.** Resume happens during
+/// the entry rendezvous; on success the target is running with the
+/// cdylib loaded and all 5 compat hooks live.
+///
+/// Returns a `CdylibInjection` (caller drops on exit to revert the
+/// stamp + close BNO handles) and a populated `SpawnCtx` whose
+/// `serve_ipc` thread is already running.
+fn try_inject_cdylib_full(
     ac: &AppContainer,
     dll_path: &std::path::Path,
     target: HANDLE,
     main_thread: HANDLE,
-) -> Result<(
-    PolicyStamp,
-    windows::Win32::Security::PSID,
-    std::thread::JoinHandle<Result<cdylib_inject::CdylibReport>>,
-)> {
-    // Resolve to a canonical path so the stamp + LoadLibraryW
-    // both see the same string. locate_cdylib() canonicalises but
-    // pol.cdylib_path may be relative; do it again here.
+    job: &Job,
+    target_cwd: &str,
+    extra_env: &[(String, String)],
+    pol: &Policy,
+) -> Result<(CdylibInjection, Arc<SpawnCtx>, Arc<AtomicBool>)> {
+    // ── 1. Resolve + stamp the cdylib's parent dir for AC RX.
     let dll_canon = dll_path.canonicalize()
         .with_context(|| format!("canonicalize cdylib path {}", dll_path.display()))?;
     let dll_dir = dll_canon
         .parent()
         .ok_or_else(|| anyhow::anyhow!("cdylib path has no parent: {}", dll_canon.display()))?
         .to_path_buf();
-
-    // Stamp the cdylib's directory for AC RX via Phase A's stamper
-    // (NOT acl::AclJournal — the plan reserves AclJournal for the
-    // legacy paths kept until Phase D). We re-derive the SID from
-    // its string form so the stamp's revert path owns the lifetime
-    // (decoupled from `ac` going out of scope).
     let stamp = PolicyStamp {
         allow_read: vec![dll_dir.clone()],
         ..Default::default()
@@ -514,35 +623,285 @@ fn try_inject_cdylib(
         }
     }
 
-    // Prepare the in-target section/event/buffer + env patch.
-    // Phase C: we don't yet wire the cdylib's hooks (no
-    // `interception::install_*(.., Some(&CdylibHookEntries))` for the
-    // cdylib_active path) — without an IPC service thread, passing a
-    // populated Channel into the buffer would point hook bodies at a
-    // dead broker. Pass `None` so the cdylib's `ipc_loaded()` check
-    // returns false and any errantly-fired hook short-circuits to
-    // STATUS_ACCESS_DENIED rather than hanging on a wait-for-event the
-    // broker never satisfies. Phase D wires the channel + service
-    // thread + hook installation as one unit.
-    let session = match cdylib_inject::prepare(target, &dll_canon, None) {
+    // From here, on any error we must revert the stamp + free the SID.
+    let cleanup_on_err = |sid: windows::Win32::Security::PSID,
+                          stamp: &PolicyStamp,
+                          bno: &mut Vec<HANDLE>| {
+        unsafe {
+            for h in bno.drain(..) { let _ = CloseHandle(h); }
+        }
+        let _ = stamp.revert(sid);
+        free_psid(sid);
+    };
+    let mut bno_handles: Vec<HANDLE> = Vec::new();
+
+    // ── 2. Pre-create the per-AC BNO root so handle_dirobj has
+    //      somewhere to redirect MSYS2/Cygwin's `\BaseNamedObjects\…`
+    //      creates. Same call build_broker_tokens makes for full
+    //      broker mode; needed independently in cdylib mode.
+    let (ac_bno_path, bnoh) = match token::create_ac_bno(&ac.sid_string) {
+        Ok(t) => t,
+        Err(e) => {
+            cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
+            return Err(e.context("create_ac_bno (cdylib path)"));
+        }
+    };
+    bno_handles = bnoh;
+    log!("cdylib: ac_bno={ac_bno_path}");
+
+    // ── 3. Create the IPC channel (section + events + mutex,
+    //      duplicated into the target).
+    let ch = match ipc::Channel::create(target) {
+        Ok(c) => c,
+        Err(e) => {
+            cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
+            return Err(e.context("ipc::Channel::create (cdylib path)"));
+        }
+    };
+    let stub_addrs = ch.stub_env_snapshot();
+
+    // ── 4. Prepare the cdylib bookkeeping in the target (section,
+    //      event, buffer, env patch). Pass the IPC channel so the
+    //      cdylib's hook bodies see live IPC handles.
+    let session = match cdylib_inject::prepare(target, &dll_canon, Some(&ch)) {
         Ok(s) => s,
         Err(e) => {
-            // Revert the stamp before returning so we don't leak it.
-            let _ = stamp.revert(sid_owned);
-            free_psid(sid_owned);
+            drop(ch);
+            cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
             return Err(e.context("cdylib_inject::prepare"));
         }
     };
     log!("cdylib prepared (dll={})", dll_canon.display());
 
-    // Resume the target's main thread and start the async wait.
-    // trigger_async() does the SETTLE_MS sleep + CreateRemoteThread
-    // off the broker's main thread.
+    // ── 5. Install the entry-trampoline rendezvous so we can wait
+    //      for the loader to map kernelbase before patching its
+    //      `CreateProcessInternalW` export. `entry_trampoline::install`
+    //      is x86_64-only — on ARM64 we fall back to a settle-based
+    //      flow (Phase B): resume + sleep + dispatch + race-pray that
+    //      no hooked syscall fires from DllMain. ARM64 production
+    //      readiness for the rendezvous is a Phase E concern.
+    let sync_opt: Option<crate::entry_trampoline::EntrySync> =
+        match crate::entry_trampoline::install(target, main_thread, false) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                let msg = format!("{e:#}");
+                if msg.contains("x86_64 only") {
+                    log!("cdylib: ARM64 fallback — no entry rendezvous; using settle delay");
+                    None
+                } else {
+                    drop(session); drop(ch);
+                    cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
+                    return Err(e.context("entry_trampoline::install (cdylib path)"));
+                }
+            }
+        };
+
+    // Macro the cleanup-on-error path threads through. `sync_opt` may
+    // hold a half-released stub; if so .go() unblocks the target so
+    // it can run to completion (or exit on whatever broke us).
+    let release_sync = |sync: &Option<crate::entry_trampoline::EntrySync>| {
+        if let Some(s) = sync.as_ref() { s.go(); }
+    };
+
+    // ── 6. Resume the main thread; with rendezvous, the entry stub
+    //      fires after the loader has mapped all static imports and
+    //      signals ev_loaded, then blocks on ev_go. Without
+    //      rendezvous (ARM64), we rely on the settle delay below.
     unsafe { ResumeThread(main_thread); }
+    if let Some(ref sync) = sync_opt {
+        if !sync.wait_loaded_or_exit(target, 15_000) {
+            drop(session); drop(ch);
+            cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
+            anyhow::bail!("entry rendezvous timed out before cdylib load (loader hung/exited)");
+        }
+    } else {
+        // No rendezvous: give the loader 150 ms to map kernelbase.
+        let settle = std::env::var("WINSBOX_CDYLIB_SETTLE_MS")
+            .ok().and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(cdylib_inject::SETTLE_MS);
+        if settle > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(settle));
+        }
+    }
+
+    // ── 7. Dispatch LoadLibraryW(<cdylib>) in a remote thread; the
+    //      cdylib's DllMain populates IPC env, signals the wake event.
+    let inject_thread = match cdylib_inject::dispatch_load_library(&session, target) {
+        Ok(t) => t,
+        Err(e) => {
+            // Best effort: release stub + drop everything.
+            release_sync(&sync_opt);
+            drop(session); drop(ch);
+            cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
+            return Err(e.context("dispatch LoadLibraryW"));
+        }
+    };
     let timeout_ms = std::env::var("WINSBOX_CDYLIB_TIMEOUT_MS")
-        .ok().and_then(|v| v.parse().ok()).unwrap_or(5_000u32);
-    let join = cdylib_inject::trigger_async(session, target, timeout_ms);
-    Ok((stamp, sid_owned, join))
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(15_000u32);
+    use windows::Win32::Foundation::WAIT_OBJECT_0;
+    use windows::Win32::System::Threading::WaitForSingleObject;
+    let wait = unsafe { WaitForSingleObject(session.wake_event(), timeout_ms) };
+    let _ = unsafe { CloseHandle(inject_thread) };
+    if wait != WAIT_OBJECT_0 {
+        release_sync(&sync_opt);
+        drop(session); drop(ch);
+        cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
+        anyhow::bail!(
+            "cdylib wake-event timeout ({timeout_ms} ms); dll={}",
+            dll_canon.display(),
+        );
+    }
+    let report = match session.verify_report() {
+        Ok(r) => r,
+        Err(e) => {
+            release_sync(&sync_opt);
+            drop(session); drop(ch);
+            cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
+            return Err(e.context("cdylib report"));
+        }
+    };
+    log!(
+        "cdylib reported back: pid={} version={} init={:#x}",
+        report.pid, report.version, report.init_result,
+    );
+
+    // ── 8. Resolve cdylib hook addresses in the target. The cdylib
+    //      is now loaded; walk the target's PEB Ldr to find its base,
+    //      then translate broker-side GetProcAddress results via the
+    //      base+RVA dance (per-process ASLR may give a different base
+    //      than the broker's own LoadLibraryW).
+    let dll_leaf = dll_canon.file_name().unwrap_or_default()
+        .to_string_lossy().into_owned();
+    let target_base = match cdylib_inject::find_target_module_base(target, &dll_leaf) {
+        Ok(b) => b,
+        Err(e) => {
+            release_sync(&sync_opt);
+            drop(session); drop(ch);
+            cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
+            return Err(e.context("find cdylib base in target"));
+        }
+    };
+    let resolve = |name: &str| -> Result<usize> {
+        cdylib_inject::resolve_target_export(target, &dll_canon, target_base, name)
+    };
+    let entries = match (|| -> Result<interception::CdylibHookEntries> {
+        Ok(interception::CdylibHookEntries {
+            nt_open_section: resolve("hook_nt_open_section")?,
+            nt_create_directory_object: resolve("hook_nt_create_directory_object")?,
+            nt_open_directory_object: resolve("hook_nt_open_directory_object")?,
+            nt_create_named_pipe_file: resolve("hook_nt_create_named_pipe_file")?,
+            create_process_internal_w: resolve("hook_create_process_internal_w")?,
+        })
+    })() {
+        Ok(e) => e,
+        Err(e) => {
+            release_sync(&sync_opt);
+            drop(session); drop(ch);
+            cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
+            return Err(e.context("resolve cdylib hook exports"));
+        }
+    };
+    log!(
+        "cdylib hooks @ target_base={target_base:#x}: \
+         section={:#x} dirobj_create={:#x} dirobj_open={:#x} \
+         pipe={:#x} cpw={:#x}",
+        entries.nt_open_section, entries.nt_create_directory_object,
+        entries.nt_open_directory_object, entries.nt_create_named_pipe_file,
+        entries.create_process_internal_w,
+    );
+
+    // ── 9. Patch ntdll + kernelbase in the target. With cdylib
+    //      entries supplied, the 5 compat hooks dispatch via
+    //      slim ABS_JMP into the cdylib's exported functions.
+    //      install_fs / install_reg are pre-resume in the broker
+    //      flow; here the target is post-loader (wait_loaded_or_exit
+    //      returned) but parked on ev_go in the entry stub, so it
+    //      hasn't issued any of the patched syscalls yet.
+    //      install_cpw must come after the loader because
+    //      kernelbase isn't mapped at CREATE_SUSPENDED.
+    if let Err(e) = interception::install_fs(target, &stub_addrs, Some(&entries)) {
+        release_sync(&sync_opt);
+        drop(session); drop(ch);
+        cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
+        return Err(e.context("install_fs (cdylib)"));
+    }
+    if let Err(e) = interception::install_reg(target, &stub_addrs, Some(&entries)) {
+        release_sync(&sync_opt);
+        drop(session); drop(ch);
+        cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
+        return Err(e.context("install_reg (cdylib)"));
+    }
+    let cpw_va = match crate::entry_trampoline::cpw_address() {
+        Ok(v) => v,
+        Err(e) => {
+            release_sync(&sync_opt);
+            drop(session); drop(ch);
+            cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
+            return Err(e.context("cpw_address"));
+        }
+    };
+    if let Err(e) = interception::install_cpw(target, &stub_addrs, cpw_va, Some(&entries)) {
+        release_sync(&sync_opt);
+        drop(session); drop(ch);
+        cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
+        return Err(e.context("install_cpw (cdylib)"));
+    }
+    log!("cdylib hooks patched into target");
+
+    // ── 10. Release the entry stub (no-op on ARM64 where there
+    //       wasn't one). Target proceeds to its normal entrypoint;
+    //       subsequent ntdll/kernelbase calls hit the slim
+    //       dispatchers and tail-call into the cdylib.
+    release_sync(&sync_opt);
+    drop(sync_opt);
+
+    // ── 11. Build the SpawnCtx the IPC service thread needs.
+    //       Cdylib mode has no broker primary/initial token (the AC
+    //       was spawned via plain CreateProcessW + SECURITY_CAPABILITIES),
+    //       so handle_cpw will see HANDLE::default() and bail.
+    //       FsPolicy + lockdown are unused by the compat handlers,
+    //       but we populate them in case the inline-asm IPC stubs
+    //       ever fire (they don't on the cdylib path; legacy hook
+    //       opcodes go away in D-4).
+    let stop = Arc::new(AtomicBool::new(false));
+    let ctx = Arc::new(SpawnCtx {
+        ac_sid: ac.sid,
+        ac_bno_path: ac_bno_path.clone(),
+        ac_sid_string: ac.sid_string.clone(),
+        job: job.handle(),
+        primary: HANDLE::default(),
+        initial: HANDLE::default(),
+        cwd: target_cwd.to_string(),
+        env: extra_env.to_vec(),
+        stop: stop.clone(),
+        fs: crate::policy_engine::FsPolicy::from_policy(pol),
+        hook_fs: false,
+        trace: std::env::var("SBOX_TRACE").is_ok(),
+        lockdown: std::env::var("WINSBOX_TOKEN").as_deref() == Ok("lockdown"),
+        broker_pipes: Mutex::new(std::collections::HashSet::new()),
+        threads: Mutex::new(Vec::new()),
+    });
+    let target_raw = target.0 as isize;
+    let ctx_thread = ctx.clone();
+    let h = std::thread::spawn(move || serve_ipc(ch, target_raw, ctx_thread));
+    ctx.threads.lock().unwrap().push(h);
+
+    // Drop the session: closes the broker-side wake event + section
+    // mapping. The cdylib has already read its IPC env from the buffer,
+    // so the buffer is dead from here on. Holding it would just keep
+    // a tiny mapping alive in the AC; let it go.
+    drop(session);
+
+    Ok((
+        CdylibInjection {
+            stamp,
+            sid_owned,
+            report: Some(report),
+            _bno_handles: bno_handles,
+        },
+        ctx,
+        stop,
+    ))
 }
 
 /// CreateProcessW into the AppContainer with the given Job + desktop.

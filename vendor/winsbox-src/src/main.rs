@@ -35,6 +35,11 @@ struct Cli {
     /// AF_UNIX socket paths (http, then optional socks).
     #[arg(long, num_args = 1..=2)]
     relay_inside: Vec<String>,
+    /// Phase D: directory storing per-AC-SID stamp manifests.
+    /// Falls back to `WINSBOX_STAMP_DIR` env var, then
+    /// `%LOCALAPPDATA%\sbox-exec\stamps\` if neither is set.
+    #[arg(long)]
+    manifest_dir: Option<std::path::PathBuf>,
 }
 
 fn load_policy(cli: &Cli) -> Result<policy::Policy> {
@@ -51,6 +56,22 @@ fn load_policy(cli: &Cli) -> Result<policy::Policy> {
 }
 
 #[cfg(windows)]
+fn resolve_manifest_dir(cli: &Cli) -> std::path::PathBuf {
+    if let Some(p) = cli.manifest_dir.clone() {
+        return p;
+    }
+    if let Ok(p) = std::env::var("WINSBOX_STAMP_DIR") {
+        if !p.is_empty() {
+            return std::path::PathBuf::from(p);
+        }
+    }
+    let base = std::env::var("LOCALAPPDATA").ok()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir());
+    base.join("sbox-exec").join("stamps")
+}
+
+#[cfg(windows)]
 fn main() -> Result<()> {
     let cli = Cli::parse();
     if !cli.relay_inside.is_empty() {
@@ -62,7 +83,8 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let pol = load_policy(&cli)?;
-    let code = launch::run(&pol)?;
+    let manifest_dir = resolve_manifest_dir(&cli);
+    let code = launch::run(&pol, &manifest_dir)?;
     std::process::exit(code as i32);
 }
 

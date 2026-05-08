@@ -13,18 +13,11 @@ pub struct Policy {
     pub deny_write: Vec<String>,
     pub network: NetworkPolicy,
     pub use_alternate_desktop: bool,
-    /// Hook `NtCreateFile`/`NtOpenFile` so reads/writes go through
-    /// the broker's policy engine. When false (default during
-    /// bring-up) the Phase-1 ACL grants are the only FS gate.
-    pub broker_fs: bool,
-    /// Phase selector understood by the launcher. Phase 0.5 only
-    /// implements `Stub`; later phases add `AppContainer` / `Broker`.
-    pub mode: Mode,
-    /// Phase-B opt-in. Path to `ac_cdylib.dll` (or compatible) to
-    /// inject into the AC target post-spawn. When `None` the launch
-    /// path is identical to pre-Phase-B. The broker also honours
-    /// the `WINSBOX_CDYLIB` environment variable as a fallback so
-    /// smoke tests / CI can opt in without editing policy JSON.
+    /// Path to `ac_cdylib.dll` (or compatible) to inject into the AC
+    /// target post-spawn. When `None` the broker falls back to the
+    /// `WINSBOX_CDYLIB` environment variable; if neither is set the
+    /// AC runs without compat hooks (suitable for non-MSYS workloads
+    /// — bash/git/npm need the cdylib for namespace shims).
     pub cdylib_path: Option<String>,
 }
 
@@ -35,11 +28,24 @@ pub struct NetworkPolicy {
     pub socks_proxy_port: Option<u16>,
 }
 
-#[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
+/// Phase-D-3 internal mode selector. The policy schema no longer carries
+/// a `mode` field — the production path is `AppContainer + cdylib + ACL
+/// stamps`. `WINSBOX_LEGACY_BROKER=1` selects the pre-D legacy broker-FS
+/// path for staged rollback during the D-1→D-4 transition; this knob
+/// goes away in D-4 once the cdylib path's bash workload is verified.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     #[default]
-    Stub,
     AppContainer,
     Broker,
+}
+
+impl Mode {
+    pub fn from_env() -> Self {
+        if std::env::var("WINSBOX_LEGACY_BROKER").as_deref() == Ok("1") {
+            Mode::Broker
+        } else {
+            Mode::AppContainer
+        }
+    }
 }
