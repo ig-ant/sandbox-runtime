@@ -24,14 +24,35 @@ use windows::Win32::Foundation::HANDLE;
 
 use crate::interception::{
     alloc_remote_rx, ntdll_export, read_remote_bytes, write_remote_bytes,
-    CdylibHookEntries,
+    CdylibHookEntries, PassthroughThunks,
 };
 use crate::ipc::StubAddrs;
+
+/// Phase E-5b: build a "saved-original" passthrough thunk for the
+/// syscall stub at `va`. Snapshots 32 bytes verbatim — the entire
+/// syscall stub including the trailing `ret`. The legacy inline-asm
+/// stub used the same trick: jump to the saved bytes, the saved
+/// `syscall; ret` returns to the caller. No jump-back needed.
+///
+/// 32 bytes covers the standard ntdll syscall layout
+/// (`mov r10,rcx; mov eax,ssn; test [...], 1; jne alt; syscall; ret;
+/// int 2e; ret`). All addressing inside is absolute (`ds:0x7ffe0308`)
+/// or RIP-relative within the saved region (`jne` to an offset within
+/// the same 32 bytes). Copying verbatim is safe.
+///
+/// Must be called *before* `patch_with_abs_jmp` overwrites the first
+/// 12 bytes — otherwise we'd snapshot our own patch.
+fn build_passthrough_thunk(target: HANDLE, va: usize) -> Result<usize> {
+    let mut orig = [0u8; 32];
+    read_remote_bytes(target, va, &mut orig)?;
+    alloc_remote_rx(target, &orig)
+}
 
 // ─── Public install API (called from interception.rs façade) ───────
 
 pub fn install_fs(
     target: HANDLE, a: &StubAddrs, cdylib: Option<&CdylibHookEntries>,
+    pt: &mut PassthroughThunks,
 ) -> Result<()> {
     let env = stub_env(a)?;
     for (name, op, n_args) in [
@@ -49,6 +70,9 @@ pub fn install_fs(
     // available; legacy inline IPC stub otherwise.
     let pipe_va = ntdll_export("NtCreateNamedPipeFile")?;
     if let Some(c) = cdylib.filter(|c| c.nt_create_named_pipe_file != 0) {
+        // Phase E-5b: build passthrough thunk BEFORE patching so we
+        // snapshot the original syscall bytes, not our ABS_JMP.
+        pt.nt_create_named_pipe_file = build_passthrough_thunk(target, pipe_va)?;
         patch_with_abs_jmp(target, "NtCreateNamedPipeFile",
                            pipe_va, c.nt_create_named_pipe_file)?;
     } else {
@@ -74,6 +98,7 @@ pub fn install_fs(
 
 pub fn install_reg(
     target: HANDLE, a: &StubAddrs, cdylib: Option<&CdylibHookEntries>,
+    pt: &mut PassthroughThunks,
 ) -> Result<()> {
     let env = stub_env(a)?;
     // Registry hooks: legacy inline IPC stub. Removed in Phase D.
@@ -92,19 +117,26 @@ pub fn install_reg(
     // Closures captured into an array slot must share a type; none of
     // these capture anything, so coerce each to a `fn` pointer.
     type GetVa = fn(&CdylibHookEntries) -> usize;
-    for (name, _op, get_va) in [
+    type SetPt = fn(&mut PassthroughThunks, usize);
+    for (name, _op, get_va, set_pt) in [
         ("NtOpenSection",
          crate::ipc::OP_NTOPENSECTION,
-         (|c: &CdylibHookEntries| c.nt_open_section) as GetVa),
+         (|c: &CdylibHookEntries| c.nt_open_section) as GetVa,
+         (|p: &mut PassthroughThunks, v| p.nt_open_section = v) as SetPt),
         ("NtCreateDirectoryObject",
          crate::ipc::OP_NTCREATEDIROBJ,
-         (|c: &CdylibHookEntries| c.nt_create_directory_object) as GetVa),
+         (|c: &CdylibHookEntries| c.nt_create_directory_object) as GetVa,
+         (|p: &mut PassthroughThunks, v| p.nt_create_directory_object = v) as SetPt),
         ("NtOpenDirectoryObject",
          crate::ipc::OP_NTOPENDIROBJ,
-         (|c: &CdylibHookEntries| c.nt_open_directory_object) as GetVa),
+         (|c: &CdylibHookEntries| c.nt_open_directory_object) as GetVa,
+         (|p: &mut PassthroughThunks, v| p.nt_open_directory_object = v) as SetPt),
     ] {
         let va = ntdll_export(name)?;
         if let Some(c) = cdylib.filter(|c| get_va(c) != 0) {
+            // Phase E-5b: build passthrough BEFORE patching.
+            let thunk_va = build_passthrough_thunk(target, va)?;
+            set_pt(pt, thunk_va);
             patch_with_abs_jmp(target, name, va, get_va(c))?;
         } else {
             let mut orig = [0u8; 32];
@@ -120,8 +152,13 @@ pub fn install_reg(
 pub fn install_cpw(
     target: HANDLE, a: &StubAddrs, cpw_va: usize,
     cdylib: Option<&CdylibHookEntries>,
+    pt: &mut PassthroughThunks,
 ) -> Result<()> {
     if let Some(c) = cdylib.filter(|c| c.create_process_internal_w != 0) {
+        // Phase E-5b: passthrough thunk for CPW. Built BEFORE patching.
+        // CPW's first 12 bytes get overwritten by ABS_JMP — same shape
+        // as the ntdll syscall stubs.
+        pt.create_process_internal_w = build_passthrough_thunk(target, cpw_va)?;
         patch_with_abs_jmp(target, "CreateProcessInternalW", cpw_va,
                            c.create_process_internal_w)?;
     } else {

@@ -64,6 +64,27 @@ impl CdylibHookEntries {
     }
 }
 
+/// Phase E-5b: target-VAs of the passthrough thunks built alongside
+/// each cdylib-dispatched hook. A thunk is a small executable region
+/// containing a copy of the original ntdll syscall stub's first
+/// 12 bytes (x64) / 16 bytes (ARM64), followed by an absolute jump
+/// back into the syscall stub at offset +12 / +16 — bypassing our
+/// hook patch. Cdylib hooks call these on `FS_PASSTHROUGH` to delegate
+/// to the un-hooked syscall.
+///
+/// A zero VA in any field means the corresponding hook wasn't
+/// installed (or passthrough wasn't built); the cdylib treats
+/// `FS_PASSTHROUGH` with zero passthrough VA as a broker bug and
+/// returns `STATUS_NOT_IMPLEMENTED`.
+#[derive(Clone, Copy, Default)]
+pub struct PassthroughThunks {
+    pub nt_open_section: usize,
+    pub nt_create_directory_object: usize,
+    pub nt_open_directory_object: usize,
+    pub nt_create_named_pipe_file: usize,
+    pub create_process_internal_w: usize,
+}
+
 /// Patch `ntdll!{NtCreateFile,NtOpenFile,NtCreateNamedPipeFile,
 /// NtQueryAttributesFile,NtQueryFullAttributesFile}` in `target`.
 /// Installed pre-resume so the loader's own opens are brokered.
@@ -71,12 +92,17 @@ impl CdylibHookEntries {
 /// Phase C: when `cdylib` is set, `NtCreateNamedPipeFile` is patched
 /// to dispatch into the cdylib instead of the inline-asm IPC stub.
 /// The other FS hooks keep the legacy stub until Phase D.
+///
+/// Phase E-5b: when a cdylib-dispatched hook is installed, build a
+/// passthrough thunk alongside (saved original bytes + JMP back) and
+/// stash its VA in `pt`.
 pub fn install_fs(
     target: HANDLE,
     a: &StubAddrs,
     cdylib: Option<&CdylibHookEntries>,
+    pt: &mut PassthroughThunks,
 ) -> Result<()> {
-    arch::install_fs(target, a, cdylib)
+    arch::install_fs(target, a, cdylib, pt)
 }
 
 /// Patch the registry/section/dirobj hooks. Installed pre-resume.
@@ -88,8 +114,9 @@ pub fn install_reg(
     target: HANDLE,
     a: &StubAddrs,
     cdylib: Option<&CdylibHookEntries>,
+    pt: &mut PassthroughThunks,
 ) -> Result<()> {
-    arch::install_reg(target, a, cdylib)
+    arch::install_reg(target, a, cdylib, pt)
 }
 
 /// Patch `kernelbase!CreateProcessInternalW` in `target`. Must run
@@ -99,8 +126,9 @@ pub fn install_cpw(
     a: &StubAddrs,
     cpw_va: usize,
     cdylib: Option<&CdylibHookEntries>,
+    pt: &mut PassthroughThunks,
 ) -> Result<()> {
-    arch::install_cpw(target, a, cpw_va, cdylib)
+    arch::install_cpw(target, a, cpw_va, cdylib, pt)
 }
 
 // ─── shared helpers ────────────────────────────────────────────────
@@ -205,13 +233,13 @@ pub fn read_remote_wstr(proc: HANDLE, addr: usize, byte_len: usize) -> Result<St
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod arch {
     use super::*;
-    pub fn install_fs(_t: HANDLE, _a: &StubAddrs, _c: Option<&CdylibHookEntries>) -> Result<()> {
+    pub fn install_fs(_t: HANDLE, _a: &StubAddrs, _c: Option<&CdylibHookEntries>, _p: &mut PassthroughThunks) -> Result<()> {
         bail!("interception: only x86_64 and aarch64 supported")
     }
-    pub fn install_reg(_t: HANDLE, _a: &StubAddrs, _c: Option<&CdylibHookEntries>) -> Result<()> {
+    pub fn install_reg(_t: HANDLE, _a: &StubAddrs, _c: Option<&CdylibHookEntries>, _p: &mut PassthroughThunks) -> Result<()> {
         bail!("interception: only x86_64 and aarch64 supported")
     }
-    pub fn install_cpw(_t: HANDLE, _a: &StubAddrs, _v: usize, _c: Option<&CdylibHookEntries>)
+    pub fn install_cpw(_t: HANDLE, _a: &StubAddrs, _v: usize, _c: Option<&CdylibHookEntries>, _p: &mut PassthroughThunks)
         -> Result<()>
     {
         bail!("interception: only x86_64 and aarch64 supported")

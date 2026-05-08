@@ -20,11 +20,35 @@
 use anyhow::{bail, Result};
 use windows::Win32::Foundation::HANDLE;
 
-use crate::interception::{ntdll_export, write_remote_bytes, CdylibHookEntries};
+use crate::interception::{
+    alloc_remote_rx, ntdll_export, read_remote_bytes, write_remote_bytes,
+    CdylibHookEntries, PassthroughThunks,
+};
 use crate::ipc::StubAddrs;
+
+/// Phase E-5b: build a "saved-original" passthrough thunk for the
+/// syscall stub at `va`. Snapshots 32 bytes verbatim — covers the
+/// `svc #X; ret` syscall plus a buffer for any prologue. The saved
+/// `ret` returns to the cdylib's caller; no jump-back needed.
+///
+/// 32 bytes is well past any actual syscall stub on ARM64
+/// (typically `svc; ret` = 8 bytes; some have a `paciasp` prologue
+/// which adds 4 more). All ARM64 instructions are 4-byte aligned and
+/// position-independent (PC-relative branches/loads); copying verbatim
+/// is safe as long as no branch targets memory outside the snapshot.
+/// The standard ntdll syscall layout is fully self-contained.
+///
+/// Must be called *before* `patch_with_abs_jmp` overwrites the first
+/// 16 bytes — otherwise we'd snapshot our own patch.
+fn build_passthrough_thunk(target: HANDLE, va: usize) -> Result<usize> {
+    let mut orig = [0u8; 32];
+    read_remote_bytes(target, va, &mut orig)?;
+    alloc_remote_rx(target, &orig)
+}
 
 pub fn install_fs(
     target: HANDLE, _a: &StubAddrs, cdylib: Option<&CdylibHookEntries>,
+    pt: &mut PassthroughThunks,
 ) -> Result<()> {
     // ARM64 path: only the compat NtCreateNamedPipeFile hook survives
     // here, dispatched into the cdylib. The other FS hooks
@@ -38,6 +62,7 @@ pub fn install_fs(
     };
     if c.nt_create_named_pipe_file != 0 {
         let va = ntdll_export("NtCreateNamedPipeFile")?;
+        pt.nt_create_named_pipe_file = build_passthrough_thunk(target, va)?;
         patch_with_abs_jmp(target, "NtCreateNamedPipeFile", va,
                            c.nt_create_named_pipe_file)?;
     }
@@ -46,19 +71,23 @@ pub fn install_fs(
 
 pub fn install_reg(
     target: HANDLE, _a: &StubAddrs, cdylib: Option<&CdylibHookEntries>,
+    pt: &mut PassthroughThunks,
 ) -> Result<()> {
     let Some(c) = cdylib else { return Ok(()); };
     if c.nt_open_section != 0 {
         let va = ntdll_export("NtOpenSection")?;
+        pt.nt_open_section = build_passthrough_thunk(target, va)?;
         patch_with_abs_jmp(target, "NtOpenSection", va, c.nt_open_section)?;
     }
     if c.nt_create_directory_object != 0 {
         let va = ntdll_export("NtCreateDirectoryObject")?;
+        pt.nt_create_directory_object = build_passthrough_thunk(target, va)?;
         patch_with_abs_jmp(target, "NtCreateDirectoryObject", va,
                            c.nt_create_directory_object)?;
     }
     if c.nt_open_directory_object != 0 {
         let va = ntdll_export("NtOpenDirectoryObject")?;
+        pt.nt_open_directory_object = build_passthrough_thunk(target, va)?;
         patch_with_abs_jmp(target, "NtOpenDirectoryObject", va,
                            c.nt_open_directory_object)?;
     }
@@ -68,10 +97,12 @@ pub fn install_reg(
 pub fn install_cpw(
     target: HANDLE, _a: &StubAddrs, cpw_va: usize,
     cdylib: Option<&CdylibHookEntries>,
+    pt: &mut PassthroughThunks,
 ) -> Result<()> {
     let Some(c) = cdylib.filter(|c| c.create_process_internal_w != 0) else {
         bail!("ARM64 install_cpw: no cdylib entry available");
     };
+    pt.create_process_internal_w = build_passthrough_thunk(target, cpw_va)?;
     patch_with_abs_jmp(target, "CreateProcessInternalW", cpw_va,
                        c.create_process_internal_w)?;
     Ok(())

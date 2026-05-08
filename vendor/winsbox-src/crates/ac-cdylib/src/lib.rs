@@ -101,38 +101,59 @@ pub const RESULT_SENTINEL: u32 = 0xACDC_BABE;
 ///     event. Used when the broker `LoadLibraryW`s the cdylib via a
 ///     remote thread post-loader.
 ///   * **Phase E-1 path** (manual map): the broker locates `IPC` via
-///     the `IPC` data export, writes the four `u64`s directly with
+///     the `IPC` data export, writes the IPC handles directly with
 ///     `WriteProcessMemory` *pre-resume*, and patches ntdll syscalls
 ///     to dispatch into the manual-mapped hooks. No DllMain runs —
 ///     the broker handles every initialisation step.
 ///
 /// Field ordering and types must NOT change without bumping
-/// [`CDYLIB_VERSION`] — the broker writes four contiguous `u64`s
+/// [`CDYLIB_VERSION`] — the broker writes a contiguous `[u64; N]`
 /// starting at `&IPC`. `AtomicU64` over a `u64` is `repr(C)` per the
 /// std atomics docs; the broker writes plain `u64` values via
 /// `WriteProcessMemory` and the cdylib reads them as `Atomic*` loads.
 /// The pre-resume write happens-before any AC-side observation since
 /// every AC thread starts after `ResumeThread`, which is a global
 /// synchronisation point.
+///
+/// Phase E-5b adds the `passthrough_*` fields: each holds the in-target
+/// VA of a small thunk built by the broker that contains a copy of the
+/// original ntdll syscall's first 12 bytes (x64) / 16 bytes (ARM64),
+/// followed by an absolute jump back to `syscall_va + 12/16`. Calling
+/// the thunk pointer with the original `extern "system"` signature
+/// executes the underlying syscall as if no hook were installed.
+/// Hook bodies use these on `FS_PASSTHROUGH` to delegate the call to
+/// the kernel directly.
 #[repr(C)]
 pub struct IpcEnv {
     pub section: AtomicU64,
     pub ev_req: AtomicU64,
     pub ev_resp: AtomicU64,
     pub mutex: AtomicU64,
+    /// Passthrough thunk VAs. Zero = no passthrough available; hook
+    /// returns STATUS_NOT_IMPLEMENTED in that case (broker bug).
+    pub passthrough_nt_open_section: AtomicU64,
+    pub passthrough_nt_create_directory_object: AtomicU64,
+    pub passthrough_nt_open_directory_object: AtomicU64,
+    pub passthrough_nt_create_named_pipe_file: AtomicU64,
+    pub passthrough_create_process_internal_w: AtomicU64,
 }
 
 /// Phase E-1: exported as a no-mangle data symbol so the broker's
 /// `resolve_target_export("IPC")` returns the in-target VA of this
-/// struct. Pre-resume the broker writes `[u64; 4]` directly here via
-/// `WriteProcessMemory`. Post-resume hook bodies read these as
-/// `AtomicU64::load(Acquire)`.
+/// struct. Pre-resume the broker writes a contiguous `[u64; 9]`
+/// directly here via `WriteProcessMemory`. Post-resume hook bodies
+/// read these as `AtomicU64::load(Acquire)`.
 #[no_mangle]
 pub static IPC: IpcEnv = IpcEnv {
     section: AtomicU64::new(0),
     ev_req: AtomicU64::new(0),
     ev_resp: AtomicU64::new(0),
     mutex: AtomicU64::new(0),
+    passthrough_nt_open_section: AtomicU64::new(0),
+    passthrough_nt_create_directory_object: AtomicU64::new(0),
+    passthrough_nt_open_directory_object: AtomicU64::new(0),
+    passthrough_nt_create_named_pipe_file: AtomicU64::new(0),
+    passthrough_create_process_internal_w: AtomicU64::new(0),
 };
 
 #[inline]
@@ -207,17 +228,15 @@ unsafe fn ipc_roundtrip(frame: &mut Wire) {
 /// Common dispatch for the 3 handle-only hooks: NtOpenSection,
 /// NtCreate/OpenDirectoryObject. All three have the
 /// (PHANDLE, ACCESS, POBJECT_ATTRIBUTES) signature; the broker
-/// returns `r0 = handle`, `r_status = NTSTATUS`. On
-/// `FS_PASSTHROUGH` we'd need to fall back to the original
-/// syscall; the Phase-D removal of that path is upstream of this
-/// concern, so for Phase C we treat passthrough as
-/// STATUS_NOT_IMPLEMENTED — the broker's `handle_dirobj` /
-/// `handle_section` already only emits passthrough for paths
-/// outside the broker's namespace, which under the new ACL design
-/// would be handled by stamping rather than hooks.
+/// returns `r0 = handle`, `r_status = NTSTATUS`. On `FS_PASSTHROUGH`
+/// we tail-call the broker-built passthrough thunk for this hook
+/// (Phase E-5b), which is a copy of the original ntdll syscall stub's
+/// first 12/16 bytes followed by a JMP back into the syscall stub past
+/// our patch — semantically equivalent to the un-hooked syscall.
 #[inline]
 unsafe fn hook_handle_op(
-    op: u64, out_handle: *mut HANDLE, desired: u32, oa: *const c_void,
+    op: u64, passthrough_va: u64,
+    out_handle: *mut HANDLE, desired: u32, oa: *const c_void,
 ) -> NTSTATUS {
     if !ipc_loaded() {
         return NTSTATUS(0xC0000022u32 as i32); // STATUS_ACCESS_DENIED
@@ -232,12 +251,16 @@ unsafe fn hook_handle_op(
     frame.args[0] = out_handle as u64;
     ipc_roundtrip(&mut frame);
     if frame.r_status == FS_PASSTHROUGH {
-        // Phase C cdylib hooks do not implement passthrough; the
-        // broker IPC handlers (`handle_dirobj`, `handle_section`)
-        // never emit FS_PASSTHROUGH for the inputs we care about.
-        // Safety belt: return NOT_IMPLEMENTED so the caller sees
-        // a defined failure rather than a silent wrong answer.
-        return NTSTATUS(0xC0000002u32 as i32);
+        if passthrough_va == 0 {
+            // Broker requested passthrough but no thunk available
+            // (install bug). Surface a defined failure.
+            return NTSTATUS(0xC0000002u32 as i32);
+        }
+        type Fn3 = unsafe extern "system" fn(
+            *mut HANDLE, u32, *const c_void,
+        ) -> NTSTATUS;
+        let f: Fn3 = std::mem::transmute(passthrough_va as usize);
+        return f(out_handle, desired, oa);
     }
     if frame.r_status >= 0 && !out_handle.is_null() {
         std::ptr::write(out_handle, HANDLE(frame.r0 as *mut c_void));
@@ -249,21 +272,24 @@ unsafe fn hook_handle_op(
 pub unsafe extern "system" fn hook_nt_open_section(
     out_handle: *mut HANDLE, desired: u32, oa: *const c_void,
 ) -> NTSTATUS {
-    hook_handle_op(OP_NTOPENSECTION, out_handle, desired, oa)
+    let pv = IPC.passthrough_nt_open_section.load(Ordering::Acquire);
+    hook_handle_op(OP_NTOPENSECTION, pv, out_handle, desired, oa)
 }
 
 #[no_mangle]
 pub unsafe extern "system" fn hook_nt_create_directory_object(
     out_handle: *mut HANDLE, desired: u32, oa: *const c_void,
 ) -> NTSTATUS {
-    hook_handle_op(OP_NTCREATEDIROBJ, out_handle, desired, oa)
+    let pv = IPC.passthrough_nt_create_directory_object.load(Ordering::Acquire);
+    hook_handle_op(OP_NTCREATEDIROBJ, pv, out_handle, desired, oa)
 }
 
 #[no_mangle]
 pub unsafe extern "system" fn hook_nt_open_directory_object(
     out_handle: *mut HANDLE, desired: u32, oa: *const c_void,
 ) -> NTSTATUS {
-    hook_handle_op(OP_NTOPENDIROBJ, out_handle, desired, oa)
+    let pv = IPC.passthrough_nt_open_directory_object.load(Ordering::Acquire);
+    hook_handle_op(OP_NTOPENDIROBJ, pv, out_handle, desired, oa)
 }
 
 /// `NtCreateNamedPipeFile` — 14 NT args, but Wire holds 12. The
@@ -312,7 +338,23 @@ pub unsafe extern "system" fn hook_nt_create_named_pipe_file(
     };
     ipc_roundtrip(&mut frame);
     if frame.r_status == FS_PASSTHROUGH {
-        return NTSTATUS(0xC0000002u32 as i32);
+        let pv = IPC.passthrough_nt_create_named_pipe_file.load(Ordering::Acquire);
+        if pv == 0 {
+            return NTSTATUS(0xC0000002u32 as i32);
+        }
+        type Fn14 = unsafe extern "system" fn(
+            *mut HANDLE, u32, *const c_void, *mut [usize; 2],
+            u32, u32, u32, u32, u32, u32, u32, u32, u32,
+            *const i64,
+        ) -> NTSTATUS;
+        let f: Fn14 = std::mem::transmute(pv as usize);
+        return f(
+            out_handle, desired_access, oa, iosb,
+            share_access, create_disposition, create_options,
+            named_pipe_type, read_mode, completion_mode,
+            maximum_instances, inbound_quota,
+            _outbound_quota, _default_timeout,
+        );
     }
     if frame.r_status >= 0 {
         if !out_handle.is_null() {
@@ -376,6 +418,24 @@ pub unsafe extern "system" fn hook_create_process_internal_w(
         r0: 0, r1: 0, r2: 0, r3: 0, r_status: 0, r_error: 0,
     };
     ipc_roundtrip(&mut frame);
+    if frame.r_status == FS_PASSTHROUGH {
+        let pv = IPC.passthrough_create_process_internal_w.load(Ordering::Acquire);
+        if pv == 0 {
+            return 0;
+        }
+        type FnCpw = unsafe extern "system" fn(
+            HANDLE, *const u16, *mut u16, *const c_void, *const c_void,
+            i32, u32, *mut c_void, *const u16, *const c_void,
+            *mut ProcessInformation, *mut HANDLE,
+        ) -> i32;
+        let f: FnCpw = std::mem::transmute(pv as usize);
+        return f(
+            _h_token, application_name, command_line,
+            process_attrs, thread_attrs, inherit_handles, creation_flags,
+            environment, current_directory, startup_info,
+            process_information, new_token,
+        );
+    }
     // Write back PROCESS_INFORMATION on success. r_status is the
     // BOOL the kernel-side spawn returned (1 = success, 0 = failure).
     if frame.r_status != 0 && !process_information.is_null() {

@@ -56,7 +56,7 @@
 
 #![cfg(windows)]
 
-use crate::interception::{ntdll_export, write_remote_bytes};
+use crate::interception::{ntdll_export, write_remote_bytes, PassthroughThunks};
 use crate::ipc::StubAddrs;
 use anyhow::{anyhow, bail, Context, Result};
 use std::ffi::c_void;
@@ -248,7 +248,8 @@ pub fn manual_map_cdylib(target: HANDLE, dll_path: &Path) -> Result<ManualMapped
 }
 
 /// Pre-fill the cdylib's `IPC` static with the IPC channel handles +
-/// section VA. Layout (must match `crates/ac-cdylib/src/lib.rs::IpcEnv`):
+/// section VA + passthrough thunk VAs. Layout (must match
+/// `crates/ac-cdylib/src/lib.rs::IpcEnv`):
 ///
 ///   ```c
 ///   struct IpcEnv {
@@ -256,20 +257,36 @@ pub fn manual_map_cdylib(target: HANDLE, dll_path: &Path) -> Result<ManualMapped
 ///     u64 ev_req;    // 0x08 — target-side event handle
 ///     u64 ev_resp;   // 0x10 — target-side event handle
 ///     u64 mutex;     // 0x18 — target-side mutant handle
+///     u64 passthrough_nt_open_section;             // 0x20
+///     u64 passthrough_nt_create_directory_object;  // 0x28
+///     u64 passthrough_nt_open_directory_object;    // 0x30
+///     u64 passthrough_nt_create_named_pipe_file;   // 0x38
+///     u64 passthrough_create_process_internal_w;   // 0x40
 ///   };
 ///   ```
 ///
 /// Each `AtomicU64` is `repr(C)` over a `u64`, so `WriteProcessMemory`
-/// of four contiguous `u64`s is byte-equivalent to four
+/// of nine contiguous `u64`s is byte-equivalent to nine
 /// `AtomicU64::store(Relaxed)`. The pre-resume write happens-before
 /// any AC-side observation (every AC thread starts after
 /// `ResumeThread`).
-pub fn prefill_ipc(target: HANDLE, ipc_va: usize, addrs: &StubAddrs) -> Result<()> {
-    let payload: [u64; 4] = [
+///
+/// CPW's passthrough VA is filled in later via [`prefill_cpw_passthrough`]
+/// because `kernelbase!CreateProcessInternalW` isn't located until the
+/// loader has mapped kernelbase post-resume.
+pub fn prefill_ipc(
+    target: HANDLE, ipc_va: usize, addrs: &StubAddrs, pt: &PassthroughThunks,
+) -> Result<()> {
+    let payload: [u64; 9] = [
         addrs.section as u64,
         addrs.ev_req,
         addrs.ev_resp,
         addrs.mutex,
+        pt.nt_open_section as u64,
+        pt.nt_create_directory_object as u64,
+        pt.nt_open_directory_object as u64,
+        pt.nt_create_named_pipe_file as u64,
+        pt.create_process_internal_w as u64,
     ];
     write_remote_bytes(
         target,
@@ -277,11 +294,25 @@ pub fn prefill_ipc(target: HANDLE, ipc_va: usize, addrs: &StubAddrs) -> Result<(
         unsafe {
             std::slice::from_raw_parts(
                 payload.as_ptr() as *const u8,
-                size_of::<[u64; 4]>(),
+                size_of::<[u64; 9]>(),
             )
         },
     )
     .context("WriteProcessMemory(IPC env prefill)")
+}
+
+/// Phase E-5b: late-stage passthrough write for
+/// `CreateProcessInternalW`. The CPW passthrough thunk is built by
+/// `interception::install_cpw` *after* the loader maps kernelbase, so
+/// by the time we have its VA the IPC env is already prefilled.
+/// This patches just the trailing `passthrough_create_process_internal_w`
+/// field at offset 0x40 from `IPC`.
+pub fn prefill_cpw_passthrough(
+    target: HANDLE, ipc_va: usize, cpw_passthrough_va: usize,
+) -> Result<()> {
+    let payload = (cpw_passthrough_va as u64).to_le_bytes();
+    write_remote_bytes(target, ipc_va + 0x40, &payload)
+        .context("WriteProcessMemory(IPC cpw_passthrough)")
 }
 
 // ─── PE header parsing ─────────────────────────────────────────────

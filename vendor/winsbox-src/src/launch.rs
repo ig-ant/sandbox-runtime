@@ -726,15 +726,6 @@ fn try_inject_cdylib_full(
         std::process::id(),
     );
 
-    // Pre-fill the cdylib's `IPC` data export with the IPC channel's
-    // target-side handles. Bypasses the Phase-D DllMain init path
-    // (which never runs in manual-map mode).
-    if let Err(e) = crate::manual_map::prefill_ipc(target, mapped.ipc_va, &stub_addrs) {
-        drop(ch);
-        cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
-        return Err(e.context("manual_map::prefill_ipc"));
-    }
-
     let entries = interception::CdylibHookEntries {
         nt_open_section: mapped.hook_nt_open_section,
         nt_create_directory_object: mapped.hook_nt_create_directory_object,
@@ -755,17 +746,40 @@ fn try_inject_cdylib_full(
     //      hooks all dispatch into ABS_JMP target VAs that are valid
     //      *before the loader runs*. Cygwin's first NtOpenSection
     //      from DllMain hits our hook → IPC → broker → success.
-    if let Err(e) = interception::install_fs(target, &stub_addrs, Some(&entries)) {
+    //
+    //      Phase E-5b: install_fs/install_reg also build "passthrough
+    //      thunks" alongside each cdylib-dispatched hook — copies of
+    //      the original syscall stub bytes + JMP back into the syscall.
+    //      The cdylib calls these on `FS_PASSTHROUGH` from the broker
+    //      so syscalls outside the broker's namespace go to the kernel
+    //      directly (was previously STATUS_NOT_IMPLEMENTED).
+    let mut pt = interception::PassthroughThunks::default();
+    if let Err(e) = interception::install_fs(target, &stub_addrs, Some(&entries), &mut pt) {
         drop(ch);
         cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
         return Err(e.context("install_fs (manual-map)"));
     }
-    if let Err(e) = interception::install_reg(target, &stub_addrs, Some(&entries)) {
+    if let Err(e) = interception::install_reg(target, &stub_addrs, Some(&entries), &mut pt) {
         drop(ch);
         cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
         return Err(e.context("install_reg (manual-map)"));
     }
-    log!("cdylib ntdll hooks patched pre-resume");
+    log!(
+        "cdylib ntdll hooks patched pre-resume; passthrough thunks: \
+         section={:#x} dirobj_create={:#x} dirobj_open={:#x} pipe={:#x}",
+        pt.nt_open_section, pt.nt_create_directory_object,
+        pt.nt_open_directory_object, pt.nt_create_named_pipe_file,
+    );
+
+    // Pre-fill the cdylib's `IPC` data export with the IPC channel's
+    // target-side handles + passthrough thunk VAs. Bypasses the
+    // Phase-D DllMain init path (which never runs in manual-map mode).
+    // CPW's passthrough VA lands later (post-loader, see step 8).
+    if let Err(e) = crate::manual_map::prefill_ipc(target, mapped.ipc_va, &stub_addrs, &pt) {
+        drop(ch);
+        cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
+        return Err(e.context("manual_map::prefill_ipc"));
+    }
 
     // ── 5b. **Phase E-4 fix:** spawn `serve_ipc` BEFORE the entry
     //       rendezvous + ResumeThread. Without this, the loader's
@@ -913,11 +927,26 @@ fn try_inject_cdylib_full(
     //      bash and friends do need it; if patching fails there,
     //      grandchild spawns won't be hooked but the target still
     //      loads and runs.
+    //
+    //      Phase E-5b: install_cpw builds CPW's passthrough thunk
+    //      (saved CPW prologue + JMP back). After patching, write the
+    //      thunk VA into the cdylib's `IPC.passthrough_create_process_internal_w`
+    //      slot (offset 0x40) so cdylib's CPW hook can passthrough.
     match crate::entry_trampoline::cpw_address() {
         Ok(cpw_va) => match interception::install_cpw(
-            target, &stub_addrs, cpw_va, Some(&entries),
+            target, &stub_addrs, cpw_va, Some(&entries), &mut pt,
         ) {
-            Ok(()) => log!("cdylib CPW hook patched post-loader"),
+            Ok(()) => {
+                log!(
+                    "cdylib CPW hook patched post-loader; cpw passthrough={:#x}",
+                    pt.create_process_internal_w,
+                );
+                if let Err(e) = crate::manual_map::prefill_cpw_passthrough(
+                    target, mapped.ipc_va, pt.create_process_internal_w,
+                ) {
+                    log!("cpw passthrough write failed: {e:#}");
+                }
+            }
             Err(e) => log!(
                 "cdylib CPW patch failed ({e:#}); grandchild spawns won't be hooked",
             ),
@@ -1076,14 +1105,15 @@ fn install_broker_hook(
     let ch = ipc::Channel::create(target)?;
     let addrs = ch.stub_env_snapshot();
     let sync = crate::entry_trampoline::install(target, thread, suspend_after)?;
+    let mut pt = interception::PassthroughThunks::default();
     if ctx.hook_fs {
         // Phase C: Mode::Broker still uses the legacy inline-asm IPC
         // stubs (cdylib = None). The cdylib path is exercised through
         // the run_confined cdylib_active branch above. install_cpw on
         // ARM64 requires cdylib; Mode::Broker on ARM64 was already
         // gated off in run_confined.
-        interception::install_fs(target, &addrs, None)?;
-        interception::install_reg(target, &addrs, None)?;
+        interception::install_fs(target, &addrs, None, &mut pt)?;
+        interception::install_reg(target, &addrs, None, &mut pt)?;
     }
     let target_raw = target.0 as isize;
     let ctx_thread = ctx.clone();
@@ -1095,7 +1125,7 @@ fn install_broker_hook(
     // Loader done; kernelbase is mapped and the target is parked
     // in the entry stub.
     let cpw = crate::entry_trampoline::cpw_address()?;
-    interception::install_cpw(target, &addrs, cpw, None)?;
+    interception::install_cpw(target, &addrs, cpw, None, &mut pt)?;
     let _ = ctx;
     sync.go();
     Ok(())
@@ -1450,46 +1480,11 @@ fn handle_dirobj(
     let suffix = match suffix {
         Some(s) => s,
         None => {
-            // Phase E-1: cdylib mode hooks fire pre-resume, including
-            // for the loader's own NtOpenDirectoryObject calls (e.g.
-            // `\KnownDlls`). The cdylib hook can't tail-call the
-            // saved original — that infrastructure landed with the
-            // legacy inline-asm stub. Broker the open ourselves
-            // instead; system directories like `\KnownDlls` accept
-            // an open from any token, so the broker-side handle is
-            // valid for the target.
-            //
-            // Read access only — broker-mode also passes through on
-            // write, but a directory object's "write" is creating
-            // children, which the loader never does on `\KnownDlls`.
-            // Falls back to FS_PASSTHROUGH on the (rare) write open
-            // — that path was already broken on cdylib since Phase D.
-            // DIRECTORY_QUERY (0x1) | DIRECTORY_TRAVERSE (0x2) =
-            // 0x3 is what every loader opens `\KnownDlls` with.
-            // DIRECTORY_CREATE_OBJECT (0x4) and DIRECTORY_CREATE_SUBDIRECTORY
-            // (0x8) are write bits — those still passthrough.
-            const DIROBJ_WRITE_BITS: u32 = 0x4 | 0x8;
-            let is_read_only = (access & DIROBJ_WRITE_BITS) == 0;
-            if is_read_only && root_raw == 0 && !leaf.is_empty()
-                && leaf.starts_with('\\')
-            {
-                match broker_open_dirobj(&leaf, access) {
-                    Ok(h) => {
-                        let th = ch.dup_to_target(h).unwrap_or(0);
-                        unsafe { let _ = CloseHandle(h); }
-                        eprintln!(
-                            "[sbox-exec] dirobj: broker-opened {leaf} access={access:#x} → {th:#x}",
-                        );
-                        ch.reply_fs(th, 0, 0);
-                        return;
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[sbox-exec] dirobj: broker-open {leaf} access={access:#x}: {e:#}",
-                        );
-                    }
-                }
-            }
+            // Phase E-5b: paths outside the per-AC BNO suffix space
+            // (e.g. `\KnownDlls`, `\Sessions\BNOLINKS\…`) FS_PASSTHROUGH
+            // back to the cdylib, which now tail-calls the saved-original
+            // syscall thunk we built alongside the hook patch. The kernel
+            // grants `\KnownDlls` access to any token, including AC.
             if ctx.trace {
                 eprintln!(
                     "[sbox-exec] dirobj: passthrough root={root_raw:#x} {leaf} access={access:#x}",
@@ -1541,45 +1536,6 @@ fn handle_dirobj(
     let th = ch.dup_to_target(h).unwrap_or(0);
     unsafe { let _ = CloseHandle(h); }
     ch.reply_fs(th, 0, 0);
-}
-
-/// Phase E-1 helper: open an absolute directory-object path from the
-/// broker's token. Used by `handle_dirobj` to broker `\KnownDlls`-
-/// style opens that the cdylib hook can't tail-call to the saved
-/// original syscall (saved-original infrastructure went away with
-/// the legacy inline-asm stub).
-fn broker_open_dirobj(path: &str, access: u32) -> Result<HANDLE> {
-    use windows::Wdk::Foundation::OBJECT_ATTRIBUTES;
-    use windows::Win32::Foundation::{NTSTATUS, UNICODE_STRING};
-    #[link(name = "ntdll")]
-    extern "system" {
-        fn NtOpenDirectoryObject(
-            h: *mut HANDLE, access: u32, oa: *const OBJECT_ATTRIBUTES,
-        ) -> NTSTATUS;
-    }
-    unsafe {
-        let mut wpath = wstr(path);
-        if wpath.last() == Some(&0) { wpath.pop(); }
-        let us = UNICODE_STRING {
-            Length: (wpath.len() * 2) as u16,
-            MaximumLength: (wpath.len() * 2) as u16,
-            Buffer: PWSTR(wpath.as_mut_ptr()),
-        };
-        let oa = OBJECT_ATTRIBUTES {
-            Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
-            RootDirectory: HANDLE::default(),
-            ObjectName: &us as *const _ as *mut _,
-            Attributes: 0x40, // OBJ_CASE_INSENSITIVE
-            SecurityDescriptor: std::ptr::null_mut(),
-            SecurityQualityOfService: std::ptr::null_mut(),
-        };
-        let mut h = HANDLE::default();
-        let st = NtOpenDirectoryObject(&mut h, access, &oa);
-        if st.0 < 0 {
-            bail!("NtOpenDirectoryObject({path}) access={access:#x}: {:#x}", st.0);
-        }
-        Ok(h)
-    }
 }
 
 /// `NtCreateNamedPipeFile`: same args[0..3] shape as
