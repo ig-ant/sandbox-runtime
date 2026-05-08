@@ -694,6 +694,34 @@ fn try_inject_cdylib_full(
             cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
             return Err(e.context("manual_map::prefill_trace_passthroughs"));
         }
+        // Phase K fix-up: read the slots back from target memory and
+        // assert every non-skipped install lands as a non-zero VA. A
+        // silent zero here would have the cdylib's `hook_*_trace` body
+        // return STATUS_NOT_IMPLEMENTED to the loader and typically AV
+        // it during early bootstrap. Surfacing a log line keeps the
+        // diagnostic one grep away when the IPC slot offset, ordering,
+        // or `WriteProcessMemory` regresses, instead of the symptom
+        // appearing only as a 0xC0000005 in the target.
+        let mut readback = [0u64; crate::ipc::TRACE_SYSCALL_COUNT];
+        if interception::read_remote_bytes(
+            target, mapped.ipc_va + 0x48,
+            unsafe {
+                std::slice::from_raw_parts_mut(
+                    readback.as_mut_ptr() as *mut u8,
+                    std::mem::size_of::<[u64; crate::ipc::TRACE_SYSCALL_COUNT]>(),
+                )
+            },
+        ).is_ok() {
+            for (i, &v) in readback.iter().enumerate() {
+                if v == 0 && trace_pt.thunks[i] != 0 {
+                    log!(
+                        "WARN: trace passthrough readback for {} is zero \
+                         but install set thunk={:#x} — IPC offset drift?",
+                        crate::ipc::TRACE_SYSCALL_NAMES[i], trace_pt.thunks[i],
+                    );
+                }
+            }
+        }
     }
 
     // ── 5b. **Phase E-4 fix:** spawn `serve_ipc` BEFORE the entry

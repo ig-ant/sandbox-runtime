@@ -23,17 +23,19 @@
 //! Pass criteria:
 //!   * Broker stderr contains "trace hooks patched pre-resume" (i.e.,
 //!     install_trace ran and didn't bail).
-//!   * If the entry rendezvous completed (target's loader ran past
-//!     RtlUserThreadStart), broker stderr contains at least 5
-//!     `[sbox-trace]` lines.
+//!   * Target exits cleanly (exit code 0).
+//!   * Broker stderr contains at least `TRACE_FLOOR` (5)
+//!     `[sbox-trace]` lines — the loader's bootstrap exercises every
+//!     trace syscall family on the standard sleep_target path.
 //!
-//! Why we don't require broker exit 0: as of Phase K the ARM64 host
-//! still hits a pre-existing 0xC0000005 in the entry-trampoline path
-//! when injection-mode is on. `smoke_cdylib` ships green via the same
-//! relaxed shape — the test checks the `cdylib reported back` stderr
-//! line and ignores the propagated target exit. The crash is the
-//! reason trace mode exists; Phase K can't fix it, only instrument it.
-//! Phase L iterates on the underlying issue.
+//! No "degraded pass" mode. The Phase K fix-up forced the dev-profile
+//! `ac-cdylib` to opt-level 2 (matching release) so the manual-mapped
+//! hook bodies behave identically across `cargo build` and
+//! `cargo build --release`. If the target AVs at 0xC0000005 again, the
+//! diagnostic regression caught one of: a hook bytecode bug (debug-
+//! profile codegen, `extern "system"` ABI break), a manual-map fixup
+//! gap (relocation/section-protection drift), or an IPC env layout
+//! mismatch (cdylib `IpcEnv` vs broker `prefill_ipc` slot offsets).
 //!
 //! Default-OFF check is covered by `smoke_cdylib` itself: if this
 //! example introduces overhead in the no-env-var path, that test
@@ -66,11 +68,17 @@ fn main() {
         }
         let exe = std::env::current_exe().ok()?;
         let exe_dir = exe.parent()?;
+        // Check the example's own debug/release sibling first, then
+        // fall back to peer profile dirs. With the Phase K fix-up
+        // forcing opt-level=2 on the ac-cdylib package even in dev,
+        // both profiles produce a usable cdylib; we still prefer the
+        // sibling profile so a `cargo run --example smoke_trace`
+        // (debug) doesn't accidentally pick a stale release artifact.
         for c in [
             exe_dir.join("ac_cdylib.dll"),
-            exe_dir.parent().map(|p| p.join("release").join("ac_cdylib.dll"))
-                .unwrap_or_default(),
             exe_dir.parent().map(|p| p.join("debug").join("ac_cdylib.dll"))
+                .unwrap_or_default(),
+            exe_dir.parent().map(|p| p.join("release").join("ac_cdylib.dll"))
                 .unwrap_or_default(),
         ] {
             if c.exists() {
@@ -211,34 +219,50 @@ fn main() {
     }
     log!("OK: {}", install_line.unwrap());
 
-    // Did the entry rendezvous complete? If yes, demand trace lines;
-    // if no (target crashed before the loader ran — pre-existing
-    // ARM64 baseline), trace lines never had a chance to fire and
-    // we pass on the install-line alone.
+    // Hard gate: target must have exited cleanly. Pre-fix-up the dev
+    // cdylib AVed during the loader's first hook entry (debug-profile
+    // ARM64 codegen quirk in the hook prologue); the fix-up matches
+    // dev's `ac-cdylib` opt-level to release, so any 0xC0000005 from
+    // here on is a real regression in either the cdylib's hook bodies,
+    // the manual-map fixups, or the IPC env layout. Don't paper over
+    // it with a "degraded pass".
     let rendezvous_failed = stderr_dump.lines().any(|l|
         l.contains("entry rendezvous failed") ||
         l.contains("cdylib injection setup failed")
     );
+    if rendezvous_failed {
+        log!("FAIL: entry rendezvous failed — target AVed before the loader ran");
+        for l in stderr_dump.lines() {
+            if l.contains("rendezvous") || l.contains("setup failed") ||
+                l.contains("target exit") {
+                log!("  {}", l);
+            }
+        }
+        std::process::exit(2);
+    }
+    if status.code() != Some(0) {
+        log!(
+            "FAIL: target exit was {:?}, expected 0 — loader hit a hook \
+             that crashed mid-run", status.code(),
+        );
+        std::process::exit(2);
+    }
 
+    // Hard gate: must see at least TRACE_FLOOR `[sbox-trace]` lines.
+    // The loader's bootstrap exercises every trace family
+    // (NtCreateEvent, NtOpenKey, NtQueryValueKey, NtOpenFile,
+    // NtDeviceIoControlFile) on the standard sleep_target path; floor
+    // is comfortably below the typical 40+ count. Zero trace lines
+    // means the cdylib never had a chance to call ipc_trace_send,
+    // which (given a clean target exit) implies the install path
+    // skipped every hook.
     let trace_lines: Vec<&str> = stderr_dump.lines()
         .filter(|l| l.contains("[sbox-trace]"))
         .collect();
     log!("trace lines emitted: {}", trace_lines.len());
     const TRACE_FLOOR: usize = 5;
-
-    if rendezvous_failed {
-        // Target died before the loader could exercise the trace hooks.
-        // Phase K can't fix that — only instrument it. Phase L
-        // iterates on the underlying issue.
-        log!(
-            "PASS (degraded): entry rendezvous failed — loader didn't run; \
-             install verified but no trace fire opportunity"
-        );
-        std::process::exit(0);
-    }
-
     if trace_lines.len() < TRACE_FLOOR {
-        log!("FAIL: only {} trace lines, expected ≥{} (loader ran)",
+        log!("FAIL: only {} trace lines, expected ≥{} (loader ran but no traces fired)",
              trace_lines.len(), TRACE_FLOOR);
         for l in &trace_lines { log!("  {}", l); }
         std::process::exit(2);
@@ -246,7 +270,7 @@ fn main() {
     log!("PASS: {} trace lines (≥{})", trace_lines.len(), TRACE_FLOOR);
 
     // Echo a few sample lines for the operator — useful when running
-    // this manually post-Phase-K to eyeball trace coverage.
+    // this manually to eyeball trace coverage.
     log!("sample trace output:");
     for l in trace_lines.iter().take(5) {
         log!("  {}", l);

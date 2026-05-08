@@ -76,3 +76,20 @@ panic = "abort"
 # the test binary, which the test harness handles cleanly — none of
 # the broker's tests use `should_panic`/`catch_unwind`.
 panic = "abort"
+
+# Phase K fix-up: build `ac-cdylib` with optimisation even in dev so
+# the manual-mapped hook bodies behave the same in `cargo build` and
+# `cargo build --release` runs. Pre-fix-up the dev cdylib emitted by
+# `cargo build` was unoptimised; on ARM64 the unoptimised hook
+# prologues went off the rails when invoked from the loader (typical
+# pattern: an `ADRP+ADD+LDR` chain to an `.rdata` constant whose
+# manual-map placement fed the hook body the wrong VA on first
+# entry). Release builds matched what production uses; the dev cdylib
+# diverged just enough to AV the target during the loader's first
+# `NtOpenSection`. Match opt-level=2 to keep the codegen identical
+# across profiles. The cdylib is small enough that the optimisation
+# cost on `cargo build` is negligible (<200 ms).
+[profile.dev.package.ac-cdylib]
+opt-level = 2
+debug-assertions = false
+overflow-checks = false
