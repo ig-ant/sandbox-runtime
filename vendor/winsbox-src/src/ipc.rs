@@ -46,6 +46,51 @@ pub const OP_NTCREATEDIROBJ: u64 = 8;
 pub const OP_NTOPENDIROBJ: u64 = 9;
 pub const OP_NTCREATENAMEDPIPE: u64 = 10;
 
+/// Phase K trace frame. Sent by the cdylib's `hook_*_trace` bodies
+/// after the passthrough thunk has run; broker logs the syscall +
+/// arg summary + NTSTATUS to stderr and replies with a no-op ACK.
+/// `args[0]` holds the trace-syscall-id (see `TRACE_*` constants
+/// below); the remaining `args` slots are op-specific arg pointers.
+pub const OP_TRACE: u64 = 100;
+
+// ─── Phase K: trace-mode syscall IDs ───────────────────────────────
+//
+// Indexed into `IpcEnv.passthrough_trace` on the cdylib side and
+// `TRACE_SYSCALL_NAMES` here. Order must match the cdylib's
+// `TRACE_*` constants byte-for-byte.
+
+pub const TRACE_NT_CREATE_FILE: u64 = 0;
+pub const TRACE_NT_OPEN_FILE: u64 = 1;
+pub const TRACE_NT_DEVICE_IO_CONTROL_FILE: u64 = 2;
+pub const TRACE_NT_ALPC_CONNECT_PORT: u64 = 3;
+pub const TRACE_NT_ALPC_SEND_WAIT_RECEIVE_PORT: u64 = 4;
+pub const TRACE_NT_OPEN_KEY: u64 = 5;
+pub const TRACE_NT_OPEN_KEY_EX: u64 = 6;
+pub const TRACE_NT_QUERY_VALUE_KEY: u64 = 7;
+pub const TRACE_NT_CREATE_EVENT: u64 = 8;
+pub const TRACE_NT_OPEN_EVENT: u64 = 9;
+pub const TRACE_NT_CREATE_MUTANT: u64 = 10;
+pub const TRACE_NT_OPEN_MUTANT: u64 = 11;
+
+pub const TRACE_SYSCALL_COUNT: usize = 12;
+
+/// (id → ntdll export name) lookup for the install path *and* the
+/// log emitter. Indexed by the `TRACE_*` ids above.
+pub const TRACE_SYSCALL_NAMES: [&str; TRACE_SYSCALL_COUNT] = [
+    "NtCreateFile",
+    "NtOpenFile",
+    "NtDeviceIoControlFile",
+    "NtAlpcConnectPort",
+    "NtAlpcSendWaitReceivePort",
+    "NtOpenKey",
+    "NtOpenKeyEx",
+    "NtQueryValueKey",
+    "NtCreateEvent",
+    "NtOpenEvent",
+    "NtCreateMutant",
+    "NtOpenMutant",
+];
+
 /// Sentinel `r_status` the broker returns when the cdylib hook
 /// should tail-call the saved-original syscall (the kernel handles
 /// the open natively) instead of returning the broker's reply.
@@ -194,6 +239,17 @@ impl Channel {
             (*self.view).r_status = status;
             let _ = SetEvent(self.ev_resp);
         }
+    }
+
+    /// Phase K: ACK a `OP_TRACE` request. Trace frames are one-way
+    /// from a semantic standpoint (the broker only logs and doesn't
+    /// modify caller state), but the cdylib's `ipc_roundtrip` still
+    /// waits on `ev_resp` before releasing the per-channel mutant —
+    /// without that wait, the next thread's frame would race the
+    /// broker's read of the previous one. So we set `ev_resp` here
+    /// without touching any reply fields.
+    pub fn reply_trace_ack(&self) {
+        unsafe { let _ = SetEvent(self.ev_resp); }
     }
 
     /// Duplicate a broker-owned handle into the target's table and

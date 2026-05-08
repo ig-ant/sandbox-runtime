@@ -22,7 +22,7 @@ use windows::Win32::Foundation::HANDLE;
 
 use crate::interception::{
     alloc_remote_rx, ntdll_export, read_remote_bytes, write_remote_bytes,
-    CdylibHookEntries, PassthroughThunks,
+    CdylibHookEntries, PassthroughThunks, TracePassthroughs,
 };
 use crate::ipc::StubAddrs;
 
@@ -105,6 +105,43 @@ pub fn install_cpw(
     pt.create_process_internal_w = build_passthrough_thunk(target, cpw_va)?;
     patch_with_abs_jmp(target, "CreateProcessInternalW", cpw_va,
                        c.create_process_internal_w)?;
+    Ok(())
+}
+
+/// Phase K: ARM64 mirror of `install_trace` from `interception_x64.rs`.
+/// Same passthrough-then-ABS_JMP shape; on ARM64 the patch is 16
+/// bytes (LDR x16, .+8 ; BR x16 ; <quad target>) instead of 12.
+pub fn install_trace(
+    target: HANDLE,
+    trace_hook_vas: &[usize; crate::ipc::TRACE_SYSCALL_COUNT],
+    out_pt: &mut TracePassthroughs,
+) -> Result<()> {
+    for (i, &name) in crate::ipc::TRACE_SYSCALL_NAMES.iter().enumerate() {
+        let dest = trace_hook_vas[i];
+        if dest == 0 {
+            eprintln!("[sbox-exec] interception(trace,arm64): cdylib export missing for {name}; skip");
+            continue;
+        }
+        let va = match ntdll_export(name) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[sbox-exec] interception(trace,arm64): ntdll!{name} unresolved ({e:#}); skip");
+                continue;
+            }
+        };
+        let thunk_va = match build_passthrough_thunk(target, va) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("[sbox-exec] interception(trace,arm64): {name} thunk build failed ({e:#}); skip");
+                continue;
+            }
+        };
+        out_pt.thunks[i] = thunk_va;
+        if let Err(e) = patch_with_abs_jmp(target, name, va, dest) {
+            eprintln!("[sbox-exec] interception(trace,arm64): {name} patch failed ({e:#}); skip");
+            out_pt.thunks[i] = 0;
+        }
+    }
     Ok(())
 }
 

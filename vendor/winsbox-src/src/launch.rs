@@ -653,6 +653,29 @@ fn try_inject_cdylib_full(
         pt.nt_open_directory_object, pt.nt_create_named_pipe_file,
     );
 
+    // Phase K: opt-in trace-mode hook install. When
+    // `WINSBOX_TRACE_SYSCALLS=1`, patch in 12 additional `Nt*`
+    // syscalls that bash bootstrap plausibly hits (FS opens, IOCTL,
+    // ALPC, registry, sync primitives). Each is a passthrough+log
+    // shape — no semantic change, just an IPC frame to the broker so
+    // the bash crash diagnostic has data. Default OFF: no install,
+    // no trace bytecode in the target, zero cost.
+    let trace_mode = std::env::var("WINSBOX_TRACE_SYSCALLS")
+        .ok().is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let mut trace_pt = interception::TracePassthroughs::default();
+    if trace_mode {
+        if let Err(e) = interception::install_trace(target, &mapped.hook_trace, &mut trace_pt) {
+            drop(ch);
+            cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
+            return Err(e.context("install_trace (manual-map)"));
+        }
+        let installed = trace_pt.thunks.iter().filter(|&&v| v != 0).count();
+        log!(
+            "cdylib trace hooks patched pre-resume ({}/{} of TRACE_SYSCALL_NAMES)",
+            installed, crate::ipc::TRACE_SYSCALL_COUNT,
+        );
+    }
+
     // Pre-fill the cdylib's `IPC` data export with the IPC channel's
     // target-side handles + passthrough thunk VAs. Bypasses the
     // Phase-D DllMain init path (which never runs in manual-map mode).
@@ -661,6 +684,16 @@ fn try_inject_cdylib_full(
         drop(ch);
         cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
         return Err(e.context("manual_map::prefill_ipc"));
+    }
+    if trace_mode {
+        // Phase K: write the trace passthrough VAs into IPC.passthrough_trace.
+        if let Err(e) = crate::manual_map::prefill_trace_passthroughs(
+            target, mapped.ipc_va, &trace_pt.thunks,
+        ) {
+            drop(ch);
+            cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
+            return Err(e.context("manual_map::prefill_trace_passthroughs"));
+        }
     }
 
     // ── 5b. **Phase E-4 fix:** spawn `serve_ipc` BEFORE the entry
@@ -975,11 +1008,132 @@ fn serve_ipc(ch: ipc::Channel, target_raw: isize, ctx: Arc<SpawnCtx>) {
                 handle_dirobj(&ch, target, &req, &ctx),
             ipc::OP_NTCREATENAMEDPIPE =>
                 handle_named_pipe(&ch, target, &req, &ctx),
+            ipc::OP_TRACE =>
+                handle_trace(&ch, target, &req),
             op => {
                 eprintln!("[sbox-exec] ipc: unknown op {op}");
                 ch.reply_fs(0, 0, 0xC0000002u32 as i32 /* STATUS_NOT_IMPLEMENTED */);
             }
         }
+    }
+}
+
+/// Phase K: log a trace frame and ACK. `req.args[0]` carries the
+/// trace-syscall-id (index into `ipc::TRACE_SYSCALL_NAMES`); the
+/// remaining args are op-specific. The wire's `r_status` is the
+/// NTSTATUS the in-target syscall returned; we render it hex.
+///
+/// Format (whitespace-separated, fixed-shape so it's grep/awk-able):
+///
+///   [sbox-trace] tid=<u32> <syscall_name> <arg_summary> -> 0x<ntstatus>
+///
+/// `tid` here is *not* the AC-target thread id — we don't have it
+/// over the wire. Use 0 as a placeholder until a TID slot is added
+/// to the trace frame; downstream (Phase L) iterates on what the
+/// trace data should include and may extend the wire.
+///
+/// TODO(`WINSBOX_TRACE_FILE`): the plan suggests an optional file
+/// sink. One-line follow-up: open the path on first trace, hold a
+/// `Mutex<File>` in `SpawnCtx`, write through here. Skipped in this
+/// phase — broker stderr is sufficient for the Phase L diagnostic
+/// loop and avoids a per-frame I/O lock contention question.
+fn handle_trace(ch: &ipc::Channel, target: HANDLE, req: &ipc::Wire) {
+    let id = req.args[0] as usize;
+    let name = ipc::TRACE_SYSCALL_NAMES.get(id).copied().unwrap_or("?");
+    let status = req.r_status as u32;
+    let summary = trace_arg_summary(target, id, req);
+    eprintln!(
+        "[sbox-trace] tid=0 {name} {summary} -> {:#010x}",
+        status,
+    );
+    ch.reply_trace_ack();
+}
+
+/// Build the per-syscall arg summary for a trace log line.
+/// Best-effort: failures (non-readable target memory, malformed
+/// strings) print `?` rather than blowing up the trace.
+fn trace_arg_summary(target: HANDLE, id: usize, req: &ipc::Wire) -> String {
+    use ipc::*;
+    // Helper: read OBJECT_ATTRIBUTES.ObjectName from `oa_va` and
+    // truncate at 128 chars. Falls back to "?" on any error.
+    let oa_path = |va: u64| -> String {
+        if va == 0 { return "(null)".to_string(); }
+        match read_target_oa_raw(target, va as usize) {
+            Ok((_root, name)) => {
+                let mut n = name;
+                if n.chars().count() > 128 {
+                    n = n.chars().take(128).collect::<String>() + "…";
+                }
+                n
+            }
+            Err(_) => "?".to_string(),
+        }
+    };
+    // Helper: read a UNICODE_STRING* (PortName, ValueName) from
+    // `us_va` directly.
+    let ustr = |va: u64| -> String {
+        if va == 0 { return "(null)".to_string(); }
+        #[repr(C)] #[derive(Clone, Copy)]
+        struct UStr { len: u16, max: u16, _pad: u32, buf: u64 }
+        match interception::read_remote::<UStr>(target, va as usize) {
+            Ok(u) if u.len > 0 && u.len <= 32768 && u.buf != 0 => {
+                interception::read_remote_wstr(target, u.buf as usize, u.len as usize)
+                    .unwrap_or_else(|_| "?".to_string())
+            }
+            Ok(_) => String::new(),
+            Err(_) => "?".to_string(),
+        }
+    };
+    match id as u64 {
+        TRACE_NT_CREATE_FILE => format!(
+            "path={:?} access={:#x} disp={:#x}",
+            oa_path(req.args[1]), req.args[2] as u32, req.args[3] as u32,
+        ),
+        TRACE_NT_OPEN_FILE => format!(
+            "path={:?} access={:#x} opts={:#x}",
+            oa_path(req.args[1]), req.args[2] as u32, req.args[3] as u32,
+        ),
+        TRACE_NT_DEVICE_IO_CONTROL_FILE => format!(
+            "h={:#x} ioctl={:#010x} in_len={} out_len={}",
+            req.args[1], req.args[2] as u32, req.args[3], req.args[4],
+        ),
+        TRACE_NT_ALPC_CONNECT_PORT => format!(
+            "port={:?} flags={:#x}",
+            ustr(req.args[1]), req.args[2] as u32,
+        ),
+        TRACE_NT_ALPC_SEND_WAIT_RECEIVE_PORT => format!(
+            "h={:#x} flags={:#x}",
+            req.args[1], req.args[2] as u32,
+        ),
+        TRACE_NT_OPEN_KEY => format!(
+            "key={:?} access={:#x}",
+            oa_path(req.args[1]), req.args[2] as u32,
+        ),
+        TRACE_NT_OPEN_KEY_EX => format!(
+            "key={:?} access={:#x} opts={:#x}",
+            oa_path(req.args[1]), req.args[2] as u32, req.args[3] as u32,
+        ),
+        TRACE_NT_QUERY_VALUE_KEY => format!(
+            "key_h={:#x} value={:?} class={} buf_len={}",
+            req.args[1], ustr(req.args[2]), req.args[3] as u32, req.args[4],
+        ),
+        TRACE_NT_CREATE_EVENT => format!(
+            "name={:?} access={:#x} type={} state={}",
+            oa_path(req.args[1]), req.args[2] as u32, req.args[3] as u32, req.args[4] as u8,
+        ),
+        TRACE_NT_OPEN_EVENT => format!(
+            "name={:?} access={:#x}",
+            oa_path(req.args[1]), req.args[2] as u32,
+        ),
+        TRACE_NT_CREATE_MUTANT => format!(
+            "name={:?} access={:#x} owner={}",
+            oa_path(req.args[1]), req.args[2] as u32, req.args[3] as u8,
+        ),
+        TRACE_NT_OPEN_MUTANT => format!(
+            "name={:?} access={:#x}",
+            oa_path(req.args[1]), req.args[2] as u32,
+        ),
+        _ => format!("(unknown id {id})"),
     }
 }
 

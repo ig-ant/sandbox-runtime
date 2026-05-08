@@ -112,6 +112,10 @@ pub struct ManualMapped {
     pub hook_nt_open_directory_object: usize,
     pub hook_nt_create_named_pipe_file: usize,
     pub hook_create_process_internal_w: usize,
+    /// Phase K: in-target VAs of the `hook_*_trace` entries. Indexed
+    /// by `crate::ipc::TRACE_*` syscall ids; only consulted when
+    /// `WINSBOX_TRACE_SYSCALLS=1`.
+    pub hook_trace: [usize; crate::ipc::TRACE_SYSCALL_COUNT],
 }
 
 /// Read `dll_path`, parse PE headers, allocate at preferred base in
@@ -229,6 +233,28 @@ pub fn manual_map_cdylib(target: HANDLE, dll_path: &Path) -> Result<ManualMapped
     let hook_create_process_internal_w =
         resolve_target_export_va(dll_path, base, "hook_create_process_internal_w")?;
 
+    // Phase K: resolve the 12 trace-mode hook export VAs. Order
+    // matches `crate::ipc::TRACE_SYSCALL_NAMES` (and the cdylib's
+    // `TRACE_*` constants).
+    let trace_export_names = [
+        "hook_nt_create_file_trace",
+        "hook_nt_open_file_trace",
+        "hook_nt_device_io_control_file_trace",
+        "hook_nt_alpc_connect_port_trace",
+        "hook_nt_alpc_send_wait_receive_port_trace",
+        "hook_nt_open_key_trace",
+        "hook_nt_open_key_ex_trace",
+        "hook_nt_query_value_key_trace",
+        "hook_nt_create_event_trace",
+        "hook_nt_open_event_trace",
+        "hook_nt_create_mutant_trace",
+        "hook_nt_open_mutant_trace",
+    ];
+    let mut hook_trace = [0usize; crate::ipc::TRACE_SYSCALL_COUNT];
+    for (i, name) in trace_export_names.iter().enumerate() {
+        hook_trace[i] = resolve_target_export_va(dll_path, base, name)?;
+    }
+
     eprintln!(
         "[sbox-exec] manual_map: cdylib mapped at {base:#x} ({alloc_size:#x} bytes), \
          IPC @ {ipc_va:#x}, delta={delta:#x}",
@@ -243,6 +269,7 @@ pub fn manual_map_cdylib(target: HANDLE, dll_path: &Path) -> Result<ManualMapped
         hook_nt_open_directory_object,
         hook_nt_create_named_pipe_file,
         hook_create_process_internal_w,
+        hook_trace,
     })
 }
 
@@ -312,6 +339,35 @@ pub fn prefill_cpw_passthrough(
     let payload = (cpw_passthrough_va as u64).to_le_bytes();
     write_remote_bytes(target, ipc_va + 0x40, &payload)
         .context("WriteProcessMemory(IPC cpw_passthrough)")
+}
+
+/// Phase K: write the per-syscall trace passthrough thunk VAs into
+/// the cdylib's `IPC.passthrough_trace[..]` slot. Layout: 12 u64s at
+/// offset 0x48 (= 9 * 8 = past the 4 IPC handle u64s + 5 non-trace
+/// passthrough u64s).
+///
+/// Called once after `install_trace_hooks` has built all 12 thunks.
+/// Not called at all in default (non-trace) runs — the slot stays
+/// zero, which the cdylib's `hook_*_trace` bodies never read because
+/// they aren't installed.
+pub fn prefill_trace_passthroughs(
+    target: HANDLE, ipc_va: usize, trace_pt: &[usize; crate::ipc::TRACE_SYSCALL_COUNT],
+) -> Result<()> {
+    let mut payload = [0u64; crate::ipc::TRACE_SYSCALL_COUNT];
+    for i in 0..crate::ipc::TRACE_SYSCALL_COUNT {
+        payload[i] = trace_pt[i] as u64;
+    }
+    write_remote_bytes(
+        target,
+        ipc_va + 0x48,
+        unsafe {
+            std::slice::from_raw_parts(
+                payload.as_ptr() as *const u8,
+                size_of::<[u64; crate::ipc::TRACE_SYSCALL_COUNT]>(),
+            )
+        },
+    )
+    .context("WriteProcessMemory(IPC trace passthroughs)")
 }
 
 // ─── PE header parsing ─────────────────────────────────────────────

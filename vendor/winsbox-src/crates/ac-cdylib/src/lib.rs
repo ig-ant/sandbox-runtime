@@ -64,7 +64,13 @@ extern "system" {
 /// Cdylib version stamp. Bumps whenever the layout of `CdylibBuffer`,
 /// `CdylibResult`, or the wire format changes. Broker compares to its
 /// own constant on readback to catch broker/cdylib skew.
-pub const CDYLIB_VERSION: u32 = 2;
+///
+/// v3 (Phase K): added `passthrough_trace[TRACE_SYSCALL_COUNT]` tail
+/// of `IpcEnv` for `WINSBOX_TRACE_SYSCALLS` opt-in tracing. Default
+/// runs leave the new fields zero-initialised (broker only writes them
+/// when trace mode is on), so the cost on the cold path is one extra
+/// page of zeroed `.bss`-equivalent in the manual-mapped image.
+pub const CDYLIB_VERSION: u32 = 3;
 
 /// Sentinel return value for `cdylib_init`. Broker verifies on
 /// report-back. Retained as a no-op export so the broker's
@@ -81,6 +87,28 @@ pub const CDYLIB_MAGIC: u64 = 0xAC11_DEAD_BEEF_CAFEu64;
 pub const RESULT_SENTINEL: u32 = 0xACDC_BABE;
 
 // ─── IPC env (process-static, populated pre-resume by the broker) ──
+
+/// Number of trace-mode passthrough thunks. Indexed by the
+/// `TRACE_*` syscall-id constants below; must match
+/// `TRACE_SYSCALL_COUNT` on the broker side.
+pub const TRACE_SYSCALL_COUNT: usize = 12;
+
+// Trace-mode syscall IDs. Each is the index into
+// `IpcEnv.passthrough_trace` *and* the value sent in the
+// `OP_TRACE` wire frame's `args[0]`. Order matches the broker's
+// `TRACE_SYSCALL_NAMES` table in `src/ipc.rs`.
+pub const TRACE_NT_CREATE_FILE: u64 = 0;
+pub const TRACE_NT_OPEN_FILE: u64 = 1;
+pub const TRACE_NT_DEVICE_IO_CONTROL_FILE: u64 = 2;
+pub const TRACE_NT_ALPC_CONNECT_PORT: u64 = 3;
+pub const TRACE_NT_ALPC_SEND_WAIT_RECEIVE_PORT: u64 = 4;
+pub const TRACE_NT_OPEN_KEY: u64 = 5;
+pub const TRACE_NT_OPEN_KEY_EX: u64 = 6;
+pub const TRACE_NT_QUERY_VALUE_KEY: u64 = 7;
+pub const TRACE_NT_CREATE_EVENT: u64 = 8;
+pub const TRACE_NT_OPEN_EVENT: u64 = 9;
+pub const TRACE_NT_CREATE_MUTANT: u64 = 10;
+pub const TRACE_NT_OPEN_MUTANT: u64 = 11;
 
 /// Process-static IPC environment. The broker locates this via the
 /// `IPC` data export, writes the IPC handles directly with
@@ -118,6 +146,11 @@ pub struct IpcEnv {
     pub passthrough_nt_open_directory_object: AtomicU64,
     pub passthrough_nt_create_named_pipe_file: AtomicU64,
     pub passthrough_create_process_internal_w: AtomicU64,
+    /// Phase K: per-trace-syscall passthrough thunk VAs. Filled in by
+    /// the broker only when `WINSBOX_TRACE_SYSCALLS=1` was set; left
+    /// zero in default runs (the trace hooks aren't installed in that
+    /// case, so the thunks aren't read either).
+    pub passthrough_trace: [AtomicU64; TRACE_SYSCALL_COUNT],
 }
 
 /// Exported as a no-mangle data symbol so the broker's
@@ -125,6 +158,10 @@ pub struct IpcEnv {
 /// struct. Pre-resume the broker writes a contiguous `[u64; 9]`
 /// directly here via `WriteProcessMemory`. Post-resume hook bodies
 /// read these as `AtomicU64::load(Acquire)`.
+///
+/// In trace mode (Phase K) the broker also writes a contiguous
+/// `[u64; TRACE_SYSCALL_COUNT]` at offset `0x48` (= 9 * 8) covering
+/// `passthrough_trace`.
 #[no_mangle]
 pub static IPC: IpcEnv = IpcEnv {
     section: AtomicU64::new(0),
@@ -136,6 +173,14 @@ pub static IPC: IpcEnv = IpcEnv {
     passthrough_nt_open_directory_object: AtomicU64::new(0),
     passthrough_nt_create_named_pipe_file: AtomicU64::new(0),
     passthrough_create_process_internal_w: AtomicU64::new(0),
+    // Repeating `AtomicU64::new(0)` 12× rather than using a `[…; N]`
+    // shorthand (which requires `Copy`, and `AtomicU64` isn't).
+    passthrough_trace: [
+        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    ],
 };
 
 #[inline]
@@ -150,6 +195,12 @@ const OP_NTOPENSECTION: u64 = 5;
 const OP_NTCREATEDIROBJ: u64 = 8;
 const OP_NTOPENDIROBJ: u64 = 9;
 const OP_NTCREATENAMEDPIPE: u64 = 10;
+/// Phase K: passthrough+log trace frame. The broker logs the syscall
+/// + key arg + return status to stderr (or a sink the broker chooses)
+/// and replies with a no-op ACK so the cdylib can release the IPC
+/// mutex. `args[0]` holds the trace-syscall-id; the remaining `args`
+/// are op-specific (see `hook_*_trace` builders).
+const OP_TRACE: u64 = 100;
 
 const FS_PASSTHROUGH: i32 = 0xE0000001u32 as i32;
 const STATUS_ACCESS_DENIED: i32 = 0xC0000022u32 as i32;
@@ -445,6 +496,400 @@ pub struct ProcessInformation {
     pub h_thread: HANDLE,
     pub process_id: u32,
     pub thread_id: u32,
+}
+
+// ─── Phase K: trace-mode hooks ─────────────────────────────────────
+//
+// Each `hook_<syscall>_trace` is a passthrough+log shape:
+//
+//   1. Tail-call the broker-built passthrough thunk for this syscall
+//      to invoke the un-hooked kernel implementation.
+//   2. Send an `OP_TRACE` frame to the broker carrying the
+//      trace-syscall-id (in `args[0]`), the original syscall args of
+//      interest (pointers into target memory — the broker uses
+//      `ReadProcessMemory` to extract path/IOCTL/etc. summaries),
+//      and the returned NTSTATUS.
+//   3. Return the NTSTATUS to the caller.
+//
+// The broker's `OP_TRACE` handler is a no-op ACK after logging — it
+// just `SetEvent(ev_resp)`. The cdylib still uses the existing
+// `ipc_roundtrip` (mutex-protected, one-at-a-time) so the trace
+// channel can't corrupt the wire while a real hook is mid-flight.
+//
+// Default-off cost: trace hooks are only patched in when
+// `WINSBOX_TRACE_SYSCALLS=1`. When unset, none of the bytecode below
+// is reachable — `passthrough_trace[*]` stays zero, the syscall stubs
+// keep their original bytes, and the cdylib spends zero cycles on
+// trace bookkeeping.
+
+/// Lightweight one-way trace frame send. Same wire shape as
+/// `ipc_roundtrip` (mutex + ev_req + section write + ev_resp wait)
+/// but the broker reply is just an ACK — caller ignores `r_*` fields.
+/// The wait-on-resp is necessary so the broker has finished copying
+/// the request frame before another thread overwrites it.
+#[inline]
+unsafe fn ipc_trace_send(
+    syscall_id: u64, status: NTSTATUS, args: [u64; 11],
+) {
+    if !ipc_loaded() { return; }
+    let mut frame = Wire {
+        op: OP_TRACE,
+        args: [
+            syscall_id,
+            args[0], args[1], args[2], args[3], args[4],
+            args[5], args[6], args[7], args[8], args[9], args[10],
+        ],
+        r0: 0, r1: 0, r2: 0, r3: 0,
+        r_status: status,
+        r_error: 0,
+    };
+    ipc_roundtrip(&mut frame);
+}
+
+/// Build a `[u64; 11]` argument tuple for `ipc_trace_send` from up
+/// to N raw u64s, zero-padding the remainder. Avoids a verbose
+/// 11-slot array literal at every call site.
+#[inline]
+fn trace_args<const N: usize>(vals: [u64; N]) -> [u64; 11] {
+    let mut out = [0u64; 11];
+    let mut i = 0;
+    while i < N && i < 11 { out[i] = vals[i]; i += 1; }
+    out
+}
+
+// 1. NtCreateFile / NtOpenFile — file/device opens. Args of
+//    interest: OBJECT_ATTRIBUTES* in slot args[2]; broker chases
+//    the embedded UNICODE_STRING `ObjectName` to get the path.
+
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
+pub unsafe extern "system" fn hook_nt_create_file_trace(
+    out_handle: *mut HANDLE,
+    desired_access: u32,
+    oa: *const c_void,
+    iosb: *mut [usize; 2],
+    alloc_size: *const i64,
+    file_attrs: u32,
+    share_access: u32,
+    create_disposition: u32,
+    create_options: u32,
+    ea_buffer: *const c_void,
+    ea_length: u32,
+) -> NTSTATUS {
+    let pv = IPC.passthrough_trace[TRACE_NT_CREATE_FILE as usize].load(Ordering::Acquire);
+    if pv == 0 { return STATUS_NOT_IMPLEMENTED; }
+    type Fn11 = unsafe extern "system" fn(
+        *mut HANDLE, u32, *const c_void, *mut [usize; 2], *const i64,
+        u32, u32, u32, u32, *const c_void, u32,
+    ) -> NTSTATUS;
+    let f: Fn11 = core::mem::transmute(pv as usize);
+    let st = f(
+        out_handle, desired_access, oa, iosb, alloc_size,
+        file_attrs, share_access, create_disposition,
+        create_options, ea_buffer, ea_length,
+    );
+    ipc_trace_send(
+        TRACE_NT_CREATE_FILE, st,
+        trace_args([oa as u64, desired_access as u64, create_disposition as u64]),
+    );
+    st
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn hook_nt_open_file_trace(
+    out_handle: *mut HANDLE,
+    desired_access: u32,
+    oa: *const c_void,
+    iosb: *mut [usize; 2],
+    share_access: u32,
+    open_options: u32,
+) -> NTSTATUS {
+    let pv = IPC.passthrough_trace[TRACE_NT_OPEN_FILE as usize].load(Ordering::Acquire);
+    if pv == 0 { return STATUS_NOT_IMPLEMENTED; }
+    type Fn6 = unsafe extern "system" fn(
+        *mut HANDLE, u32, *const c_void, *mut [usize; 2], u32, u32,
+    ) -> NTSTATUS;
+    let f: Fn6 = core::mem::transmute(pv as usize);
+    let st = f(out_handle, desired_access, oa, iosb, share_access, open_options);
+    ipc_trace_send(
+        TRACE_NT_OPEN_FILE, st,
+        trace_args([oa as u64, desired_access as u64, open_options as u64]),
+    );
+    st
+}
+
+// 2. NtDeviceIoControlFile — IOCTLs (CRYPTBASE/CNG/etc.).
+
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
+pub unsafe extern "system" fn hook_nt_device_io_control_file_trace(
+    file_handle: HANDLE,
+    event: HANDLE,
+    apc_routine: *const c_void,
+    apc_context: *const c_void,
+    iosb: *mut [usize; 2],
+    io_control_code: u32,
+    in_buf: *const c_void,
+    in_len: u32,
+    out_buf: *mut c_void,
+    out_len: u32,
+) -> NTSTATUS {
+    let pv = IPC.passthrough_trace[TRACE_NT_DEVICE_IO_CONTROL_FILE as usize]
+        .load(Ordering::Acquire);
+    if pv == 0 { return STATUS_NOT_IMPLEMENTED; }
+    type Fn10 = unsafe extern "system" fn(
+        HANDLE, HANDLE, *const c_void, *const c_void, *mut [usize; 2],
+        u32, *const c_void, u32, *mut c_void, u32,
+    ) -> NTSTATUS;
+    let f: Fn10 = core::mem::transmute(pv as usize);
+    let st = f(
+        file_handle, event, apc_routine, apc_context, iosb,
+        io_control_code, in_buf, in_len, out_buf, out_len,
+    );
+    ipc_trace_send(
+        TRACE_NT_DEVICE_IO_CONTROL_FILE, st,
+        trace_args([file_handle as u64, io_control_code as u64,
+                    in_len as u64, out_len as u64]),
+    );
+    st
+}
+
+// 3. NtAlpcConnectPort / NtAlpcSendWaitReceivePort — LSA / RPC under
+//    the hood. The full ALPC signature is wide; we only care about
+//    the first few args for the trace summary, so declare matching
+//    `extern "system"` fn types and tail-call the kernel verbatim by
+//    forwarding *every* arg position via the same prototype. We
+//    spell out the full prototypes below.
+
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
+pub unsafe extern "system" fn hook_nt_alpc_connect_port_trace(
+    out_handle: *mut HANDLE,
+    port_name: *const c_void, // PUNICODE_STRING
+    object_attributes: *const c_void,
+    port_attrs: *const c_void,
+    flags: u32,
+    required_server_sid: *const c_void,
+    connection_message: *mut c_void,
+    buffer_length: *mut usize,
+    out_message_attributes: *mut c_void,
+    in_message_attributes: *mut c_void,
+    timeout: *const i64,
+) -> NTSTATUS {
+    let pv = IPC.passthrough_trace[TRACE_NT_ALPC_CONNECT_PORT as usize]
+        .load(Ordering::Acquire);
+    if pv == 0 { return STATUS_NOT_IMPLEMENTED; }
+    type Fn11 = unsafe extern "system" fn(
+        *mut HANDLE, *const c_void, *const c_void, *const c_void,
+        u32, *const c_void, *mut c_void, *mut usize,
+        *mut c_void, *mut c_void, *const i64,
+    ) -> NTSTATUS;
+    let f: Fn11 = core::mem::transmute(pv as usize);
+    let st = f(
+        out_handle, port_name, object_attributes, port_attrs,
+        flags, required_server_sid, connection_message, buffer_length,
+        out_message_attributes, in_message_attributes, timeout,
+    );
+    ipc_trace_send(
+        TRACE_NT_ALPC_CONNECT_PORT, st,
+        trace_args([port_name as u64, flags as u64]),
+    );
+    st
+}
+
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
+pub unsafe extern "system" fn hook_nt_alpc_send_wait_receive_port_trace(
+    port_handle: HANDLE,
+    flags: u32,
+    send_message: *const c_void,
+    send_message_attributes: *mut c_void,
+    receive_message: *mut c_void,
+    buffer_length: *mut usize,
+    receive_message_attributes: *mut c_void,
+    timeout: *const i64,
+) -> NTSTATUS {
+    let pv = IPC.passthrough_trace[TRACE_NT_ALPC_SEND_WAIT_RECEIVE_PORT as usize]
+        .load(Ordering::Acquire);
+    if pv == 0 { return STATUS_NOT_IMPLEMENTED; }
+    type Fn8 = unsafe extern "system" fn(
+        HANDLE, u32, *const c_void, *mut c_void, *mut c_void,
+        *mut usize, *mut c_void, *const i64,
+    ) -> NTSTATUS;
+    let f: Fn8 = core::mem::transmute(pv as usize);
+    let st = f(
+        port_handle, flags, send_message, send_message_attributes,
+        receive_message, buffer_length, receive_message_attributes, timeout,
+    );
+    ipc_trace_send(
+        TRACE_NT_ALPC_SEND_WAIT_RECEIVE_PORT, st,
+        trace_args([port_handle as u64, flags as u64]),
+    );
+    st
+}
+
+// 4. NtOpenKey / NtOpenKeyEx / NtQueryValueKey — registry reads.
+
+#[no_mangle]
+pub unsafe extern "system" fn hook_nt_open_key_trace(
+    out_handle: *mut HANDLE,
+    desired_access: u32,
+    oa: *const c_void,
+) -> NTSTATUS {
+    let pv = IPC.passthrough_trace[TRACE_NT_OPEN_KEY as usize].load(Ordering::Acquire);
+    if pv == 0 { return STATUS_NOT_IMPLEMENTED; }
+    type Fn3 = unsafe extern "system" fn(
+        *mut HANDLE, u32, *const c_void,
+    ) -> NTSTATUS;
+    let f: Fn3 = core::mem::transmute(pv as usize);
+    let st = f(out_handle, desired_access, oa);
+    ipc_trace_send(
+        TRACE_NT_OPEN_KEY, st,
+        trace_args([oa as u64, desired_access as u64]),
+    );
+    st
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn hook_nt_open_key_ex_trace(
+    out_handle: *mut HANDLE,
+    desired_access: u32,
+    oa: *const c_void,
+    open_options: u32,
+) -> NTSTATUS {
+    let pv = IPC.passthrough_trace[TRACE_NT_OPEN_KEY_EX as usize].load(Ordering::Acquire);
+    if pv == 0 { return STATUS_NOT_IMPLEMENTED; }
+    type Fn4 = unsafe extern "system" fn(
+        *mut HANDLE, u32, *const c_void, u32,
+    ) -> NTSTATUS;
+    let f: Fn4 = core::mem::transmute(pv as usize);
+    let st = f(out_handle, desired_access, oa, open_options);
+    ipc_trace_send(
+        TRACE_NT_OPEN_KEY_EX, st,
+        trace_args([oa as u64, desired_access as u64, open_options as u64]),
+    );
+    st
+}
+
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
+pub unsafe extern "system" fn hook_nt_query_value_key_trace(
+    key_handle: HANDLE,
+    value_name: *const c_void, // PUNICODE_STRING
+    info_class: u32,
+    info_buffer: *mut c_void,
+    info_length: u32,
+    result_length: *mut u32,
+) -> NTSTATUS {
+    let pv = IPC.passthrough_trace[TRACE_NT_QUERY_VALUE_KEY as usize]
+        .load(Ordering::Acquire);
+    if pv == 0 { return STATUS_NOT_IMPLEMENTED; }
+    type Fn6 = unsafe extern "system" fn(
+        HANDLE, *const c_void, u32, *mut c_void, u32, *mut u32,
+    ) -> NTSTATUS;
+    let f: Fn6 = core::mem::transmute(pv as usize);
+    let st = f(
+        key_handle, value_name, info_class, info_buffer,
+        info_length, result_length,
+    );
+    ipc_trace_send(
+        TRACE_NT_QUERY_VALUE_KEY, st,
+        trace_args([key_handle as u64, value_name as u64,
+                    info_class as u64, info_length as u64]),
+    );
+    st
+}
+
+// 5–6. NtCreateEvent / NtOpenEvent / NtCreateMutant / NtOpenMutant —
+//      synchronisation primitives. All read OBJECT_ATTRIBUTES for
+//      the object name from args[2].
+
+#[no_mangle]
+pub unsafe extern "system" fn hook_nt_create_event_trace(
+    out_handle: *mut HANDLE,
+    desired_access: u32,
+    oa: *const c_void,
+    event_type: u32,
+    initial_state: u8,
+) -> NTSTATUS {
+    let pv = IPC.passthrough_trace[TRACE_NT_CREATE_EVENT as usize]
+        .load(Ordering::Acquire);
+    if pv == 0 { return STATUS_NOT_IMPLEMENTED; }
+    type Fn5 = unsafe extern "system" fn(
+        *mut HANDLE, u32, *const c_void, u32, u8,
+    ) -> NTSTATUS;
+    let f: Fn5 = core::mem::transmute(pv as usize);
+    let st = f(out_handle, desired_access, oa, event_type, initial_state);
+    ipc_trace_send(
+        TRACE_NT_CREATE_EVENT, st,
+        trace_args([oa as u64, desired_access as u64,
+                    event_type as u64, initial_state as u64]),
+    );
+    st
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn hook_nt_open_event_trace(
+    out_handle: *mut HANDLE,
+    desired_access: u32,
+    oa: *const c_void,
+) -> NTSTATUS {
+    let pv = IPC.passthrough_trace[TRACE_NT_OPEN_EVENT as usize]
+        .load(Ordering::Acquire);
+    if pv == 0 { return STATUS_NOT_IMPLEMENTED; }
+    type Fn3 = unsafe extern "system" fn(
+        *mut HANDLE, u32, *const c_void,
+    ) -> NTSTATUS;
+    let f: Fn3 = core::mem::transmute(pv as usize);
+    let st = f(out_handle, desired_access, oa);
+    ipc_trace_send(
+        TRACE_NT_OPEN_EVENT, st,
+        trace_args([oa as u64, desired_access as u64]),
+    );
+    st
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn hook_nt_create_mutant_trace(
+    out_handle: *mut HANDLE,
+    desired_access: u32,
+    oa: *const c_void,
+    initial_owner: u8,
+) -> NTSTATUS {
+    let pv = IPC.passthrough_trace[TRACE_NT_CREATE_MUTANT as usize]
+        .load(Ordering::Acquire);
+    if pv == 0 { return STATUS_NOT_IMPLEMENTED; }
+    type Fn4 = unsafe extern "system" fn(
+        *mut HANDLE, u32, *const c_void, u8,
+    ) -> NTSTATUS;
+    let f: Fn4 = core::mem::transmute(pv as usize);
+    let st = f(out_handle, desired_access, oa, initial_owner);
+    ipc_trace_send(
+        TRACE_NT_CREATE_MUTANT, st,
+        trace_args([oa as u64, desired_access as u64, initial_owner as u64]),
+    );
+    st
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn hook_nt_open_mutant_trace(
+    out_handle: *mut HANDLE,
+    desired_access: u32,
+    oa: *const c_void,
+) -> NTSTATUS {
+    let pv = IPC.passthrough_trace[TRACE_NT_OPEN_MUTANT as usize]
+        .load(Ordering::Acquire);
+    if pv == 0 { return STATUS_NOT_IMPLEMENTED; }
+    type Fn3 = unsafe extern "system" fn(
+        *mut HANDLE, u32, *const c_void,
+    ) -> NTSTATUS;
+    let f: Fn3 = core::mem::transmute(pv as usize);
+    let st = f(out_handle, desired_access, oa);
+    ipc_trace_send(
+        TRACE_NT_OPEN_MUTANT, st,
+        trace_args([oa as u64, desired_access as u64]),
+    );
+    st
 }
 
 // ─── no_std plumbing ───────────────────────────────────────────────

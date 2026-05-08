@@ -79,6 +79,15 @@ pub struct PassthroughThunks {
     pub create_process_internal_w: usize,
 }
 
+/// Phase K: target-VAs of the 12 trace-mode passthrough thunks. Same
+/// structure as `PassthroughThunks` but indexed by the
+/// `crate::ipc::TRACE_*` syscall ids so the cdylib can `[id]`-index
+/// without a per-name field lookup.
+#[derive(Clone, Copy, Default)]
+pub struct TracePassthroughs {
+    pub thunks: [usize; crate::ipc::TRACE_SYSCALL_COUNT],
+}
+
 /// Patch `ntdll!NtCreateNamedPipeFile` in `target`. Installed
 /// pre-resume so the loader's own opens are brokered.
 ///
@@ -123,6 +132,28 @@ pub fn install_cpw(
     pt: &mut PassthroughThunks,
 ) -> Result<()> {
     arch::install_cpw(target, a, cpw_va, cdylib, pt)
+}
+
+/// Phase K: install all 12 trace-mode hooks. Each entry in
+/// `trace_hook_vas` is the in-target VA of `hook_<syscall>_trace`
+/// (resolved by `manual_map_cdylib`). The function:
+///
+///   * Resolves each ntdll export by name from
+///     `crate::ipc::TRACE_SYSCALL_NAMES`.
+///   * Builds a passthrough thunk (saved 12-byte / 16-byte syscall
+///     prologue + JMP back) and stashes its VA in `out_pt`.
+///   * Patches the syscall's first 12 bytes (x64) / 16 bytes (ARM64)
+///     with an ABS_JMP to the trace hook.
+///
+/// Called pre-resume from `launch.rs` only when
+/// `WINSBOX_TRACE_SYSCALLS=1` is set. In default runs none of this
+/// code runs and the syscall stubs keep their original bytes.
+pub fn install_trace(
+    target: HANDLE,
+    trace_hook_vas: &[usize; crate::ipc::TRACE_SYSCALL_COUNT],
+    out_pt: &mut TracePassthroughs,
+) -> Result<()> {
+    arch::install_trace(target, trace_hook_vas, out_pt)
 }
 
 // ─── shared helpers ────────────────────────────────────────────────
@@ -236,6 +267,13 @@ mod arch {
     pub fn install_cpw(_t: HANDLE, _a: &StubAddrs, _v: usize, _c: Option<&CdylibHookEntries>, _p: &mut PassthroughThunks)
         -> Result<()>
     {
+        bail!("interception: only x86_64 and aarch64 supported")
+    }
+    pub fn install_trace(
+        _t: HANDLE,
+        _vas: &[usize; crate::ipc::TRACE_SYSCALL_COUNT],
+        _p: &mut TracePassthroughs,
+    ) -> Result<()> {
         bail!("interception: only x86_64 and aarch64 supported")
     }
 }

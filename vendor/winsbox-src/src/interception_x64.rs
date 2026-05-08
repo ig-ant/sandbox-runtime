@@ -15,7 +15,7 @@ use windows::Win32::Foundation::HANDLE;
 
 use crate::interception::{
     alloc_remote_rx, ntdll_export, read_remote_bytes, write_remote_bytes,
-    CdylibHookEntries, PassthroughThunks,
+    CdylibHookEntries, PassthroughThunks, TracePassthroughs,
 };
 use crate::ipc::StubAddrs;
 
@@ -101,6 +101,53 @@ pub fn install_cpw(
     pt.create_process_internal_w = build_passthrough_thunk(target, cpw_va)?;
     patch_with_abs_jmp(target, "CreateProcessInternalW", cpw_va,
                        c.create_process_internal_w)?;
+    Ok(())
+}
+
+/// Phase K: install the 12 trace hooks. Resolves each `Nt*` export
+/// from ntdll, builds a passthrough thunk (32-byte snapshot + tail-
+/// call to the un-hooked syscall), and patches in an ABS_JMP to the
+/// matching `hook_*_trace` cdylib export.
+///
+/// Failures partway through are non-fatal *for the trace surface* —
+/// we log and continue so a missing export on an older Windows
+/// build doesn't kill the whole trace install. The thunk slot stays
+/// zero, the cdylib's `hook_*_trace` for that syscall returns
+/// STATUS_NOT_IMPLEMENTED if invoked, but since we also skipped the
+/// patch the kernel runs the syscall normally.
+pub fn install_trace(
+    target: HANDLE,
+    trace_hook_vas: &[usize; crate::ipc::TRACE_SYSCALL_COUNT],
+    out_pt: &mut TracePassthroughs,
+) -> Result<()> {
+    for (i, &name) in crate::ipc::TRACE_SYSCALL_NAMES.iter().enumerate() {
+        let dest = trace_hook_vas[i];
+        if dest == 0 {
+            eprintln!("[sbox-exec] interception(trace): cdylib export missing for {name}; skip");
+            continue;
+        }
+        let va = match ntdll_export(name) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[sbox-exec] interception(trace): ntdll!{name} unresolved ({e:#}); skip");
+                continue;
+            }
+        };
+        let thunk_va = match build_passthrough_thunk(target, va) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("[sbox-exec] interception(trace): {name} thunk build failed ({e:#}); skip");
+                continue;
+            }
+        };
+        out_pt.thunks[i] = thunk_va;
+        if let Err(e) = patch_with_abs_jmp(target, name, va, dest) {
+            eprintln!("[sbox-exec] interception(trace): {name} patch failed ({e:#}); skip");
+            // Roll back the thunk slot so the cdylib doesn't think a
+            // (now-uninstalled) hook has a passthrough.
+            out_pt.thunks[i] = 0;
+        }
+    }
     Ok(())
 }
 
