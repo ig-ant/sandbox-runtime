@@ -361,13 +361,16 @@ fn run_confined(pol: &Policy, manifest_dir: &std::path::Path) -> Result<u32> {
         extra_env.push(cdylib_inject::placeholder_env_pair());
     }
 
-    // Phase E-2: cdylib mode also needs a USER_LOCKDOWN + IL_UNTRUSTED
-    // token. Without it the AC inherits `Everyone:RX` / `Users:RX` on
-    // policy paths and the deny stamps don't enforce. The shape mirrors
-    // `build_broker_tokens` but pins the spec independently of the
-    // (legacy) WINSBOX_TOKEN env-var bisection knob.
+    // Phase E-5c: cdylib mode uses USER_LIMITED (Everyone + AuthUsers +
+    // Users enabled) instead of USER_LOCKDOWN. Cygwin's CRYPTBASE/CNG/LSA
+    // bootstrap needs object access via `BUILTIN\Users:RX` inherited
+    // ACEs, which USER_LOCKDOWN denies. USER_LIMITED keeps Everyone
+    // enabled (WFP intra-AC loopback exemption preserved -> network
+    // sandbox holds), and explicit DENY stamps still override inherited
+    // ALLOWs (kernel evaluates DENY first regardless of enabled status),
+    // so the deny-list stays enforced.
     let cdylib_tokens: Option<BrokerTokens> = if cdylib_active {
-        match build_broker_tokens_with(&ac, token::USER_LOCKDOWN, token::IL_UNTRUSTED) {
+        match build_broker_tokens_with(&ac, token::USER_LIMITED, token::IL_UNTRUSTED) {
             Ok(t) => Some(t),
             Err(e) => {
                 log!("cdylib lockdown token build failed ({e:#}); falling back to AC-only token");
