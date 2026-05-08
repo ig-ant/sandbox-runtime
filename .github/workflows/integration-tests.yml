@@ -2,7 +2,7 @@ name: Tests
 
 on:
   push:
-    branches: ['main', 'windows-*']
+    branches: ['main', 'windows-*', 'winsbox-*']
   pull_request:
     branches: ['**']
 
