@@ -1,31 +1,26 @@
 //! Production cdylib loaded into the AppContainer target.
 //!
-//! Phase B established the load-and-report-back protocol:
-//!   1. Broker creates an anonymous file mapping (page-sized) and an
-//!      auto-reset event, duplicates both into the suspended target,
-//!      and pre-maps the section view via NtMapViewOfSection.
-//!   2. Broker writes a `CdylibBuffer` struct into a `VirtualAllocEx`
-//!      region in the target. The buffer carries the in-target handles
-//!      + section VA + the broker IPC `StubAddrs` (Phase C addition)
-//!      + a magic sentinel.
-//!   3. Broker patches the target's environment block in-place so
-//!      `AC_CDYLIB_BUFFER=<hex VA>` (16 hex chars) points to the
-//!      buffer. Env vars are visible to DllMain via `std::env::var`.
-//!   4. Target loads us via remote `LoadLibraryW(<dll path>)`.
-//!   5. `DllMain(DLL_PROCESS_ATTACH)` reads `AC_CDYLIB_BUFFER`, copies
-//!      the IPC env into a process-static `IpcEnv`, calls
-//!      `cdylib_init()`, writes its result + sentinel + PID + version
-//!      into the mapped section, and `SetEvent`s the wake event.
-//!   6. Broker waits on the event, reads the section, then resolves
-//!      the `hook_*` exports via `GetProcAddress` and patches the
-//!      ntdll/kernelbase syscall stubs to dispatch into them.
+//! Phase E-5c: this crate is `#![no_std]`. The cdylib is manual-mapped
+//! into the AC pre-resume by the broker (`crate::manual_map`) — no
+//! TLS callbacks, no `DllMain`, no loader-driven init at all. The
+//! broker pre-fills the [`IPC`] global directly via `WriteProcessMemory`
+//! and patches ntdll/kernelbase syscall stubs to dispatch into the
+//! `hook_*` exports below. Removing `std` removes the cdylib's TLS
+//! directory entirely (Rust's std runtime is the only thing that needs
+//! TLS in our hook bodies), which sidesteps the `manual_map` warning
+//! about un-executed TLS callbacks: with no TLS at all, there is
+//! nothing to skip.
 //!
-//! Phase C added the hook bodies. Each `hook_*` function:
+//! Hook-body machinery:
+//!   * Each `hook_*` function is `extern "system"` matching the ABI
+//!     the patched ntdll/kernelbase export expected.
 //!   * Reads input args from the standard Win64 ABI (rcx/rdx/r8/r9 +
-//!     stack on x64; x0..x7 on ARM64; both surfaces use `extern "system"`).
+//!     stack on x64; x0..x7 on ARM64).
 //!   * Acquires the IPC mutex, writes the wire frame, signals
 //!     `ev_req`, waits on `ev_resp`.
 //!   * Writes the broker's reply into the caller's out-params.
+//!   * On `FS_PASSTHROUGH` from the broker, tail-calls the broker-built
+//!     passthrough thunk (Phase E-5b) instead.
 //!   * Releases the mutex and returns `r_status`.
 //!
 //! The IPC layout (`Wire`) and op codes match the broker's
@@ -34,13 +29,35 @@
 //! member (no cyclic dep, smaller link surface).
 
 #![cfg(windows)]
+#![cfg_attr(not(test), no_std)]
 
-use std::ffi::c_void;
-use std::sync::atomic::{AtomicU64, Ordering};
-use windows::Win32::Foundation::{HANDLE, NTSTATUS};
-use windows::Win32::System::Threading::SetEvent;
+use core::ffi::c_void;
+use core::sync::atomic::{AtomicU64, Ordering};
 
-const DLL_PROCESS_ATTACH: u32 = 1;
+// ─── Minimal Win32 ABI bindings ────────────────────────────────────
+//
+// We re-declare these here rather than pull in `windows`/`windows-sys`
+// because (a) `windows` 0.58 isn't no_std-compatible (its proc-macro
+// crates pull `std`), and (b) the cdylib's surface is tiny: HANDLE
+// (pointer-sized), NTSTATUS (`i32`), and three ntdll syscall signatures.
+// ABI-equivalent declarations keep the broker side untouched.
+//
+// `HANDLE` is exposed in this crate's exports purely as a pointer-
+// sized integer; the broker passes raw `usize`/`u64` values to/from
+// these slots and never inspects the Rust type.
+
+#[allow(non_camel_case_types)]
+pub type HANDLE = *mut c_void;
+
+#[allow(non_camel_case_types)]
+pub type NTSTATUS = i32;
+
+#[link(name = "ntdll")]
+extern "system" {
+    fn NtSetEvent(h: HANDLE, prev: *mut i32) -> NTSTATUS;
+    fn NtWaitForSingleObject(h: HANDLE, alertable: u8, timeout: *const i64) -> NTSTATUS;
+    fn NtReleaseMutant(h: HANDLE, prev: *mut i32) -> NTSTATUS;
+}
 
 // ─── Versioning ────────────────────────────────────────────────────
 
@@ -50,7 +67,9 @@ const DLL_PROCESS_ATTACH: u32 = 1;
 pub const CDYLIB_VERSION: u32 = 2;
 
 /// Sentinel return value for `cdylib_init`. Broker verifies on
-/// report-back.
+/// report-back. Retained as a no-op export so the broker's
+/// `resolve_target_export("cdylib_init")` still succeeds even though
+/// the manual-map path never invokes it.
 pub const CDYLIB_INIT_OK: u32 = 0xACDC_0001;
 
 #[no_mangle]
@@ -58,53 +77,16 @@ pub extern "system" fn cdylib_init() -> u32 {
     CDYLIB_INIT_OK
 }
 
-// ─── Buffer / report layout (mirrors broker side) ──────────────────
-
-/// Layout of the broker-allocated scratch buffer in the target.
-/// MUST match `CdylibBuffer` in `cdylib_inject.rs`.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct CdylibBuffer {
-    _section: u64,
-    event: u64,
-    view: u64,
-    magic: u64,
-    /// Phase C: IPC environment for hook bodies.
-    /// Target-VA of the broker IPC section (one Wire-sized
-    /// shared region; see `crate::ipc::Wire` in the broker).
-    ipc_section: u64,
-    /// Target-side HANDLE values for the IPC event/mutex pair.
-    ipc_ev_req: u64,
-    ipc_ev_resp: u64,
-    ipc_mutex: u64,
-}
-
 pub const CDYLIB_MAGIC: u64 = 0xAC11_DEAD_BEEF_CAFEu64;
-
-#[repr(C)]
-struct CdylibResult {
-    init_result: u32,
-    version: u32,
-    sentinel: u32,
-    pid: u32,
-}
-
 pub const RESULT_SENTINEL: u32 = 0xACDC_BABE;
 
-// ─── IPC env (process-static, populated at DLL_PROCESS_ATTACH) ─────
+// ─── IPC env (process-static, populated pre-resume by the broker) ──
 
-/// Process-static IPC environment. Two write paths populate it:
-///
-///   * **Phase B/C/D path** (LoadLibraryW): `DllMain` reads
-///     `AC_CDYLIB_BUFFER` from the env block, copies the
-///     [`CdylibBuffer`]'s IPC fields into `IPC`, and signals the wake
-///     event. Used when the broker `LoadLibraryW`s the cdylib via a
-///     remote thread post-loader.
-///   * **Phase E-1 path** (manual map): the broker locates `IPC` via
-///     the `IPC` data export, writes the IPC handles directly with
-///     `WriteProcessMemory` *pre-resume*, and patches ntdll syscalls
-///     to dispatch into the manual-mapped hooks. No DllMain runs —
-///     the broker handles every initialisation step.
+/// Process-static IPC environment. The broker locates this via the
+/// `IPC` data export, writes the IPC handles directly with
+/// `WriteProcessMemory` *pre-resume*, and patches ntdll syscalls to
+/// dispatch into the manual-mapped hooks. No DllMain runs — the broker
+/// handles every initialisation step.
 ///
 /// Field ordering and types must NOT change without bumping
 /// [`CDYLIB_VERSION`] — the broker writes a contiguous `[u64; N]`
@@ -115,14 +97,14 @@ pub const RESULT_SENTINEL: u32 = 0xACDC_BABE;
 /// every AC thread starts after `ResumeThread`, which is a global
 /// synchronisation point.
 ///
-/// Phase E-5b adds the `passthrough_*` fields: each holds the in-target
-/// VA of a small thunk built by the broker that contains a copy of the
-/// original ntdll syscall's first 12 bytes (x64) / 16 bytes (ARM64),
-/// followed by an absolute jump back to `syscall_va + 12/16`. Calling
-/// the thunk pointer with the original `extern "system"` signature
-/// executes the underlying syscall as if no hook were installed.
-/// Hook bodies use these on `FS_PASSTHROUGH` to delegate the call to
-/// the kernel directly.
+/// The `passthrough_*` fields each hold the in-target VA of a small
+/// thunk built by the broker that contains a copy of the original
+/// ntdll syscall's first 12 bytes (x64) / 16 bytes (ARM64), followed
+/// by an absolute jump back to `syscall_va + 12/16`. Calling the thunk
+/// pointer with the original `extern "system"` signature executes the
+/// underlying syscall as if no hook were installed. Hook bodies use
+/// these on `FS_PASSTHROUGH` to delegate the call to the kernel
+/// directly.
 #[repr(C)]
 pub struct IpcEnv {
     pub section: AtomicU64,
@@ -138,7 +120,7 @@ pub struct IpcEnv {
     pub passthrough_create_process_internal_w: AtomicU64,
 }
 
-/// Phase E-1: exported as a no-mangle data symbol so the broker's
+/// Exported as a no-mangle data symbol so the broker's
 /// `resolve_target_export("IPC")` returns the in-target VA of this
 /// struct. Pre-resume the broker writes a contiguous `[u64; 9]`
 /// directly here via `WriteProcessMemory`. Post-resume hook bodies
@@ -170,6 +152,8 @@ const OP_NTOPENDIROBJ: u64 = 9;
 const OP_NTCREATENAMEDPIPE: u64 = 10;
 
 const FS_PASSTHROUGH: i32 = 0xE0000001u32 as i32;
+const STATUS_ACCESS_DENIED: i32 = 0xC0000022u32 as i32;
+const STATUS_NOT_IMPLEMENTED: i32 = 0xC0000002u32 as i32;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -183,16 +167,7 @@ struct Wire {
     r_status: i32,
     r_error: u32,
 }
-const _: () = assert!(std::mem::size_of::<Wire>() == 0x88);
-
-// ─── ntdll bindings used by hook bodies for the IPC sync calls ─────
-
-#[link(name = "ntdll")]
-extern "system" {
-    fn NtSetEvent(h: HANDLE, prev: *mut i32) -> NTSTATUS;
-    fn NtWaitForSingleObject(h: HANDLE, alertable: u8, timeout: *const i64) -> NTSTATUS;
-    fn NtReleaseMutant(h: HANDLE, prev: *mut i32) -> NTSTATUS;
-}
+const _: () = assert!(core::mem::size_of::<Wire>() == 0x88);
 
 // ─── Hook-body machinery ───────────────────────────────────────────
 
@@ -207,22 +182,22 @@ extern "system" {
 /// stubs (see broker `src/ipc.rs` doc).
 unsafe fn ipc_roundtrip(frame: &mut Wire) {
     let section = IPC.section.load(Ordering::Acquire) as *mut Wire;
-    let ev_req = HANDLE(IPC.ev_req.load(Ordering::Acquire) as *mut c_void);
-    let ev_resp = HANDLE(IPC.ev_resp.load(Ordering::Acquire) as *mut c_void);
-    let mutex = HANDLE(IPC.mutex.load(Ordering::Acquire) as *mut c_void);
+    let ev_req = IPC.ev_req.load(Ordering::Acquire) as HANDLE;
+    let ev_resp = IPC.ev_resp.load(Ordering::Acquire) as HANDLE;
+    let mutex = IPC.mutex.load(Ordering::Acquire) as HANDLE;
 
     // Acquire mutex. STATUS_ABANDONED still grants ownership — same
     // policy as the inline-asm stubs.
-    let _ = NtWaitForSingleObject(mutex, 0, std::ptr::null());
+    let _ = NtWaitForSingleObject(mutex, 0, core::ptr::null());
     // Write request frame into the shared section.
-    std::ptr::write_volatile(section, *frame);
+    core::ptr::write_volatile(section, *frame);
     // Signal the broker; wait for reply.
-    let _ = NtSetEvent(ev_req, std::ptr::null_mut());
-    let _ = NtWaitForSingleObject(ev_resp, 0, std::ptr::null());
+    let _ = NtSetEvent(ev_req, core::ptr::null_mut());
+    let _ = NtWaitForSingleObject(ev_resp, 0, core::ptr::null());
     // Read reply.
-    *frame = std::ptr::read_volatile(section);
+    *frame = core::ptr::read_volatile(section);
     // Release mutex.
-    let _ = NtReleaseMutant(mutex, std::ptr::null_mut());
+    let _ = NtReleaseMutant(mutex, core::ptr::null_mut());
 }
 
 /// Common dispatch for the 3 handle-only hooks: NtOpenSection,
@@ -239,7 +214,7 @@ unsafe fn hook_handle_op(
     out_handle: *mut HANDLE, desired: u32, oa: *const c_void,
 ) -> NTSTATUS {
     if !ipc_loaded() {
-        return NTSTATUS(0xC0000022u32 as i32); // STATUS_ACCESS_DENIED
+        return STATUS_ACCESS_DENIED;
     }
     let mut frame = Wire {
         op,
@@ -254,18 +229,18 @@ unsafe fn hook_handle_op(
         if passthrough_va == 0 {
             // Broker requested passthrough but no thunk available
             // (install bug). Surface a defined failure.
-            return NTSTATUS(0xC0000002u32 as i32);
+            return STATUS_NOT_IMPLEMENTED;
         }
         type Fn3 = unsafe extern "system" fn(
             *mut HANDLE, u32, *const c_void,
         ) -> NTSTATUS;
-        let f: Fn3 = std::mem::transmute(passthrough_va as usize);
+        let f: Fn3 = core::mem::transmute(passthrough_va as usize);
         return f(out_handle, desired, oa);
     }
     if frame.r_status >= 0 && !out_handle.is_null() {
-        std::ptr::write(out_handle, HANDLE(frame.r0 as *mut c_void));
+        core::ptr::write(out_handle, frame.r0 as HANDLE);
     }
-    NTSTATUS(frame.r_status)
+    frame.r_status
 }
 
 #[no_mangle]
@@ -316,7 +291,7 @@ pub unsafe extern "system" fn hook_nt_create_named_pipe_file(
     _default_timeout: *const i64,
 ) -> NTSTATUS {
     if !ipc_loaded() {
-        return NTSTATUS(0xC0000022u32 as i32);
+        return STATUS_ACCESS_DENIED;
     }
     let mut frame = Wire {
         op: OP_NTCREATENAMEDPIPE,
@@ -340,14 +315,14 @@ pub unsafe extern "system" fn hook_nt_create_named_pipe_file(
     if frame.r_status == FS_PASSTHROUGH {
         let pv = IPC.passthrough_nt_create_named_pipe_file.load(Ordering::Acquire);
         if pv == 0 {
-            return NTSTATUS(0xC0000002u32 as i32);
+            return STATUS_NOT_IMPLEMENTED;
         }
         type Fn14 = unsafe extern "system" fn(
             *mut HANDLE, u32, *const c_void, *mut [usize; 2],
             u32, u32, u32, u32, u32, u32, u32, u32, u32,
             *const i64,
         ) -> NTSTATUS;
-        let f: Fn14 = std::mem::transmute(pv as usize);
+        let f: Fn14 = core::mem::transmute(pv as usize);
         return f(
             out_handle, desired_access, oa, iosb,
             share_access, create_disposition, create_options,
@@ -358,7 +333,7 @@ pub unsafe extern "system" fn hook_nt_create_named_pipe_file(
     }
     if frame.r_status >= 0 {
         if !out_handle.is_null() {
-            std::ptr::write(out_handle, HANDLE(frame.r0 as *mut c_void));
+            core::ptr::write(out_handle, frame.r0 as HANDLE);
         }
         if !iosb.is_null() {
             // IO_STATUS_BLOCK = { Status, Information } both pointer-
@@ -368,7 +343,7 @@ pub unsafe extern "system" fn hook_nt_create_named_pipe_file(
             (*iosb)[1] = frame.r1 as usize;
         }
     }
-    NTSTATUS(frame.r_status)
+    frame.r_status
 }
 
 /// `CreateProcessInternalW` — kernelbase export with the standard
@@ -428,7 +403,7 @@ pub unsafe extern "system" fn hook_create_process_internal_w(
             i32, u32, *mut c_void, *const u16, *const c_void,
             *mut ProcessInformation, *mut HANDLE,
         ) -> i32;
-        let f: FnCpw = std::mem::transmute(pv as usize);
+        let f: FnCpw = core::mem::transmute(pv as usize);
         return f(
             _h_token, application_name, command_line,
             process_attrs, thread_attrs, inherit_handles, creation_flags,
@@ -439,21 +414,21 @@ pub unsafe extern "system" fn hook_create_process_internal_w(
     // Write back PROCESS_INFORMATION on success. r_status is the
     // BOOL the kernel-side spawn returned (1 = success, 0 = failure).
     if frame.r_status != 0 && !process_information.is_null() {
-        (*process_information).h_process = HANDLE(frame.r0 as *mut c_void);
-        (*process_information).h_thread = HANDLE(frame.r1 as *mut c_void);
+        (*process_information).h_process = frame.r0 as HANDLE;
+        (*process_information).h_thread = frame.r1 as HANDLE;
         (*process_information).process_id = frame.r2;
         (*process_information).thread_id = frame.r3;
     }
     if frame.r_status != 0 && !new_token.is_null() {
         // CreateProcessAsUserExW path passes phNewToken; broker
         // replies 0 here so caller sees NULL.
-        std::ptr::write(new_token, HANDLE::default());
+        core::ptr::write(new_token, core::ptr::null_mut());
     }
     if frame.r_status == 0 {
         // Set last-error from the broker's reply. SetLastError lives
         // in kernel32; we'd dynamically resolve, but the simpler path
         // is via the TEB's `LastErrorValue` (TEB+0x68 on x64, same on
-        // ARM64). Defer that to a Phase-D refinement; for now leave
+        // ARM64). Defer that to a future refinement; for now leave
         // the OS-supplied last-error untouched (mirrors the legacy
         // stub behaviour absent the explicit `gs:[0x68]` write).
         let _ = frame.r_error;
@@ -472,50 +447,20 @@ pub struct ProcessInformation {
     pub thread_id: u32,
 }
 
-// ─── DllMain plumbing (unchanged from Phase B except for IPC env) ──
+// ─── no_std plumbing ───────────────────────────────────────────────
+//
+// We're a `cdylib` with `panic = "abort"` (workspace profiles, see
+// `Cargo.toml`). The compiler still requires a `#[panic_handler]` for
+// any `no_std` crate that produces a binary artifact. None of the
+// hook bodies above panic — every fallible op returns an NTSTATUS or
+// BOOL — so this handler is unreachable in practice; we spin-loop to
+// be safe rather than recursing or calling abort (which would need
+// another extern declaration).
 
-fn env_u64(key: &str) -> Option<u64> {
-    let v = std::env::var(key).ok()?;
-    u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()
-}
-
-unsafe fn run_attach() {
-    let Some(buf_addr) = env_u64("AC_CDYLIB_BUFFER") else { return };
-    let buf = &*(buf_addr as *const CdylibBuffer);
-    if buf.magic != CDYLIB_MAGIC {
-        return;
+#[cfg(not(test))]
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    loop {
+        core::hint::spin_loop();
     }
-    // Phase C: copy IPC env into the process-static IPC singleton
-    // before any hook can fire (the broker patches ntdll exports
-    // *after* it sees our wake-event reply).
-    IPC.section.store(buf.ipc_section, Ordering::Release);
-    IPC.ev_req.store(buf.ipc_ev_req, Ordering::Release);
-    IPC.ev_resp.store(buf.ipc_ev_resp, Ordering::Release);
-    IPC.mutex.store(buf.ipc_mutex, Ordering::Release);
-
-    let view = buf.view as *mut CdylibResult;
-    if view.is_null() {
-        return;
-    }
-    let pid = windows::Win32::System::Threading::GetCurrentProcessId();
-    let result = CdylibResult {
-        init_result: cdylib_init(),
-        version: CDYLIB_VERSION,
-        sentinel: RESULT_SENTINEL,
-        pid,
-    };
-    std::ptr::write_volatile(view, result);
-    let _ = SetEvent(HANDLE(buf.event as *mut c_void));
-}
-
-#[no_mangle]
-pub extern "system" fn DllMain(
-    _hinst: *mut c_void,
-    reason: u32,
-    _reserved: *mut c_void,
-) -> i32 {
-    if reason == DLL_PROCESS_ATTACH {
-        let _ = std::panic::catch_unwind(|| unsafe { run_attach() });
-    }
-    1
 }

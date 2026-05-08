@@ -75,3 +75,14 @@ opt-level = 2
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+# `crates/ac-cdylib` is `#![no_std]`; rustc requires a panic strategy
+# selected at the profile level rather than per-crate. The broker has
+# no `catch_unwind` or `panic::*` calls, so `abort` is safe here.
+panic = "abort"
+
+[profile.dev]
+# Match release: needed so `cargo build` (not just `--release`) can
+# link the no_std `ac-cdylib` cdylib. `cargo test` panics still abort
+# the test binary, which the test harness handles cleanly — none of
+# the broker's tests use `should_panic`/`catch_unwind`.
+panic = "abort"
