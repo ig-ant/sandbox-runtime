@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{LocalFree, ERROR_SUCCESS, HLOCAL};
+use windows::Win32::Foundation::{LocalFree, ERROR_ACCESS_DENIED, ERROR_SUCCESS, HLOCAL};
 use windows::Win32::Security::Authorization::{
     BuildExplicitAccessWithNameW, BuildTrusteeWithSidW, ConvertSidToStringSidW,
     GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW,
@@ -82,6 +82,17 @@ pub struct PolicyStamp {
 pub struct StampStats {
     pub roots_stamped: usize,
     pub roots_skipped_idempotent: usize,
+    /// Phase E-5a: an `allow_*` path was skipped because the directory's
+    /// existing DACL already grants `ALL APPLICATION PACKAGES` (S-1-15-2-1)
+    /// at least the access we'd add. This is the common case for system
+    /// tool installs (`C:\Program Files\Git`, `C:\Windows`, ...) which
+    /// already inherit a `(OI)(CI)` ALLOW for AC packages and which the
+    /// broker (a non-admin user) typically *cannot* re-stamp anyway.
+    pub roots_skipped_already_accessible: usize,
+    /// Phase E-5a: a `TreeSetNamedSecurityInfoW` call returned
+    /// `ERROR_ACCESS_DENIED` (e.g., admin-protected dir) but we
+    /// continued instead of aborting the whole `apply()`.
+    pub roots_soft_failed_access_denied: usize,
     pub denies_emitted: usize,
     pub denies_omitted_unnecessary: usize,
     pub elapsed_ms: u128,
@@ -108,6 +119,27 @@ struct StampOp {
     mode: ACCESS_MODE,
 }
 
+/// Outcome of a single `apply_one` call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApplyOutcome {
+    /// `TreeSetNamedSecurityInfoW` succeeded.
+    Stamped,
+    /// Idempotency probe matched — root already has our ACE and a
+    /// probe leaf inherits it.
+    SkippedIdempotent,
+    /// Phase E-5a: `TreeSetNamedSecurityInfoW` returned
+    /// `ERROR_ACCESS_DENIED`. Caller should log + continue.
+    SoftFailedAccessDenied,
+}
+
+/// Well-known SID for `ALL APPLICATION PACKAGES`. Standard tool installs
+/// like `C:\Program Files\Git`, `C:\Windows`, etc. already carry an
+/// `(OI)(CI)` ALLOW ACE for this SID inherited from above, which is
+/// enough for the AC's lockdown token to read+execute. When that's
+/// already true on an `allow_*` path, our extra stamp would be redundant
+/// — and admin-protected dirs we can't write to anyway.
+const ALL_APP_PACKAGES_SID: &str = "S-1-15-2-1";
+
 impl PolicyStamp {
     /// Apply against an AC SID. Idempotent: any root whose existing DACL
     /// already contains our exact ACE *and* whose probe leaf inherits it
@@ -124,8 +156,23 @@ impl PolicyStamp {
         };
 
         // 1. ALLOW stamps.
+        //
+        // Phase E-5a: probe-skip rule applies *only* to ALLOW stamps.
+        // If the root's existing DACL already grants ALL APPLICATION
+        // PACKAGES at least the mask we'd add, our stamp is redundant
+        // and we skip it. DENY paths below skip this probe — even
+        // an existing ALL-APP-PACKAGES ALLOW means we DO need an
+        // explicit DENY to override.
         for p in &self.allow_read {
             if excluded(p) {
+                continue;
+            }
+            if existing_ace_grants_all_app_packages(p, read_mask()).unwrap_or(false) {
+                eprintln!(
+                    "[acl_stamper] skip {:?}: already accessible to ALL APP PACKAGES (allow_read)",
+                    p,
+                );
+                stats.roots_skipped_already_accessible += 1;
                 continue;
             }
             let op = StampOp {
@@ -134,14 +181,24 @@ impl PolicyStamp {
                 mask: read_mask(),
                 mode: GRANT_ACCESS,
             };
-            if apply_one(&op, ac_sid)? {
-                stats.roots_stamped += 1;
-            } else {
-                stats.roots_skipped_idempotent += 1;
+            match apply_one(&op, ac_sid)? {
+                ApplyOutcome::Stamped => stats.roots_stamped += 1,
+                ApplyOutcome::SkippedIdempotent => stats.roots_skipped_idempotent += 1,
+                ApplyOutcome::SoftFailedAccessDenied => {
+                    stats.roots_soft_failed_access_denied += 1;
+                }
             }
         }
         for p in &self.allow_write {
             if excluded(p) {
+                continue;
+            }
+            if existing_ace_grants_all_app_packages(p, write_mask()).unwrap_or(false) {
+                eprintln!(
+                    "[acl_stamper] skip {:?}: already accessible to ALL APP PACKAGES (allow_write)",
+                    p,
+                );
+                stats.roots_skipped_already_accessible += 1;
                 continue;
             }
             let op = StampOp {
@@ -150,10 +207,12 @@ impl PolicyStamp {
                 mask: write_mask(),
                 mode: GRANT_ACCESS,
             };
-            if apply_one(&op, ac_sid)? {
-                stats.roots_stamped += 1;
-            } else {
-                stats.roots_skipped_idempotent += 1;
+            match apply_one(&op, ac_sid)? {
+                ApplyOutcome::Stamped => stats.roots_stamped += 1,
+                ApplyOutcome::SkippedIdempotent => stats.roots_skipped_idempotent += 1,
+                ApplyOutcome::SoftFailedAccessDenied => {
+                    stats.roots_soft_failed_access_denied += 1;
+                }
             }
         }
 
@@ -199,11 +258,33 @@ impl PolicyStamp {
                     mask,
                     mode: DENY_ACCESS,
                 };
-                if apply_one(&op, ac_sid)? {
-                    stats.roots_stamped += 1;
-                    stats.denies_emitted += 1;
-                } else {
-                    stats.roots_skipped_idempotent += 1;
+                // Phase E-5a: denies do NOT probe-skip on ALL APP
+                // PACKAGES — an existing ALLOW for that SID is exactly
+                // why we need the DENY. Only soft-fail on access denied
+                // is shared with allow paths; here it's a real concern
+                // (we'd be silently failing to enforce a deny) so we
+                // log at error severity but still continue so a single
+                // admin-protected deny path doesn't tank the whole
+                // policy apply.
+                match apply_one(&op, ac_sid)? {
+                    ApplyOutcome::Stamped => {
+                        stats.roots_stamped += 1;
+                        stats.denies_emitted += 1;
+                    }
+                    ApplyOutcome::SkippedIdempotent => {
+                        stats.roots_skipped_idempotent += 1;
+                    }
+                    ApplyOutcome::SoftFailedAccessDenied => {
+                        stats.roots_soft_failed_access_denied += 1;
+                        eprintln!(
+                            "[acl_stamper] ERROR: deny stamp on {:?} \
+                             returned ERROR_ACCESS_DENIED — deny may not \
+                             be enforced for AC SID. Run broker as admin \
+                             or reorganize policy to avoid stamping under \
+                             admin-protected roots.",
+                            p,
+                        );
+                    }
                 }
                 // Phase E-3: also DENY for the well-known inherited
                 // ALLOW SIDs the lockdown token keeps enabled. Each
@@ -382,10 +463,18 @@ fn apply_batched_denies(path: &Path, mask: u32, sids: &[&PSID]) -> Result<()> {
     Ok(())
 }
 
-/// Apply a single stamp operation. Returns `Ok(true)` if a `TreeSetNamedSecurityInfoW`
-/// call was actually issued, `Ok(false)` if the idempotency probe matched and
-/// we skipped.
-fn apply_one(op: &StampOp, ac_sid: PSID) -> Result<bool> {
+/// Apply a single stamp operation.
+///
+/// Returns:
+/// - `ApplyOutcome::Stamped` — `TreeSetNamedSecurityInfoW` succeeded.
+/// - `ApplyOutcome::SkippedIdempotent` — root + leaf already have the ACE.
+/// - `ApplyOutcome::SoftFailedAccessDenied` — Phase E-5a: the
+///   `TreeSetNamedSecurityInfoW` call returned `ERROR_ACCESS_DENIED`
+///   (e.g. broker is non-admin and the path is under
+///   `C:\Program Files`). Caller decides whether that's tolerable
+///   (allow_*: yes, the path may already be AC-readable via
+///   ALL APPLICATION PACKAGES; deny_*: log loudly but keep going).
+fn apply_one(op: &StampOp, ac_sid: PSID) -> Result<ApplyOutcome> {
     let want_ace_type = match op.mode {
         m if m == GRANT_ACCESS => ACCESS_ALLOWED_ACE_TYPE,
         m if m == DENY_ACCESS => ACCESS_DENIED_ACE_TYPE,
@@ -395,7 +484,7 @@ fn apply_one(op: &StampOp, ac_sid: PSID) -> Result<bool> {
     if root_already_stamped(&op.path, ac_sid, op.mask, want_ace_type)?
         && probe_leaf_inherits(&op.path, ac_sid, op.mask, want_ace_type)?
     {
-        return Ok(false);
+        return Ok(ApplyOutcome::SkippedIdempotent);
     }
 
     let path_w = wstr(&op.path.to_string_lossy());
@@ -465,6 +554,21 @@ fn apply_one(op: &StampOp, ac_sid: PSID) -> Result<bool> {
     }
     let _ = &mut existing_acl_ptr;
 
+    if rc == ERROR_ACCESS_DENIED {
+        // Phase E-5a: admin-protected directory — broker isn't elevated
+        // and the kernel won't let us rewrite the DACL. The path may
+        // still be AC-accessible via inherited ALL APPLICATION PACKAGES
+        // ACEs (verified empirically on `C:\Program Files\Git`), so the
+        // caller treats this as a warning rather than a fatal error.
+        eprintln!(
+            "[acl_stamper] WARN TreeSetNamedSecurityInfoW({:?}) \
+             returned ERROR_ACCESS_DENIED — admin-protected dir, \
+             skipping (path may already be AC-readable via inherited \
+             ALL APPLICATION PACKAGES; verify with `icacls`)",
+            op.path,
+        );
+        return Ok(ApplyOutcome::SoftFailedAccessDenied);
+    }
     if rc != ERROR_SUCCESS {
         bail!(
             "TreeSetNamedSecurityInfoW({:?}) failed: {:?}",
@@ -473,7 +577,7 @@ fn apply_one(op: &StampOp, ac_sid: PSID) -> Result<bool> {
         );
     }
 
-    Ok(true)
+    Ok(ApplyOutcome::Stamped)
 }
 
 unsafe fn fetch_dacl(path_w: &[u16]) -> Result<(*mut ACL, *mut c_void)> {
@@ -494,6 +598,114 @@ unsafe fn fetch_dacl(path_w: &[u16]) -> Result<(*mut ACL, *mut c_void)> {
         bail!("GetNamedSecurityInfoW failed: {:?}", rc);
     }
     Ok((dacl, sd.0))
+}
+
+/// Phase E-5a: check whether the root's DACL already has an `(OI)(CI)`
+/// (or inherited) ALLOW ACE for `ALL APPLICATION PACKAGES` whose mask
+/// covers `requested_mask`. When this is true for an `allow_*` path,
+/// the AC token can already access the subtree via inheritance and our
+/// stamp would be redundant — and importantly we're often unable to
+/// write the stamp anyway (admin-protected dirs like `C:\Program Files`).
+///
+/// Lookup is best-effort: any failure (path doesn't exist,
+/// `GetNamedSecurityInfoW` fails, no DACL) returns `Ok(false)` so the
+/// caller falls through to the normal stamp path.
+fn existing_ace_grants_all_app_packages(path: &Path, requested_mask: u32) -> Result<bool> {
+    let path_w = wstr(&path.to_string_lossy());
+    let app_pkgs_sid = match psid_from_string(ALL_APP_PACKAGES_SID) {
+        Ok(s) => s,
+        Err(_) => return Ok(false),
+    };
+    let _g = SidGuard(app_pkgs_sid);
+
+    unsafe {
+        let (dacl_ptr, sd_ptr) = match fetch_dacl(&path_w) {
+            Ok(t) => t,
+            Err(_) => return Ok(false),
+        };
+        let result =
+            ace_for_sid_grants(dacl_ptr, app_pkgs_sid, requested_mask, ACCESS_ALLOWED_ACE_TYPE);
+        if !sd_ptr.is_null() {
+            let _ = LocalFree(HLOCAL(sd_ptr));
+        }
+        Ok(result)
+    }
+}
+
+/// Returns true if the DACL contains any ALLOW ACE for `target_sid`
+/// whose access mask covers the requested rights, considering both
+/// specific (`FILE_*`) and generic (`GENERIC_*`) bits.
+///
+/// For the Phase E-5a probe-skip we only care about the *effective*
+/// access for AC packages — we don't need the ACE to be `(OI)(CI)`
+/// vs. inherited vs. on the dir itself: the tool-install pattern
+/// (e.g. `C:\Program Files\Git`) typically has *both* a non-inherit
+/// `(RX)` ACE on the dir for the dir itself and a `(OI)(CI)(IO)(GR,GE)`
+/// for children. Either presence is enough to indicate the AC token
+/// has read+execute access on this subtree.
+///
+/// We accept generic rights (`GENERIC_READ | GENERIC_EXECUTE`) as a
+/// proxy for the equivalent `FILE_GENERIC_READ | FILE_GENERIC_EXECUTE`
+/// — Windows expands them at access-check time. Same for write/all.
+unsafe fn ace_for_sid_grants(
+    dacl: *const ACL, target_sid: PSID, requested_mask: u32, ace_type: u8,
+) -> bool {
+    if dacl.is_null() || target_sid.0.is_null() {
+        return false;
+    }
+    let count = (*dacl).AceCount as u32;
+    // Generic rights bits — `GenericMapping` for files maps:
+    //   GENERIC_READ    (0x80000000) → FILE_GENERIC_READ
+    //   GENERIC_WRITE   (0x40000000) → FILE_GENERIC_WRITE
+    //   GENERIC_EXECUTE (0x20000000) → FILE_GENERIC_EXECUTE
+    //   GENERIC_ALL     (0x10000000) → FILE_ALL_ACCESS
+    use windows::Win32::Storage::FileSystem::{
+        FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+    };
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const GENERIC_EXECUTE: u32 = 0x2000_0000;
+    const GENERIC_ALL: u32 = 0x1000_0000;
+    let expand = |m: u32| -> u32 {
+        let mut out = m & !(GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | GENERIC_ALL);
+        if m & GENERIC_READ != 0 { out |= FILE_GENERIC_READ.0; }
+        if m & GENERIC_WRITE != 0 { out |= FILE_GENERIC_WRITE.0; }
+        if m & GENERIC_EXECUTE != 0 { out |= FILE_GENERIC_EXECUTE.0; }
+        if m & GENERIC_ALL != 0 {
+            out |= FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0 | FILE_GENERIC_EXECUTE.0;
+        }
+        out
+    };
+
+    for i in 0..count {
+        let mut ace: *mut c_void = std::ptr::null_mut();
+        if GetAce(dacl, i, &mut ace).is_err() || ace.is_null() {
+            continue;
+        }
+        let header = &*(ace as *const windows::Win32::Security::ACE_HEADER);
+        if header.AceType != ace_type {
+            continue;
+        }
+        // Skip Inherit-Only ACEs when checking the DIRECTORY ITSELF —
+        // those only apply to children. But for Phase E-5a we want to
+        // know if either the dir or its inheritable children grants
+        // access; we accept any ACE flag combination as long as the
+        // mask covers what we need. The caller (probe-skip) uses this
+        // as a heuristic, not a guarantee.
+        let mask_ptr = (ace as *const u8)
+            .add(std::mem::size_of::<windows::Win32::Security::ACE_HEADER>())
+            as *const u32;
+        let ace_mask = expand(*mask_ptr);
+        if ace_mask & requested_mask != requested_mask {
+            continue;
+        }
+        let sid_ptr = mask_ptr.add(1) as *const c_void;
+        let candidate = PSID(sid_ptr as *mut c_void);
+        if EqualSid(candidate, target_sid).is_ok() {
+            return true;
+        }
+    }
+    false
 }
 
 /// Returns true if the root's DACL already has an ACE matching (SID, mask,
@@ -798,9 +1010,14 @@ pub fn psid_to_string(sid: PSID) -> Result<String> {
 mod tests {
     use super::*;
 
-    /// Well-known: ALL APPLICATION PACKAGES. Real SID, accepted everywhere,
-    /// no AppContainer profile required.
-    const TEST_SID: &str = "S-1-15-2-1";
+    /// A well-known capability SID that the AC subsystem accepts but
+    /// which is *not* covered by `ALL APPLICATION PACKAGES` inheritance.
+    /// We use an arbitrary app-capability-style SID here so the
+    /// Phase E-5a probe-skip doesn't trigger and short-circuit the
+    /// existing per-SID idempotency / allow / deny checks (the inherited
+    /// `S-1-15-2-1 ALLOW` on `%TEMP%` would otherwise make `apply()`
+    /// skip every test root before our SID-specific assertions ran).
+    const TEST_SID: &str = "S-1-15-3-1024-2049345768";
 
     fn unique_dir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!(
@@ -939,6 +1156,72 @@ mod tests {
         free_psid(everyone);
         free_psid(users);
         free_psid(auth_users);
+        cleanup(&root);
+    }
+
+    /// Phase E-5a: when a directory already has an `(OI)(CI)` ALLOW
+    /// ACE for `ALL APPLICATION PACKAGES` granting at least the rights
+    /// we'd add, `apply()` must skip stamping that path and bump
+    /// `roots_skipped_already_accessible` instead. Critically, it
+    /// must NOT add a redundant ACE for the test SID, since the
+    /// real-world case (e.g. `C:\Program Files\Git`) is a path we
+    /// can't write to anyway.
+    #[test]
+    fn test_skip_when_all_app_packages_already_grants() {
+        let root = unique_dir("e5a-skip");
+        // Plant an (OI)(CI) ALLOW ACE for ALL APPLICATION PACKAGES
+        // with FILE_GENERIC_READ | FILE_GENERIC_EXECUTE — same mask
+        // we'd add for an allow_read stamp.
+        let app_pkgs = psid_from_string(ALL_APP_PACKAGES_SID).unwrap();
+        let _g = SidGuard(app_pkgs);
+        let plant_op = StampOp {
+            path: root.clone(),
+            kind: "test_plant",
+            mask: read_mask(),
+            mode: GRANT_ACCESS,
+        };
+        // Use apply_one directly to plant the ACE under the App
+        // Pkgs SID. (apply_one is internal — that's fine; this is
+        // a unit test in the same module.)
+        let outcome = apply_one(&plant_op, app_pkgs).unwrap();
+        assert_eq!(outcome, ApplyOutcome::Stamped, "planting ACE must succeed");
+
+        // Confirm the helper sees it.
+        assert!(
+            existing_ace_grants_all_app_packages(&root, read_mask()).unwrap(),
+            "helper must detect the planted ALL APP PACKAGES ACE",
+        );
+
+        // Now apply a policy with the test SID against the same
+        // root: stamping should be skipped.
+        let test_sid = psid_from_string("S-1-15-3-1024-1").unwrap(); // app capability SID, distinct from S-1-15-2-1
+        let policy = PolicyStamp {
+            allow_read: vec![root.clone()],
+            ..Default::default()
+        };
+
+        let stats = policy.apply(test_sid).unwrap();
+        assert_eq!(
+            stats.roots_skipped_already_accessible, 1,
+            "apply must skip-AC-accessible the planted root",
+        );
+        assert_eq!(stats.roots_stamped, 0, "no stamp should be issued");
+
+        // And our test SID's ACE must NOT have been added.
+        assert!(
+            !root_already_stamped(&root, test_sid, read_mask(), ACCESS_ALLOWED_ACE_TYPE)
+                .unwrap(),
+            "test SID's ACE should not have been added (probe-skip)",
+        );
+
+        // Cleanup: remove the planted ACE before deleting the dir.
+        let cleanup_policy = PolicyStamp {
+            allow_read: vec![root.clone()],
+            ..Default::default()
+        };
+        let _ = cleanup_policy.revert(app_pkgs);
+
+        free_psid(test_sid);
         cleanup(&root);
     }
 

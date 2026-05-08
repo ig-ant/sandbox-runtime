@@ -29,16 +29,47 @@ pub struct EntrySync {
     ev_loaded: HANDLE,
     ev_go: HANDLE,
 }
+
+/// Phase E-4: detail return for the entry rendezvous wait. Distinguishes
+/// the three failure modes for diagnostic clarity.
+#[derive(Debug, Clone, Copy)]
+pub enum EntryWait {
+    Loaded,
+    TargetExited,
+    Timeout,
+    Other(u32),
+}
 impl EntrySync {
     /// Block until the target's loader has finished and the stub
     /// has signalled, OR the target process exited (loader
     /// failed). Returns false on timeout or process exit.
     pub fn wait_loaded_or_exit(&self, target: HANDLE, timeout_ms: u32) -> bool {
+        let r = self.wait_loaded_or_exit_detail(target, timeout_ms);
+        matches!(r, EntryWait::Loaded)
+    }
+
+    /// Phase E-4: caller wants to distinguish between "loader finished"
+    /// (good), "target exited before signalling" (loader crashed),
+    /// "timeout" (loader is stuck or so slow we should give up). All
+    /// three were folded into a single `false` previously, which made
+    /// debugging the cygwin1.dll DllMain crash look like a timeout.
+    pub fn wait_loaded_or_exit_detail(
+        &self, target: HANDLE, timeout_ms: u32,
+    ) -> EntryWait {
         use windows::Win32::System::Threading::WaitForMultipleObjects;
+        use windows::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
         unsafe {
             let handles = [self.ev_loaded, target];
-            WaitForMultipleObjects(&handles, false, timeout_ms)
-                == windows::Win32::Foundation::WAIT_OBJECT_0
+            let r = WaitForMultipleObjects(&handles, false, timeout_ms);
+            if r == WAIT_OBJECT_0 {
+                EntryWait::Loaded
+            } else if r.0 == WAIT_OBJECT_0.0 + 1 {
+                EntryWait::TargetExited
+            } else if r == WAIT_TIMEOUT {
+                EntryWait::Timeout
+            } else {
+                EntryWait::Other(r.0)
+            }
         }
     }
     pub fn go(&self) {

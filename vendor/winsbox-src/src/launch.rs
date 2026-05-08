@@ -559,10 +559,14 @@ fn maybe_apply_stamps(
         e
     })?;
     log!(
-        "policy-stamp: {} stamped, {} skipped (idempotent), {} denies emitted, \
-         {} denies omitted, {} ms",
+        "policy-stamp: {} stamped, {} skipped (idempotent), {} skipped (AC \
+         already accessible), {} soft-failed (access denied), {} denies \
+         emitted, {} denies omitted, {} ms",
         stats.roots_stamped, stats.roots_skipped_idempotent,
-        stats.denies_emitted, stats.denies_omitted_unnecessary, stats.elapsed_ms,
+        stats.roots_skipped_already_accessible,
+        stats.roots_soft_failed_access_denied,
+        stats.denies_emitted, stats.denies_omitted_unnecessary,
+        stats.elapsed_ms,
     );
 
     let manifest = crate::stamp_manifest::StampManifest::from_policy(
@@ -641,9 +645,13 @@ fn try_inject_cdylib_full(
         .with_context(|| format!("psid_from_string({})", ac.sid_string))?;
     match stamp.apply(sid_owned) {
         Ok(stats) => log!(
-            "cdylib stamp on {}: {} stamped, {} skipped (idempotent), {} ms",
+            "cdylib stamp on {}: {} stamped, {} skipped (idempotent), {} \
+             skipped (AC accessible), {} soft-failed, {} ms",
             dll_dir.display(),
-            stats.roots_stamped, stats.roots_skipped_idempotent, stats.elapsed_ms,
+            stats.roots_stamped, stats.roots_skipped_idempotent,
+            stats.roots_skipped_already_accessible,
+            stats.roots_soft_failed_access_denied,
+            stats.elapsed_ms,
         ),
         Err(e) => {
             free_psid(sid_owned);
@@ -759,6 +767,67 @@ fn try_inject_cdylib_full(
     }
     log!("cdylib ntdll hooks patched pre-resume");
 
+    // ── 5b. **Phase E-4 fix:** spawn `serve_ipc` BEFORE the entry
+    //       rendezvous + ResumeThread. Without this, the loader's
+    //       first `NtOpenSection` (Cygwin's `cygwin1.dll` DllMain
+    //       hits this on the very first instruction of its load)
+    //       calls into the cdylib hook → IPC `OP_NTOPENSECTION` →
+    //       waits on the broker's reply event. The broker hasn't
+    //       started a `serve_ipc` thread yet, so the cdylib hook
+    //       blocks indefinitely. Meanwhile the broker is parked on
+    //       `wait_loaded_or_exit` waiting for `ev_loaded` (from the
+    //       entry stub at `RtlUserThreadStart` — which never fires
+    //       because the loader is stuck inside cygwin1.dll's DllMain).
+    //       Classical deadlock.
+    //
+    //       Fix: build the `SpawnCtx` and spawn `serve_ipc` here,
+    //       *before* `ResumeThread`. The IPC channel is ready (we
+    //       prefilled it above), the cdylib hook VAs are patched,
+    //       and `serve_ipc` will service the loader's IPC requests
+    //       as they come in. Then the rendezvous can proceed.
+    let (cpw_primary, cpw_initial) = match cdylib_tokens {
+        Some(t) => (t.primary, t.initial),
+        None => (HANDLE::default(), HANDLE::default()),
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    let ctx = Arc::new(SpawnCtx {
+        ac_sid: ac.sid,
+        ac_bno_path: ac_bno_path.clone(),
+        ac_sid_string: ac.sid_string.clone(),
+        job: job.handle(),
+        primary: cpw_primary,
+        initial: cpw_initial,
+        cwd: target_cwd.to_string(),
+        env: extra_env.to_vec(),
+        stop: stop.clone(),
+        fs: crate::policy_engine::FsPolicy::from_policy(pol),
+        hook_fs: false,
+        trace: std::env::var("SBOX_TRACE").is_ok(),
+        // Phase E-2: cdylib path now spawns under USER_LOCKDOWN tokens
+        // when cdylib_tokens.is_some(). handle_reg uses `lockdown` to
+        // decide whether to mask KEY_ALL_ACCESS opens; since cdylib
+        // mode doesn't service registry opcodes anyway (D-4 deletes
+        // them), this is a no-op.
+        lockdown: cdylib_tokens.is_some(),
+        broker_pipes: Mutex::new(std::collections::HashSet::new()),
+        threads: Mutex::new(Vec::new()),
+    });
+    let target_raw = target.0 as isize;
+    let ctx_thread = ctx.clone();
+    let h = std::thread::spawn(move || serve_ipc(ch, target_raw, ctx_thread));
+    ctx.threads.lock().unwrap().push(h);
+    log!("cdylib serve_ipc thread spawned (pre-resume)");
+
+    // From step 5b onward `ch` has been moved into the serve_ipc
+    // thread; on any further error we have to stop + join that thread
+    // before reverting stamps + freeing the SID.
+    let stop_ipc_and_join = |ctx: &Arc<SpawnCtx>, stop: &Arc<AtomicBool>| {
+        stop.store(true, Ordering::Relaxed);
+        for h in ctx.threads.lock().unwrap().drain(..) {
+            let _ = h.join();
+        }
+    };
+
     // ── 6. Install the entry-trampoline rendezvous so we can wait
     //      for the loader to map kernelbase before patching its
     //      `CreateProcessInternalW` export. The CPW hook is the only
@@ -775,7 +844,7 @@ fn try_inject_cdylib_full(
                     log!("cdylib: ARM64 fallback — no entry rendezvous; using settle delay");
                     None
                 } else {
-                    drop(ch);
+                    stop_ipc_and_join(&ctx, &stop);
                     cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
                     return Err(e.context("entry_trampoline::install (cdylib path)"));
                 }
@@ -794,11 +863,39 @@ fn try_inject_cdylib_full(
     //      ev_go; we then patch CreateProcessInternalW.
     unsafe { ResumeThread(main_thread); }
     if let Some(ref sync) = sync_opt {
-        if !sync.wait_loaded_or_exit(target, 15_000) {
-            release_sync(&sync_opt);
-            drop(ch);
-            cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
-            anyhow::bail!("entry rendezvous timed out (loader hung/exited)");
+        // Phase E-4: bash + cygwin1.dll DllMain takes longer than 15s
+        // when the loader does dozens of brokered NtOpenSection /
+        // NtCreateFile passthroughs. Give it 60s; on a successful
+        // bring-up the rendezvous fires in <1s anyway.
+        let entry_timeout_ms = std::env::var("WINSBOX_ENTRY_TIMEOUT_MS")
+            .ok().and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(60_000);
+        let r = sync.wait_loaded_or_exit_detail(target, entry_timeout_ms);
+        match r {
+            crate::entry_trampoline::EntryWait::Loaded => {}
+            other => {
+                let detail = match other {
+                    crate::entry_trampoline::EntryWait::TargetExited => {
+                        let mut code = 0u32;
+                        unsafe {
+                            use windows::Win32::System::Threading::GetExitCodeProcess;
+                            let _ = GetExitCodeProcess(target, &mut code);
+                        }
+                        format!("target exited before signalling (exit={:#x})", code)
+                    }
+                    crate::entry_trampoline::EntryWait::Timeout => format!(
+                        "loader hung past {entry_timeout_ms} ms"
+                    ),
+                    crate::entry_trampoline::EntryWait::Other(c) => {
+                        format!("WaitForMultipleObjects returned {:#x}", c)
+                    }
+                    crate::entry_trampoline::EntryWait::Loaded => unreachable!(),
+                };
+                release_sync(&sync_opt);
+                stop_ipc_and_join(&ctx, &stop);
+                cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
+                anyhow::bail!("entry rendezvous failed: {detail}");
+            }
         }
     } else {
         // ARM64 fallback: settle delay before patching CPW.
@@ -834,49 +931,14 @@ fn try_inject_cdylib_full(
     release_sync(&sync_opt);
     drop(sync_opt);
 
-    // ── 11. Build the SpawnCtx the IPC service thread needs.
-    //       Phase E-2: cdylib mode now spawns the AC under USER_LOCKDOWN
-    //       + lowbox tokens (built in run_confined::cdylib_tokens), and
-    //       the same primary/initial pair powers handle_cpw's brokered
-    //       grandchild spawns. When cdylib_tokens is None (token build
-    //       failed) handle_cpw sees HANDLE::default() and bails — that
-    //       degraded mode matches Phase D's behaviour.
-    let (cpw_primary, cpw_initial) = match cdylib_tokens {
-        Some(t) => (t.primary, t.initial),
-        None => (HANDLE::default(), HANDLE::default()),
-    };
-    let stop = Arc::new(AtomicBool::new(false));
-    let ctx = Arc::new(SpawnCtx {
-        ac_sid: ac.sid,
-        ac_bno_path: ac_bno_path.clone(),
-        ac_sid_string: ac.sid_string.clone(),
-        job: job.handle(),
-        primary: cpw_primary,
-        initial: cpw_initial,
-        cwd: target_cwd.to_string(),
-        env: extra_env.to_vec(),
-        stop: stop.clone(),
-        fs: crate::policy_engine::FsPolicy::from_policy(pol),
-        hook_fs: false,
-        trace: std::env::var("SBOX_TRACE").is_ok(),
-        // Phase E-2: cdylib path now spawns under USER_LOCKDOWN tokens
-        // when cdylib_tokens.is_some(). handle_reg uses `lockdown` to
-        // decide whether to mask KEY_ALL_ACCESS opens; since cdylib mode
-        // doesn't service registry opcodes anyway (D-4 deletes them),
-        // this is a no-op.
-        lockdown: cdylib_tokens.is_some(),
-        broker_pipes: Mutex::new(std::collections::HashSet::new()),
-        threads: Mutex::new(Vec::new()),
-    });
-    let target_raw = target.0 as isize;
-    let ctx_thread = ctx.clone();
-    let h = std::thread::spawn(move || serve_ipc(ch, target_raw, ctx_thread));
-    ctx.threads.lock().unwrap().push(h);
-
     // Phase E-1 manual-map mode: no session/report — the broker filled
     // IPC directly via WriteProcessMemory and never set up the
     // cdylib_inject report-back protocol. `bno_handles` keeps the AC's
     // BNO root alive; CdylibInjection's Drop handles cleanup.
+    //
+    // The `SpawnCtx` and `serve_ipc` thread were started above (step 5b)
+    // before `ResumeThread` so the cdylib's loader-time hooks have a
+    // server to talk to. We just need to return the wired-up tuple.
 
     Ok((
         CdylibInjection {
