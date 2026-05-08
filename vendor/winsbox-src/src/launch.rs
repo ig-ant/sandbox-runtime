@@ -249,6 +249,11 @@ fn run_confined(pol: &Policy, manifest_dir: &std::path::Path) -> Result<u32> {
     //    (no enforcement); workloads that need cdylib hooks will
     //    still segfault per P13, but with a clearer error.
     let broker_tokens: Option<BrokerTokens> = match build_broker_tokens_with(
+        // Phase L cycle 2: tested IL_LOW (0x1000) — same AV. The AC's
+        // package SID already clamps the effective IL to LOW; setting
+        // it to UNTRUSTED at the token level was harmless (and equally
+        // ineffective). Reverted to UNTRUSTED for parity with prior
+        // phases. The AV is not IL-driven.
         &ac, token::USER_LIMITED, token::IL_UNTRUSTED,
     ) {
         Ok(t) => Some(t),
