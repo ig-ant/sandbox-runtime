@@ -30,30 +30,52 @@
 //!     IPC roundtrips work, but Cygwin's loader-time syscall mix hits
 //!     a corner the broker isn't covering.
 //!
-//! Remaining hypotheses (not yet pursued):
-//!   * **ARM64 passthrough thunk** — the saved-32-byte snapshot may
-//!     not capture an ARM64 syscall stub variant that has more than 8
-//!     bytes of preamble before `svc`.
-//!   * **Brokered handle shape** — section/dirobj IPC replies don't
-//!     fully replicate the AC's effective access rights on the dup'd
-//!     handle.
-//!   * **`lpReserved2` forwarding** — Cygwin fork passes
-//!     `child_info_fork` via `STARTUPINFOW.lpReserved2` whose handle
-//!     values are caller-table; the broker forwards via
-//!     `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` but a sub-handle there
-//!     might still need explicit dup.
-//!   * **BNO path rewrites** — the `\BaseNamedObjects` → AC-BNO
-//!     redirect in `handle_dirobj` may miss a Cygwin shared-state
-//!     subpath that's now hard-coded as a session BNO link rather than
-//!     a top-level BNO entry.
+//! Phase L (cycles 1–4) findings — two independent walls:
+//!
+//!   * **Wall 1 — Cygwin DllMain in bare AC.** `bash.exe`, `true.exe`,
+//!     `cygpath.exe` (all x86-64 Cygwin) AV `0xC0000005` inside an AC
+//!     even with NO cdylib injected (no manual-map, no ntdll patches).
+//!     Pure ARM64 Win32 binaries (`cmd.exe`, `git.exe` from Git's
+//!     `cmd\`) work fine in the same AC. An x86-64 native-Rust target
+//!     (rebuilt sleep_target for `x86_64-pc-windows-msvc`) ALSO works
+//!     in bare AC. So the AV is not "x64 emulator can't bootstrap in
+//!     AC" — it's specific to cygwin1.dll/msys-2.0.dll's DllMain.
+//!     Setting token IL to LOW vs UNTRUSTED, dropping USER_LIMITED
+//!     restrictions (bare-AC mode), and extending trace coverage to
+//!     15 syscalls (file/IOCTL/ALPC/registry/sync + map/create-section
+//!     + alloc-vmem) all leave zero `[sbox-trace]` lines before AV —
+//!     the loader doesn't reach any hooked syscall before cygwin1.dll
+//!     dies.
+//!
+//!   * **Wall 2 — ARM64 cdylib into x64 target.** Even if Wall 1 is
+//!     bypassed (by the kernel mapping a x64 cygwin DLL successfully),
+//!     our manual-mapped ARM64 cdylib's hook bodies are ARM64
+//!     bytecode. When patched into the target's x64 `ntdll!Nt*`
+//!     stubs, the x64 syscall caller jumps to ARM64 code → AV. Test:
+//!     x86-64 `sleep_target.exe` runs cleanly without cdylib in the
+//!     AC, but AVs the moment the cdylib is manual-mapped.
+//!
+//! Implication: making bash work needs (a) an arch-matched cdylib
+//! (build x86-64 `ac_cdylib.dll` when target is x86-64) AND (b) a
+//! workaround for cygwin1.dll's bare-AC DllMain crash. (a) is a
+//! well-defined build/install change (probably ~50 LOC: produce both
+//! ARM64 and x86-64 cdylibs, pick at spawn time based on target's
+//! image arch). (b) is a research project — likely needs running bash
+//! WITHOUT the AC at all (use the restricted token directly without
+//! `CreateProcessAsUserW + AC capabilities`), which loses the AC SID
+//! ACL stamping foundation entirely.
+//!
+//! Recommend a separate plan to address (a)+(b) together. For now,
+//! the harness is wired so a future branch can re-run with both
+//! walls fixed and flip green.
 //!
 //! How to use this file:
-//!   * **D-4 stance**: it does not run; `main` immediately exits with
-//!     a "skipped (known-failing)" message and exit code 0. The harness
-//!     stays intact so a future branch can flip the early return off.
-//!   * **Re-enabling** when investigating: delete the early-return at
-//!     the top of `main` and the rest of the file is the original
-//!     three-sub-test harness (echo+uname / pipeline / deny check).
+//!   * **Phase L stance** (re-enabled, expects FAIL): runs the 3
+//!     sub-tests; all currently fail with `0xC0000005`. The harness
+//!     itself works — broker spawns, ACL stamps, hooks patch, x64
+//!     emulation initialises — only Cygwin's DllMain dies.
+//!   * To skip: env var `WINSBOX_SKIP_BASH_SMOKE=1` (caller-side
+//!     opt-out for CI / known-failing branches).
 
 #[cfg(not(windows))]
 fn main() {
@@ -64,8 +86,17 @@ fn main() {
 #[cfg(windows)]
 fn main() {
     // Phase L: harness re-enabled to drive MSYS2 compat iteration. The
-    // outer skip block (with std::process::exit(0)) is removed so the
-    // harness runs the 3 sub-tests against bash inside the sandbox.
+    // 3 sub-tests are EXPECTED to FAIL pending the dual-wall fix
+    // documented above (arch-matched cdylib + bare-AC cygwin1.dll
+    // workaround). Setting `WINSBOX_SKIP_BASH_SMOKE=1` opts out for
+    // CI / branches that haven't picked up the fix yet.
+    if std::env::var("WINSBOX_SKIP_BASH_SMOKE").is_ok() {
+        eprintln!(
+            "[smoke_bash] SKIP (WINSBOX_SKIP_BASH_SMOKE=1): see file \
+             header for the dual-wall finding from Phase L."
+        );
+        std::process::exit(0);
+    }
     use std::path::PathBuf;
     use std::time::Instant;
 
