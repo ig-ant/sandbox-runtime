@@ -9,6 +9,8 @@ mod policy;
 #[cfg(all(windows, target_arch = "x86_64"))] mod interception_x64;
 #[cfg(all(windows, target_arch = "aarch64"))] mod interception_arm64;
 #[cfg(windows)] mod interception;
+#[cfg(all(windows, target_arch = "x86_64"))] mod entry_trampoline_x64;
+#[cfg(all(windows, target_arch = "aarch64"))] mod entry_trampoline_arm64;
 #[cfg(windows)] mod entry_trampoline;
 #[cfg(windows)] mod cdylib_inject;
 #[cfg(windows)] mod manual_map;
