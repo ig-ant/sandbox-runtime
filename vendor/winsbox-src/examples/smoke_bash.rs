@@ -57,11 +57,20 @@
 //!
 //! Implication: making bash work needs (a) an arch-matched cdylib
 //! (build x86-64 `ac_cdylib.dll` when target is x86-64) AND (b) a
-//! workaround for cygwin1.dll's bare-AC DllMain crash. (a) is a
-//! well-defined build/install change (probably ~50 LOC: produce both
-//! ARM64 and x86-64 cdylibs, pick at spawn time based on target's
-//! image arch). (b) is a research project — likely needs running bash
-//! WITHOUT the AC at all (use the restricted token directly without
+//! workaround for cygwin1.dll's bare-AC DllMain crash.
+//!
+//! Cycle 5 verified that cross-building the x86-64 cdylib is easy
+//! (`cargo build --target x86_64-pc-windows-msvc -p ac-cdylib` produces
+//! a 17 KB x64 PE32+ DLL), BUT the ARM64 broker cannot `LoadLibraryW`
+//! the x64 dll for export resolution (`%1 is not a valid Win32
+//! application`, 0x800700C1). `manual_map.rs::manual_map_cdylib`
+//! depends on LoadLibrary in the broker to resolve `hook_*` export
+//! VAs. Fixing (a) means parsing the PE export table directly without
+//! LoadLibrary — ~150 LOC in `manual_map.rs`, not the ~50 estimated
+//! before cycle 5.
+//!
+//! (b) is a research project — likely needs running bash WITHOUT the
+//! AC at all (use the restricted token directly without
 //! `CreateProcessAsUserW + AC capabilities`), which loses the AC SID
 //! ACL stamping foundation entirely.
 //!
