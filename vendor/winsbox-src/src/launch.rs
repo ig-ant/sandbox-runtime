@@ -18,7 +18,9 @@ use windows::Win32::System::Threading::{
 };
 
 use crate::acl::{AclJournal, FULL, MODIFY, READ_EXECUTE};
+use crate::acl_stamper::{psid_from_string, free_psid, PolicyStamp};
 use crate::appcontainer::AppContainer;
+use crate::cdylib_inject;
 use crate::desktop::AltDesktop;
 use crate::interception;
 use crate::ipc;
@@ -326,11 +328,66 @@ fn run_confined(pol: &Policy) -> Result<u32> {
         .cloned()
         .unwrap_or_else(|| ac.folder.to_string_lossy().into_owned());
 
+    // ── Phase B: optional cdylib injection. ─────────────────────────
+    // pol.cdylib_path (or WINSBOX_CDYLIB env override) selects the
+    // dll we LoadLibraryW into the target post-spawn. When set, we:
+    //   (a) push a placeholder AC_CDYLIB_BUFFER env var so the
+    //       in-target env block has space for the buffer VA,
+    //   (b) ACL-stamp the dll's parent dir for AC RX via Phase A's
+    //       PolicyStamp (NOT the legacy AclJournal),
+    //   (c) spawn SUSPENDED, prepare() the section/event/buffer,
+    //   (d) resume + trigger_async() — wait happens in a background
+    //       thread so the broker's main flow can move on.
+    //
+    // Mode::Broker (full hook stack) is gated off for now: the
+    // entry_trampoline rendezvous and broker IPC owns the resume
+    // sequencing, and grafting a parallel cdylib-LoadLibrary onto
+    // it is a Phase-C concern. Logged + skipped non-fatally.
+    let cdylib_request: Option<std::path::PathBuf> = pol.cdylib_path
+        .as_deref()
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var("WINSBOX_CDYLIB").ok().map(std::path::PathBuf::from));
+    let cdylib_active = cdylib_request.is_some() && tokens.is_none();
+    if cdylib_request.is_some() && tokens.is_some() {
+        log!("cdylib injection requested but Mode::Broker is incompatible \
+              with Phase-B scaffolding; skipping (Phase C extends entry \
+              trampoline to LoadLibrary the cdylib in-thread)");
+    }
+    if cdylib_active {
+        extra_env.push(cdylib_inject::placeholder_env_pair());
+    }
+
     log!("launching target (cwd={}): {}", target_cwd, pol.command_line);
+    // For cdylib injection we need to control the resume manually
+    // so prepare() (env patch + buffer write) runs while the target
+    // is still suspended. The legacy AC path resumes inside
+    // spawn_in_ac (resume=true).
+    let resume_in_spawn = tokens.is_none() && !cdylib_active;
     let pi = spawn_in_ac(&ac, &job, desktop.as_ref(), tokens.as_ref(),
                          &pol.command_line, Some(&target_cwd), &extra_env,
-                         /*resume=*/ tokens.is_none())?;
+                         /*resume=*/ resume_in_spawn)?;
     log!("target pid={}", pi.dwProcessId);
+
+    // Cdylib injection: stamp + prepare while still suspended,
+    // then resume + trigger_async. Failures here are non-fatal —
+    // the target launches normally; we just don't have the cdylib
+    // loaded (matches the policy-opt-in contract).
+    let mut cdylib_join: Option<std::thread::JoinHandle<Result<cdylib_inject::CdylibReport>>>
+        = None;
+    let mut cdylib_stamp: Option<(PolicyStamp, windows::Win32::Security::PSID)> = None;
+    if cdylib_active {
+        let dll_path = cdylib_request.as_ref().unwrap();
+        match try_inject_cdylib(&ac, dll_path, pi.hProcess, pi.hThread) {
+            Ok((stamp, sid_owned, join)) => {
+                cdylib_stamp = Some((stamp, sid_owned));
+                cdylib_join = Some(join);
+            }
+            Err(e) => {
+                log!("cdylib injection setup failed ({e:#}); resuming target without cdylib");
+                unsafe { ResumeThread(pi.hThread); }
+            }
+        }
+    }
 
     // Phase-2b: under the restricted+lowbox primary the target
     // cannot CreateProcess natively (P10). Hook NtCreateUserProcess
@@ -372,6 +429,19 @@ fn run_confined(pol: &Policy) -> Result<u32> {
     if let Some(ctx) = ctx {
         for h in ctx.threads.lock().unwrap().drain(..) { let _ = h.join(); }
     }
+    if let Some(j) = cdylib_join {
+        match j.join() {
+            Ok(Ok(_)) => {} // already logged inside trigger
+            Ok(Err(e)) => log!("cdylib injection result: {e:#}"),
+            Err(_) => log!("cdylib injection thread panicked"),
+        }
+    }
+    if let Some((stamp, sid)) = cdylib_stamp.take() {
+        if let Err(e) = stamp.revert(sid) {
+            log!("cdylib stamp revert: {e:#}");
+        }
+        free_psid(sid);
+    }
     let mut code = 0u32;
     unsafe { GetExitCodeProcess(pi.hProcess, &mut code)?; }
     log!("target exit={code:#x}");
@@ -388,6 +458,82 @@ fn run_confined(pol: &Policy) -> Result<u32> {
     drop(desktop);
     drop(job);
     Ok(code)
+}
+
+/// Phase-B: stamp the cdylib's parent dir for AC RX, prepare the
+/// section/event/buffer in the target, resume, and dispatch the
+/// LoadLibraryW remote thread (asynchronously waits for the cdylib
+/// wake event in a background thread).
+///
+/// Returns the PolicyStamp + owned PSID (caller reverts on cleanup)
+/// and the JoinHandle for the wait thread.
+///
+/// **The target must be SUSPENDED on entry** — we patch its env
+/// block in place. We resume the main thread internally before
+/// dispatching the LoadLibraryW remote thread.
+fn try_inject_cdylib(
+    ac: &AppContainer,
+    dll_path: &std::path::Path,
+    target: HANDLE,
+    main_thread: HANDLE,
+) -> Result<(
+    PolicyStamp,
+    windows::Win32::Security::PSID,
+    std::thread::JoinHandle<Result<cdylib_inject::CdylibReport>>,
+)> {
+    // Resolve to a canonical path so the stamp + LoadLibraryW
+    // both see the same string. locate_cdylib() canonicalises but
+    // pol.cdylib_path may be relative; do it again here.
+    let dll_canon = dll_path.canonicalize()
+        .with_context(|| format!("canonicalize cdylib path {}", dll_path.display()))?;
+    let dll_dir = dll_canon
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("cdylib path has no parent: {}", dll_canon.display()))?
+        .to_path_buf();
+
+    // Stamp the cdylib's directory for AC RX via Phase A's stamper
+    // (NOT acl::AclJournal — the plan reserves AclJournal for the
+    // legacy paths kept until Phase D). We re-derive the SID from
+    // its string form so the stamp's revert path owns the lifetime
+    // (decoupled from `ac` going out of scope).
+    let stamp = PolicyStamp {
+        allow_read: vec![dll_dir.clone()],
+        ..Default::default()
+    };
+    let sid_owned = psid_from_string(&ac.sid_string)
+        .with_context(|| format!("psid_from_string({})", ac.sid_string))?;
+    match stamp.apply(sid_owned) {
+        Ok(stats) => log!(
+            "cdylib stamp on {}: {} stamped, {} skipped (idempotent), {} ms",
+            dll_dir.display(),
+            stats.roots_stamped, stats.roots_skipped_idempotent, stats.elapsed_ms,
+        ),
+        Err(e) => {
+            free_psid(sid_owned);
+            anyhow::bail!("PolicyStamp.apply for cdylib dir {}: {e:#}", dll_dir.display());
+        }
+    }
+
+    // Prepare the in-target section/event/buffer + env patch.
+    let session = match cdylib_inject::prepare(target, &dll_canon) {
+        Ok(s) => s,
+        Err(e) => {
+            // Revert the stamp before returning so we don't leak it.
+            let _ = stamp.revert(sid_owned);
+            free_psid(sid_owned);
+            return Err(e.context("cdylib_inject::prepare"));
+        }
+    };
+    log!("cdylib prepared (dll={})", dll_canon.display());
+
+    // Resume the target's main thread and start the async wait.
+    // trigger_async() does the SETTLE_MS sleep + CreateRemoteThread
+    // off the broker's main thread.
+    unsafe { ResumeThread(main_thread); }
+    let timeout_ms = std::env::var("WINSBOX_CDYLIB_TIMEOUT_MS")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(5_000u32);
+    let join = cdylib_inject::trigger_async(session, target, timeout_ms);
+    Ok((stamp, sid_owned, join))
 }
 
 /// CreateProcessW into the AppContainer with the given Job + desktop.

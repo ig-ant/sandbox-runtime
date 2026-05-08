@@ -20,6 +20,12 @@ pub struct Policy {
     /// Phase selector understood by the launcher. Phase 0.5 only
     /// implements `Stub`; later phases add `AppContainer` / `Broker`.
     pub mode: Mode,
+    /// Phase-B opt-in. Path to `ac_cdylib.dll` (or compatible) to
+    /// inject into the AC target post-spawn. When `None` the launch
+    /// path is identical to pre-Phase-B. The broker also honours
+    /// the `WINSBOX_CDYLIB` environment variable as a fallback so
+    /// smoke tests / CI can opt in without editing policy JSON.
+    pub cdylib_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
