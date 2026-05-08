@@ -30,107 +30,22 @@ use windows::Win32::System::SystemServices::SE_GROUP_LOGON_ID;
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 pub const IL_UNTRUSTED: u32 = 0x0000;
-pub const IL_LOW: u32 = 0x1000;
 
-/// Restricting-SID list shape for `make_lockdown_with`.
-#[derive(Clone, Copy, Debug)]
-pub enum Restricting {
-    /// `keep_enabled` ∪ {Logon SID, RESTRICTED}. Current Phase-2
-    /// production shape — broad enough that the loader can read
-    /// system files via raw syscall.
-    Keep,
-    /// {Logon SID, RESTRICTED} only.
-    LogonAndRestricted,
-    /// {Everyone, Authenticated Users, Users, RESTRICTED,
-    /// Logon SID}. With `keep_enabled = []` the *normal*-SID
-    /// check is already the FS boundary — only objects
-    /// granting `ALL APP PACKAGES` (lowbox-added), the AC
-    /// SID, or the Logon SID pass it, and user files grant
-    /// none of those. The restricting list is therefore
-    /// widened to the USER_LIMITED set so passthrough'd
-    /// opens of `\Device\Afd` (grants `Authenticated
-    /// Users`), system registry/sections (grant `Users`),
-    /// and `\BaseNamedObjects` (grants `Everyone`) all
-    /// satisfy the restricting check; the normal check stays
-    /// tight. `CreateRestrictedToken` rejects every
-    /// `S-1-15-*` SID in `SidsToRestrict` (verified for
-    /// `S-1-15-2-1` at ff18fb4), so the restricting list
-    /// can't simply mirror the lowbox-enabled groups.
-    Lockdown,
-    /// {S-1-0-0}. Chromium USER_LOCKDOWN — every access check
-    /// fails the restricting pass unless the object's DACL grants
-    /// NULL SID (effectively never). Unusable for a target that
-    /// must do its own AFD opens (ours must — broker-opening
-    /// AFD yields a non-AC socket).
-    Null,
-}
-
+/// Token shape for `make_lockdown_with`. `keep_enabled` lists the
+/// group SIDs (string form) that stay enabled; every other group
+/// goes deny-only (the Logon SID and the integrity-label group are
+/// always exempt). The restricting list is built as
+/// `keep_enabled ∪ {Logon SID, RESTRICTED}` — broad enough that
+/// the loader can read system files via raw syscall, while AC-SID
+/// DENY stamps still gate the normal-SID pass.
 #[derive(Clone, Copy, Debug)]
 pub struct LockdownSpec {
-    /// Group SIDs (string form) that stay enabled; every other
-    /// group goes deny-only. The Logon SID and the integrity-label
-    /// group are always exempt from deny-only regardless.
     pub keep_enabled: &'static [&'static str],
-    pub restricting: Restricting,
 }
 
 pub const USER_LIMITED: LockdownSpec = LockdownSpec {
     keep_enabled: &["S-1-1-0", "S-1-5-11", "S-1-5-32-545"],
-    restricting: Restricting::Keep,
 };
-/// WFP's intra-AC-loopback exemption (which lets a lowbox
-/// process connect to a same-AC listener despite no
-/// `internetClient` capability) keys on `Everyone` being
-/// enabled in the connecting token — bisected at 7847a77:
-/// keep_enabled=[Everyone] → curl-http+npm pass (17/0);
-/// [AuthUsers] or [Users] alone → still refused. With
-/// Users/AuthUsers deny-only, raw-syscall bypass can read
-/// only objects whose DACL grants `Everyone` (system
-/// files, `C:\Users\Public`) — user data (`~/.ssh`,
-/// `%APPDATA%`, app installs ACL'd to `Users`) is still
-/// blocked at the *normal*-SID check. `acl::deny()` strips
-/// `Everyone` from denyRead paths so an inherited
-/// `Everyone:R` doesn't leak through.
-pub const USER_LOCKDOWN: LockdownSpec = LockdownSpec {
-    keep_enabled: &["S-1-1-0"],
-    restricting: Restricting::Lockdown,
-};
-
-/// `WINSBOX_TOKEN=lockdown` → (USER_LOCKDOWN, Untrusted IL).
-/// Anything else → (USER_LIMITED, Low IL). The IL is returned so
-/// `build_broker_tokens` can apply the same level to the initial
-/// impersonation token (SeTokenCanImpersonate requires they match).
-pub fn spec_from_env() -> (LockdownSpec, u32) {
-    // WINSBOX_IL=low keeps the lockdown spec but at Low IL —
-    // bisects whether the inside-relay loopback connect failure
-    // under USER_LOCKDOWN is the Untrusted-IL target failing the
-    // no-write-up check on the Low-IL relay's AFD endpoint, or
-    // the deny-only enabled groups.
-    let il = match std::env::var("WINSBOX_IL").as_deref() {
-        Ok("low") => IL_LOW,
-        Ok("untrusted") => IL_UNTRUSTED,
-        _ => match std::env::var("WINSBOX_TOKEN").as_deref() {
-            Ok("lockdown") => IL_UNTRUSTED,
-            _ => IL_LOW,
-        },
-    };
-    let mut spec = match std::env::var("WINSBOX_TOKEN").as_deref() {
-        Ok("lockdown") => USER_LOCKDOWN,
-        _ => USER_LIMITED,
-    };
-    // WINSBOX_KEEP=<sid>[,<sid>...] overrides keep_enabled —
-    // bisects which deny-only group is what WFP's
-    // intra-AC-loopback check keys on. Leaks the Vec; runs
-    // once per process.
-    if let Ok(k) = std::env::var("WINSBOX_KEEP") {
-        let v: Vec<&'static str> = k.split(',')
-            .map(|s| Box::leak(s.trim().to_string().into_boxed_str()) as &str)
-            .filter(|s| !s.is_empty())
-            .collect();
-        spec.keep_enabled = Box::leak(v.into_boxed_slice());
-    }
-    (spec, il)
-}
 
 #[link(name = "ntdll")]
 extern "system" {
@@ -151,28 +66,11 @@ pub fn open_self_token() -> Result<HANDLE> {
     }
 }
 
-// P12 (d7ef9a9): under brokered spawn the USER_LOCKDOWN blocker is
-// not a conhost/csrss object; it's that the FS hooks were installed
-// post-rendezvous, so non-KnownDll grandchildren died 0xc0000135
-// from parallel-loader worker threads running under the
-// NULL-restricting process token. install_broker_hook now patches
-// NtCreateFile/NtOpenFile before resume. P12 also showed dropping
-// `Authenticated Users` and IL→Untrusted are free; `BUILTIN\Users`
-// keys worker-thread DLL file opens; `Everyone` keys a DllMain init
-// path. The default stays USER_LIMITED until WINSBOX_TOKEN=lockdown
-// is green on CI with the pre-resume FS hooks.
-
-/// Phase-2 primary token. Defaults to USER_LIMITED (deny-only on
-/// admin/elevated groups, keep Users/Everyone/AuthUsers, drop
-/// every privilege except SeChangeNotify) so brokered children
-/// can still read system files via raw syscall while the
-/// confused-deputy hardening lands. `WINSBOX_TOKEN=lockdown`
-/// switches to USER_LOCKDOWN (deny-all + NULL restricting SID) for
-/// step-0 retesting and CI bisection.
-pub fn make_lockdown(base: HANDLE, il_rid: u32) -> Result<HANDLE> {
-    let (spec, _) = spec_from_env();
-    make_lockdown_with(base, il_rid, spec)
-}
+// Production token shape (Phase E-5c, c0209d1): USER_LIMITED — deny-
+// only on admin/elevated groups, keep Users/Everyone/AuthUsers
+// enabled, drop every privilege except SeChangeNotify. Brokered
+// children still read system files via raw syscall (CRYPTBASE/CNG/LSA
+// need `BUILTIN\Users:RX`) while AC-SID DENY stamps gate user data.
 
 pub fn make_lockdown_with(
     base: HANDLE, il_rid: u32, spec: LockdownSpec,
@@ -201,63 +99,28 @@ pub fn make_lockdown_with(
             .map(|g| SID_AND_ATTRIBUTES { Sid: g.Sid, Attributes: 0 })
             .collect();
 
-        // Restricting list. RESTRICTED (S-1-5-12) is the canonical
-        // "restricted code" SID; the broker also grants it on
-        // allowRead/allowWrite so those paths pass the restricting
-        // check on the lockdown primary after RevertToSelf.
-        // AppContainer package SIDs are not valid restricting SIDs
-        // — CreateRestrictedToken returns ERROR_INVALID_PARAMETER.
+        // Restricting list = `keep_enabled ∪ {Logon SID, RESTRICTED}`.
+        // RESTRICTED (S-1-5-12) is the canonical "restricted code" SID;
+        // the broker also grants it on allowRead/allowWrite so those
+        // paths pass the restricting check on the lockdown primary
+        // after RevertToSelf. AppContainer package SIDs are not valid
+        // restricting SIDs — CreateRestrictedToken returns
+        // ERROR_INVALID_PARAMETER.
         let logon_sid = garr.iter()
             .find(|g| g.Attributes & (SE_GROUP_LOGON_ID as u32) != 0)
             .map(|g| g.Sid);
         let mut owned_restrict: Vec<PSID> = Vec::new();
-        let restrict: Vec<SID_AND_ATTRIBUTES> = match spec.restricting {
-            Restricting::Keep => {
-                let mut v: Vec<SID_AND_ATTRIBUTES> = keep_sids.iter()
-                    .map(|s| SID_AND_ATTRIBUTES { Sid: *s, Attributes: 0 }).collect();
-                if let Some(l) = logon_sid {
-                    v.push(SID_AND_ATTRIBUTES { Sid: l, Attributes: 0 });
-                }
-                if let Some(r) = str_sid("S-1-5-12") {
-                    owned_restrict.push(r);
-                    v.push(SID_AND_ATTRIBUTES { Sid: r, Attributes: 0 });
-                }
-                v
+        let restrict: Vec<SID_AND_ATTRIBUTES> = {
+            let mut v: Vec<SID_AND_ATTRIBUTES> = keep_sids.iter()
+                .map(|s| SID_AND_ATTRIBUTES { Sid: *s, Attributes: 0 }).collect();
+            if let Some(l) = logon_sid {
+                v.push(SID_AND_ATTRIBUTES { Sid: l, Attributes: 0 });
             }
-            Restricting::LogonAndRestricted => {
-                let mut v = Vec::new();
-                if let Some(l) = logon_sid {
-                    v.push(SID_AND_ATTRIBUTES { Sid: l, Attributes: 0 });
-                }
-                if let Some(r) = str_sid("S-1-5-12") {
-                    owned_restrict.push(r);
-                    v.push(SID_AND_ATTRIBUTES { Sid: r, Attributes: 0 });
-                }
-                v
+            if let Some(r) = str_sid("S-1-5-12") {
+                owned_restrict.push(r);
+                v.push(SID_AND_ATTRIBUTES { Sid: r, Attributes: 0 });
             }
-            Restricting::Lockdown => {
-                let mut v = Vec::new();
-                if let Some(l) = logon_sid {
-                    v.push(SID_AND_ATTRIBUTES { Sid: l, Attributes: 0 });
-                }
-                for s in [
-                    "S-1-1-0",      // Everyone
-                    "S-1-5-11",     // Authenticated Users
-                    "S-1-5-32-545", // BUILTIN\Users
-                    "S-1-5-12",     // RESTRICTED
-                ] {
-                    if let Some(p) = str_sid(s) {
-                        owned_restrict.push(p);
-                        v.push(SID_AND_ATTRIBUTES { Sid: p, Attributes: 0 });
-                    }
-                }
-                v
-            }
-            Restricting::Null => {
-                let n = str_sid("S-1-0-0").expect("S-1-0-0");
-                owned_restrict.push(n);
-                vec![SID_AND_ATTRIBUTES { Sid: n, Attributes: 0 }]
-            }
+            v
         };
 
         let to_delete = privileges_except(base, &["SeChangeNotifyPrivilege"])?;

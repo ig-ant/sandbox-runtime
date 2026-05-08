@@ -133,7 +133,7 @@ fn main() {
             }
 
             let base = token::open_self_token()?;
-            let il = token::IL_LOW;
+            let il = token::IL_UNTRUSTED;
             let (lock, init) = if v.skip_restricted {
                 let mut p = HANDLE::default();
                 unsafe {
@@ -145,7 +145,8 @@ fn main() {
                 }
                 (p, token::make_initial(base, il)?)
             } else {
-                (token::make_lockdown(base, il)?, token::make_initial(base, il)?)
+                (token::make_lockdown_with(base, il, token::USER_LIMITED)?,
+                 token::make_initial(base, il)?)
             };
             unsafe { let _ = CloseHandle(base); }
 

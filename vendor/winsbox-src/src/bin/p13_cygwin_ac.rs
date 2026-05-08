@@ -107,9 +107,10 @@ fn parent() {
             //   lockdown=true  → CreateRestrictedToken + lowbox (= production)
             //   lockdown=false → just lowbox over the parent token (vanilla AC)
             let base = token::open_self_token()?;
-            let il = token::IL_LOW;
+            let il = token::IL_UNTRUSTED;
             let (lock, init) = if p.lockdown {
-                (token::make_lockdown(base, il)?, token::make_initial(base, il)?)
+                (token::make_lockdown_with(base, il, token::USER_LIMITED)?,
+                 token::make_initial(base, il)?)
             } else {
                 let mut a = HANDLE::default();
                 let mut b = HANDLE::default();

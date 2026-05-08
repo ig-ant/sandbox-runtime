@@ -1040,10 +1040,10 @@ fn handle_cpw(ch: &ipc::Channel, target: HANDLE, req: &ipc::Wire, ctx: &Arc<Spaw
 /// `NtOpenSection` namespace handler (D-4: collapsed from `handle_reg`
 /// to a passthrough). The cdylib hooks `NtOpenSection` to give the
 /// broker a chance to redirect Cygwin's shared-state sections, but
-/// the legacy redirect logic was bound to `WINSBOX_TOKEN=lockdown`
-/// quirks that are gone post-D-4. Reply `FS_PASSTHROUGH` so the
-/// kernel handles the open under the AC's own token; ACL stamps
-/// gate which sections it can reach.
+/// the legacy redirect logic was tied to a token shape that's gone
+/// post-D-4. Reply `FS_PASSTHROUGH` so the kernel handles the open
+/// under the AC's own token; ACL stamps gate which sections it can
+/// reach.
 fn handle_section(
     ch: &ipc::Channel, _target: HANDLE, _req: &ipc::Wire, ctx: &Arc<SpawnCtx>,
 ) {
