@@ -29,7 +29,8 @@
 
 #![cfg(windows)]
 
-use crate::util::{pcwstr, wstr};
+use crate::ipc;
+use crate::util::wstr;
 use anyhow::{anyhow, bail, Context, Result};
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
@@ -64,12 +65,23 @@ pub const ENV_KEY: &str = "AC_CDYLIB_BUFFER";
 pub const ENV_PLACEHOLDER: &str = "0000000000000000";
 
 /// Layout MUST match `crates/ac-cdylib/src/lib.rs::CdylibBuffer`.
+/// Phase C added the trailing IPC fields so the cdylib's hook bodies
+/// can do their own IPC frame writes (no inline-asm stub in target
+/// memory). All zero is permitted for Phase-B-style smoke runs that
+/// don't enable any hooks.
 #[repr(C)]
 struct CdylibBuffer {
     section: u64,
     event: u64,
     view: u64,
     magic: u64,
+    /// IPC section VA in the target's address space (one Wire-sized
+    /// shared region; see `crate::ipc::Wire`).
+    ipc_section: u64,
+    /// Target-side handles for the IPC events + mutex.
+    ipc_ev_req: u64,
+    ipc_ev_resp: u64,
+    ipc_mutex: u64,
 }
 const CDYLIB_MAGIC: u64 = 0xAC11_DEAD_BEEF_CAFEu64;
 
@@ -212,6 +224,15 @@ pub fn placeholder_env_pair() -> (String, String) {
 ///   * VirtualAllocEx + WriteProcessMemory the cdylib path string
 ///     (UTF-16) so [`trigger`] can pass its VA to LoadLibraryW.
 ///
+/// `ipc_channel`, when supplied, contributes its target-side
+/// section-VA / ev_req / ev_resp / mutex into the [`CdylibBuffer`]'s
+/// IPC fields. The cdylib's hook bodies read these on every call to
+/// IPC the broker. When `None`, the IPC fields are zero — the cdylib
+/// `ipc_loaded()` check returns false and hooks short-circuit to
+/// STATUS_ACCESS_DENIED. Phase B (no hooks installed) passes `None`;
+/// Phase C+ shares the same channel that powers the inline-asm thunks
+/// so the broker sees one stream of requests.
+///
 /// **Pre-condition:** the caller must have set `AC_CDYLIB_BUFFER=`
 /// followed by exactly [`ENV_PLACEHOLDER`] in the env block passed
 /// to CreateProcess. Use [`placeholder_env_pair`] to construct it.
@@ -220,7 +241,11 @@ pub fn placeholder_env_pair() -> (String, String) {
 /// have the AC SID's read+execute ACE — the broker stamps it via
 /// `acl_stamper::PolicyStamp { allow_read: vec![dll.parent()], .. }`
 /// before calling us.
-pub fn prepare(target: HANDLE, dll_path: &Path) -> Result<CdylibSession> {
+pub fn prepare(
+    target: HANDLE,
+    dll_path: &Path,
+    ipc_channel: Option<&ipc::Channel>,
+) -> Result<CdylibSession> {
     if !dll_path.exists() {
         bail!("cdylib path does not exist: {}", dll_path.display());
     }
@@ -273,11 +298,28 @@ pub fn prepare(target: HANDLE, dll_path: &Path) -> Result<CdylibSession> {
             if p.is_null() {
                 bail!("VirtualAllocEx(CdylibBuffer): {:?}", GetLastError());
             }
+            // Phase C: when an IPC channel is supplied, surface its
+            // target-side section VA + handle values into the buffer
+            // so the cdylib's hook bodies can IPC the broker. The
+            // channel itself was already mapped + duplicated into the
+            // target by `ipc::Channel::create`; we just pass through
+            // its `StubAddrs` snapshot.
+            let (ipc_section, ipc_ev_req, ipc_ev_resp, ipc_mutex) = match ipc_channel {
+                Some(ch) => {
+                    let s = ch.stub_env_snapshot();
+                    (s.section as u64, s.ev_req, s.ev_resp, s.mutex)
+                }
+                None => (0, 0, 0, 0),
+            };
             let buf = CdylibBuffer {
                 section: target_section_h,
                 event: target_event_h,
                 view: target_view as u64,
                 magic: CDYLIB_MAGIC,
+                ipc_section,
+                ipc_ev_req,
+                ipc_ev_resp,
+                ipc_mutex,
             };
             let mut n = 0usize;
             WriteProcessMemory(

@@ -7,6 +7,8 @@ mod policy;
 #[cfg(windows)] mod netbridge;
 #[cfg(windows)] mod token;
 #[cfg(windows)] mod ipc;
+#[cfg(all(windows, target_arch = "x86_64"))] mod interception_x64;
+#[cfg(all(windows, target_arch = "aarch64"))] mod interception_arm64;
 #[cfg(windows)] mod interception;
 #[cfg(windows)] mod entry_trampoline;
 #[cfg(windows)] mod policy_engine;

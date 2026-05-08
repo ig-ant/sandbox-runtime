@@ -1,93 +1,393 @@
-//! Production cdylib loaded into the AppContainer target. Phase B
-//! scaffolding only — exports a single sentinel function (`cdylib_init`)
-//! and a `DllMain` that signals back to the broker over a shared
-//! section + event. Phase C will replace `cdylib_init` with the real
-//! hook entry points.
+//! Production cdylib loaded into the AppContainer target.
 //!
-//! The handoff protocol mirrors `spike-cdylib`:
-//!
+//! Phase B established the load-and-report-back protocol:
 //!   1. Broker creates an anonymous file mapping (page-sized) and an
-//!      auto-reset event, duplicates both into the suspended target
-//!      with PROCESS_DUP_HANDLE, and pre-maps the section view via
-//!      NtMapViewOfSection so DllMain doesn't have to.
+//!      auto-reset event, duplicates both into the suspended target,
+//!      and pre-maps the section view via NtMapViewOfSection.
 //!   2. Broker writes a `CdylibBuffer` struct into a `VirtualAllocEx`
-//!      region in the target containing the target-side handle/VA values
-//!      and a magic sentinel.
-//!   3. Broker patches the target's environment block in-place to set
-//!      `AC_CDYLIB_BUFFER=<hex VA>` (16 hex chars). Env vars are visible
-//!      to DllMain via `std::env::var`.
+//!      region in the target. The buffer carries the in-target handles
+//!      + section VA + the broker IPC `StubAddrs` (Phase C addition)
+//!      + a magic sentinel.
+//!   3. Broker patches the target's environment block in-place so
+//!      `AC_CDYLIB_BUFFER=<hex VA>` (16 hex chars) points to the
+//!      buffer. Env vars are visible to DllMain via `std::env::var`.
 //!   4. Target loads us via remote `LoadLibraryW(<dll path>)`.
-//!   5. Our `DllMain(DLL_PROCESS_ATTACH)` reads `AC_CDYLIB_BUFFER`,
-//!      calls `cdylib_init()`, writes the result + sentinel + PID +
-//!      version into the mapped section, and `SetEvent`s the wake event.
-//!   6. Broker waits on the event, reads the section, logs the report.
+//!   5. `DllMain(DLL_PROCESS_ATTACH)` reads `AC_CDYLIB_BUFFER`, copies
+//!      the IPC env into a process-static `IpcEnv`, calls
+//!      `cdylib_init()`, writes its result + sentinel + PID + version
+//!      into the mapped section, and `SetEvent`s the wake event.
+//!   6. Broker waits on the event, reads the section, then resolves
+//!      the `hook_*` exports via `GetProcAddress` and patches the
+//!      ntdll/kernelbase syscall stubs to dispatch into them.
 //!
-//! The named-event variant we considered for the spike (Local\…)
-//! requires extra ACL plumbing under AC; anonymous handles +
-//! DuplicateHandle is the simpler path.
+//! Phase C added the hook bodies. Each `hook_*` function:
+//!   * Reads input args from the standard Win64 ABI (rcx/rdx/r8/r9 +
+//!     stack on x64; x0..x7 on ARM64; both surfaces use `extern "system"`).
+//!   * Acquires the IPC mutex, writes the wire frame, signals
+//!     `ev_req`, waits on `ev_resp`.
+//!   * Writes the broker's reply into the caller's out-params.
+//!   * Releases the mutex and returns `r_status`.
+//!
+//! The IPC layout (`Wire`) and op codes match the broker's
+//! `src/ipc.rs` byte-for-byte. We re-declare them locally rather than
+//! depend on the broker crate so the cdylib stays a leaf workspace
+//! member (no cyclic dep, smaller link surface).
 
 #![cfg(windows)]
 
 use std::ffi::c_void;
-use windows::Win32::Foundation::HANDLE;
+use std::sync::atomic::{AtomicU64, Ordering};
+use windows::Win32::Foundation::{HANDLE, NTSTATUS};
 use windows::Win32::System::Threading::SetEvent;
 
 const DLL_PROCESS_ATTACH: u32 = 1;
 
-/// Cdylib version stamp. Bumps whenever the layout of `CdylibResult`
-/// or the protocol changes. Broker compares to its own constant on
-/// readback to catch broker/cdylib skew (e.g. forgot to rebuild the
-/// dll after touching the wire format).
-pub const CDYLIB_VERSION: u32 = 1;
+// ─── Versioning ────────────────────────────────────────────────────
 
-/// Phase-B sentinel return value for `cdylib_init`. Phase C replaces
-/// this function with real hook entry points.
+/// Cdylib version stamp. Bumps whenever the layout of `CdylibBuffer`,
+/// `CdylibResult`, or the wire format changes. Broker compares to its
+/// own constant on readback to catch broker/cdylib skew.
+pub const CDYLIB_VERSION: u32 = 2;
+
+/// Sentinel return value for `cdylib_init`. Broker verifies on
+/// report-back.
 pub const CDYLIB_INIT_OK: u32 = 0xACDC_0001;
 
-/// One-shot init callable by the broker (or DllMain) to confirm the
-/// cdylib is loaded and its symbols are resolvable. Returns
-/// [`CDYLIB_INIT_OK`].
 #[no_mangle]
 pub extern "system" fn cdylib_init() -> u32 {
     CDYLIB_INIT_OK
 }
 
+// ─── Buffer / report layout (mirrors broker side) ──────────────────
+
 /// Layout of the broker-allocated scratch buffer in the target.
-/// MUST match `CdylibBuffer` in the broker (`cdylib_inject.rs`).
+/// MUST match `CdylibBuffer` in `cdylib_inject.rs`.
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct CdylibBuffer {
-    /// Target-side HANDLE for the result section. Currently unused
-    /// by DllMain (broker pre-mapped the view) but included for
-    /// completeness.
     _section: u64,
-    /// Target-side HANDLE for the wake event.
     event: u64,
-    /// Target-side VA where the section is mapped.
     view: u64,
-    /// Sanity sentinel.
     magic: u64,
+    /// Phase C: IPC environment for hook bodies.
+    /// Target-VA of the broker IPC section (one Wire-sized
+    /// shared region; see `crate::ipc::Wire` in the broker).
+    ipc_section: u64,
+    /// Target-side HANDLE values for the IPC event/mutex pair.
+    ipc_ev_req: u64,
+    ipc_ev_resp: u64,
+    ipc_mutex: u64,
 }
 
-/// Magic value the broker stamps into [`CdylibBuffer::magic`].
 pub const CDYLIB_MAGIC: u64 = 0xAC11_DEAD_BEEF_CAFEu64;
 
-/// Layout of the result section the broker reads back. MUST match
-/// `CdylibResult` in the broker.
 #[repr(C)]
 struct CdylibResult {
-    /// `cdylib_init()` return value. Broker expects [`CDYLIB_INIT_OK`].
     init_result: u32,
-    /// Cdylib version (= [`CDYLIB_VERSION`]).
     version: u32,
-    /// Sentinel so the broker can tell "DllMain ran" from
-    /// "section was zero-initialised".
     sentinel: u32,
-    /// PID we ran in (sanity check the right process attached).
     pid: u32,
 }
 
-/// Sentinel placed in [`CdylibResult::sentinel`] to mark a real reply.
 pub const RESULT_SENTINEL: u32 = 0xACDC_BABE;
+
+// ─── IPC env (process-static, populated at DLL_PROCESS_ATTACH) ─────
+
+/// Process-static IPC environment. `DllMain` writes this from the
+/// `CdylibBuffer`; hook bodies read it on every call. `AtomicU64`
+/// stores so we don't need a `Mutex` on the hot path — only
+/// `DllMain` writes, and it runs strictly before any hook patch.
+struct IpcEnv {
+    section: AtomicU64,
+    ev_req: AtomicU64,
+    ev_resp: AtomicU64,
+    mutex: AtomicU64,
+}
+static IPC: IpcEnv = IpcEnv {
+    section: AtomicU64::new(0),
+    ev_req: AtomicU64::new(0),
+    ev_resp: AtomicU64::new(0),
+    mutex: AtomicU64::new(0),
+};
+
+#[inline]
+fn ipc_loaded() -> bool {
+    IPC.section.load(Ordering::Acquire) != 0
+}
+
+// ─── Wire-format constants (mirror crate::ipc) ─────────────────────
+
+const OP_CPW: u64 = 0;
+const OP_NTOPENSECTION: u64 = 5;
+const OP_NTCREATEDIROBJ: u64 = 8;
+const OP_NTOPENDIROBJ: u64 = 9;
+const OP_NTCREATENAMEDPIPE: u64 = 10;
+
+const FS_PASSTHROUGH: i32 = 0xE0000001u32 as i32;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Wire {
+    op: u64,
+    args: [u64; 12],
+    r0: u64,
+    r1: u64,
+    r2: u32,
+    r3: u32,
+    r_status: i32,
+    r_error: u32,
+}
+const _: () = assert!(std::mem::size_of::<Wire>() == 0x88);
+
+// ─── ntdll bindings used by hook bodies for the IPC sync calls ─────
+
+#[link(name = "ntdll")]
+extern "system" {
+    fn NtSetEvent(h: HANDLE, prev: *mut i32) -> NTSTATUS;
+    fn NtWaitForSingleObject(h: HANDLE, alertable: u8, timeout: *const i64) -> NTSTATUS;
+    fn NtReleaseMutant(h: HANDLE, prev: *mut i32) -> NTSTATUS;
+}
+
+// ─── Hook-body machinery ───────────────────────────────────────────
+
+/// One IPC round-trip. Caller fills in `op` + `args[..]`, we acquire
+/// the broker mutex, copy the local frame into the shared section,
+/// signal `ev_req`, wait on `ev_resp`, copy the reply back into
+/// `frame`, release the mutex, and return.
+///
+/// Concurrency: a per-channel mutant — the broker IPC section holds
+/// one request at a time, so two threads in the AC racing two hooks
+/// serialise on this mutant. Same model as the legacy inline-asm
+/// stubs (see broker `src/ipc.rs` doc).
+unsafe fn ipc_roundtrip(frame: &mut Wire) {
+    let section = IPC.section.load(Ordering::Acquire) as *mut Wire;
+    let ev_req = HANDLE(IPC.ev_req.load(Ordering::Acquire) as *mut c_void);
+    let ev_resp = HANDLE(IPC.ev_resp.load(Ordering::Acquire) as *mut c_void);
+    let mutex = HANDLE(IPC.mutex.load(Ordering::Acquire) as *mut c_void);
+
+    // Acquire mutex. STATUS_ABANDONED still grants ownership — same
+    // policy as the inline-asm stubs.
+    let _ = NtWaitForSingleObject(mutex, 0, std::ptr::null());
+    // Write request frame into the shared section.
+    std::ptr::write_volatile(section, *frame);
+    // Signal the broker; wait for reply.
+    let _ = NtSetEvent(ev_req, std::ptr::null_mut());
+    let _ = NtWaitForSingleObject(ev_resp, 0, std::ptr::null());
+    // Read reply.
+    *frame = std::ptr::read_volatile(section);
+    // Release mutex.
+    let _ = NtReleaseMutant(mutex, std::ptr::null_mut());
+}
+
+/// Common dispatch for the 3 handle-only hooks: NtOpenSection,
+/// NtCreate/OpenDirectoryObject. All three have the
+/// (PHANDLE, ACCESS, POBJECT_ATTRIBUTES) signature; the broker
+/// returns `r0 = handle`, `r_status = NTSTATUS`. On
+/// `FS_PASSTHROUGH` we'd need to fall back to the original
+/// syscall; the Phase-D removal of that path is upstream of this
+/// concern, so for Phase C we treat passthrough as
+/// STATUS_NOT_IMPLEMENTED — the broker's `handle_dirobj` /
+/// `handle_section` already only emits passthrough for paths
+/// outside the broker's namespace, which under the new ACL design
+/// would be handled by stamping rather than hooks.
+#[inline]
+unsafe fn hook_handle_op(
+    op: u64, out_handle: *mut HANDLE, desired: u32, oa: *const c_void,
+) -> NTSTATUS {
+    if !ipc_loaded() {
+        return NTSTATUS(0xC0000022u32 as i32); // STATUS_ACCESS_DENIED
+    }
+    let mut frame = Wire {
+        op,
+        args: [0, desired as u64, oa as u64, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        r0: 0, r1: 0, r2: 0, r3: 0, r_status: 0, r_error: 0,
+    };
+    // args[0] = the out-handle pointer (broker uses it as
+    // identity, not for writes — we write the result locally).
+    frame.args[0] = out_handle as u64;
+    ipc_roundtrip(&mut frame);
+    if frame.r_status == FS_PASSTHROUGH {
+        // Phase C cdylib hooks do not implement passthrough; the
+        // broker IPC handlers (`handle_dirobj`, `handle_section`)
+        // never emit FS_PASSTHROUGH for the inputs we care about.
+        // Safety belt: return NOT_IMPLEMENTED so the caller sees
+        // a defined failure rather than a silent wrong answer.
+        return NTSTATUS(0xC0000002u32 as i32);
+    }
+    if frame.r_status >= 0 && !out_handle.is_null() {
+        std::ptr::write(out_handle, HANDLE(frame.r0 as *mut c_void));
+    }
+    NTSTATUS(frame.r_status)
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn hook_nt_open_section(
+    out_handle: *mut HANDLE, desired: u32, oa: *const c_void,
+) -> NTSTATUS {
+    hook_handle_op(OP_NTOPENSECTION, out_handle, desired, oa)
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn hook_nt_create_directory_object(
+    out_handle: *mut HANDLE, desired: u32, oa: *const c_void,
+) -> NTSTATUS {
+    hook_handle_op(OP_NTCREATEDIROBJ, out_handle, desired, oa)
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn hook_nt_open_directory_object(
+    out_handle: *mut HANDLE, desired: u32, oa: *const c_void,
+) -> NTSTATUS {
+    hook_handle_op(OP_NTOPENDIROBJ, out_handle, desired, oa)
+}
+
+/// `NtCreateNamedPipeFile` — 14 NT args, but Wire holds 12. The
+/// broker's `handle_named_pipe` ignores `OutboundQuota` /
+/// `DefaultTimeout` (Cygwin passes the broker-side defaults) and
+/// reads the rest from `args[1..]`. Returns
+/// `(handle, IO_STATUS_BLOCK.Information, NTSTATUS)`.
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
+pub unsafe extern "system" fn hook_nt_create_named_pipe_file(
+    out_handle: *mut HANDLE,
+    desired_access: u32,
+    oa: *const c_void,
+    iosb: *mut [usize; 2],
+    share_access: u32,
+    create_disposition: u32,
+    create_options: u32,
+    named_pipe_type: u32,
+    read_mode: u32,
+    completion_mode: u32,
+    maximum_instances: u32,
+    inbound_quota: u32,
+    _outbound_quota: u32,
+    _default_timeout: *const i64,
+) -> NTSTATUS {
+    if !ipc_loaded() {
+        return NTSTATUS(0xC0000022u32 as i32);
+    }
+    let mut frame = Wire {
+        op: OP_NTCREATENAMEDPIPE,
+        args: [
+            out_handle as u64,
+            desired_access as u64,
+            oa as u64,
+            iosb as u64,
+            share_access as u64,
+            create_disposition as u64,
+            create_options as u64,
+            named_pipe_type as u64,
+            read_mode as u64,
+            completion_mode as u64,
+            maximum_instances as u64,
+            inbound_quota as u64,
+        ],
+        r0: 0, r1: 0, r2: 0, r3: 0, r_status: 0, r_error: 0,
+    };
+    ipc_roundtrip(&mut frame);
+    if frame.r_status == FS_PASSTHROUGH {
+        return NTSTATUS(0xC0000002u32 as i32);
+    }
+    if frame.r_status >= 0 {
+        if !out_handle.is_null() {
+            std::ptr::write(out_handle, HANDLE(frame.r0 as *mut c_void));
+        }
+        if !iosb.is_null() {
+            // IO_STATUS_BLOCK = { Status, Information } both pointer-
+            // sized. Match the legacy stub: status from r_status (sign-
+            // extended), information from r1.
+            (*iosb)[0] = frame.r_status as isize as usize;
+            (*iosb)[1] = frame.r1 as usize;
+        }
+    }
+    NTSTATUS(frame.r_status)
+}
+
+/// `CreateProcessInternalW` — kernelbase export with the standard
+/// CreateProcess signature (12 args). Broker's `handle_cpw` runs
+/// the spawn under its own token, recursively installs the hook,
+/// duplicates `(hProcess, hThread)` back, and replies with PID/TID.
+/// On success we write the broker's `PROCESS_INFORMATION` into the
+/// caller's `lpProcessInformation`. Returns BOOL via `r_status`.
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
+pub unsafe extern "system" fn hook_create_process_internal_w(
+    _h_token: HANDLE,
+    application_name: *const u16,
+    command_line: *mut u16,
+    process_attrs: *const c_void,
+    thread_attrs: *const c_void,
+    inherit_handles: i32,
+    creation_flags: u32,
+    environment: *mut c_void,
+    current_directory: *const u16,
+    startup_info: *const c_void,
+    process_information: *mut ProcessInformation,
+    new_token: *mut HANDLE,
+) -> i32 {
+    if !ipc_loaded() {
+        // Match the legacy stub's failure behaviour: BOOL = 0.
+        // GetLastError unset on this path; the OS will report the
+        // last-error from whichever earlier call failed.
+        return 0;
+    }
+    let mut frame = Wire {
+        op: OP_CPW,
+        args: [
+            0, // h_token: broker spawns under its own token
+            application_name as u64,
+            command_line as u64,
+            process_attrs as u64,
+            thread_attrs as u64,
+            inherit_handles as u64,
+            creation_flags as u64,
+            environment as u64,
+            current_directory as u64,
+            startup_info as u64,
+            process_information as u64,
+            new_token as u64,
+        ],
+        r0: 0, r1: 0, r2: 0, r3: 0, r_status: 0, r_error: 0,
+    };
+    ipc_roundtrip(&mut frame);
+    // Write back PROCESS_INFORMATION on success. r_status is the
+    // BOOL the kernel-side spawn returned (1 = success, 0 = failure).
+    if frame.r_status != 0 && !process_information.is_null() {
+        (*process_information).h_process = HANDLE(frame.r0 as *mut c_void);
+        (*process_information).h_thread = HANDLE(frame.r1 as *mut c_void);
+        (*process_information).process_id = frame.r2;
+        (*process_information).thread_id = frame.r3;
+    }
+    if frame.r_status != 0 && !new_token.is_null() {
+        // CreateProcessAsUserExW path passes phNewToken; broker
+        // replies 0 here so caller sees NULL.
+        std::ptr::write(new_token, HANDLE::default());
+    }
+    if frame.r_status == 0 {
+        // Set last-error from the broker's reply. SetLastError lives
+        // in kernel32; we'd dynamically resolve, but the simpler path
+        // is via the TEB's `LastErrorValue` (TEB+0x68 on x64, same on
+        // ARM64). Defer that to a Phase-D refinement; for now leave
+        // the OS-supplied last-error untouched (mirrors the legacy
+        // stub behaviour absent the explicit `gs:[0x68]` write).
+        let _ = frame.r_error;
+    }
+    frame.r_status
+}
+
+/// Subset of `PROCESS_INFORMATION` matching the Win32 layout. The
+/// broker's caller (hooked `CreateProcessInternalW`) hands us a
+/// pointer with this exact ABI.
+#[repr(C)]
+pub struct ProcessInformation {
+    pub h_process: HANDLE,
+    pub h_thread: HANDLE,
+    pub process_id: u32,
+    pub thread_id: u32,
+}
+
+// ─── DllMain plumbing (unchanged from Phase B except for IPC env) ──
 
 fn env_u64(key: &str) -> Option<u64> {
     let v = std::env::var(key).ok()?;
@@ -100,6 +400,14 @@ unsafe fn run_attach() {
     if buf.magic != CDYLIB_MAGIC {
         return;
     }
+    // Phase C: copy IPC env into the process-static IPC singleton
+    // before any hook can fire (the broker patches ntdll exports
+    // *after* it sees our wake-event reply).
+    IPC.section.store(buf.ipc_section, Ordering::Release);
+    IPC.ev_req.store(buf.ipc_ev_req, Ordering::Release);
+    IPC.ev_resp.store(buf.ipc_ev_resp, Ordering::Release);
+    IPC.mutex.store(buf.ipc_mutex, Ordering::Release);
+
     let view = buf.view as *mut CdylibResult;
     if view.is_null() {
         return;
@@ -122,8 +430,6 @@ pub extern "system" fn DllMain(
     _reserved: *mut c_void,
 ) -> i32 {
     if reason == DLL_PROCESS_ATTACH {
-        // Catch panics so a bug here doesn't kill the target — failure
-        // mode is "broker times out", not "target crashes mysteriously".
         let _ = std::panic::catch_unwind(|| unsafe { run_attach() });
     }
     1

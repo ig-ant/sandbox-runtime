@@ -515,7 +515,16 @@ fn try_inject_cdylib(
     }
 
     // Prepare the in-target section/event/buffer + env patch.
-    let session = match cdylib_inject::prepare(target, &dll_canon) {
+    // Phase C: we don't yet wire the cdylib's hooks (no
+    // `interception::install_*(.., Some(&CdylibHookEntries))` for the
+    // cdylib_active path) — without an IPC service thread, passing a
+    // populated Channel into the buffer would point hook bodies at a
+    // dead broker. Pass `None` so the cdylib's `ipc_loaded()` check
+    // returns false and any errantly-fired hook short-circuits to
+    // STATUS_ACCESS_DENIED rather than hanging on a wait-for-event the
+    // broker never satisfies. Phase D wires the channel + service
+    // thread + hook installation as one unit.
+    let session = match cdylib_inject::prepare(target, &dll_canon, None) {
         Ok(s) => s,
         Err(e) => {
             // Revert the stamp before returning so we don't leak it.
@@ -661,8 +670,13 @@ fn install_broker_hook(
     let addrs = ch.stub_env_snapshot();
     let sync = crate::entry_trampoline::install(target, thread, suspend_after)?;
     if ctx.hook_fs {
-        interception::install_fs(target, &addrs)?;
-        interception::install_reg(target, &addrs)?;
+        // Phase C: Mode::Broker still uses the legacy inline-asm IPC
+        // stubs (cdylib = None). The cdylib path is exercised through
+        // the run_confined cdylib_active branch above. install_cpw on
+        // ARM64 requires cdylib; Mode::Broker on ARM64 was already
+        // gated off in run_confined.
+        interception::install_fs(target, &addrs, None)?;
+        interception::install_reg(target, &addrs, None)?;
     }
     let target_raw = target.0 as isize;
     let ctx_thread = ctx.clone();
@@ -674,7 +688,7 @@ fn install_broker_hook(
     // Loader done; kernelbase is mapped and the target is parked
     // in the entry stub.
     let cpw = crate::entry_trampoline::cpw_address()?;
-    interception::install_cpw(target, &addrs, cpw)?;
+    interception::install_cpw(target, &addrs, cpw, None)?;
     let _ = ctx;
     sync.go();
     Ok(())
