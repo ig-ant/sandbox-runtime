@@ -63,23 +63,9 @@ fn main() {
 
 #[cfg(windows)]
 fn main() {
-    // D-4: bash is a known-failing follow-up. Skip the harness rather
-    // than running it to a failure that will look like a regression in
-    // CI. To investigate, delete this early return.
-    eprintln!(
-        "[smoke_bash] SKIP (known-failing): MSYS2 bash inside sandbox \
-         segfaults in CRYPTBASE/CNG/LSA bootstrap during cygwin1.dll \
-         DllMain. See file header for diagnostic trail and outstanding \
-         hypotheses; harness body retained below for future re-enable."
-    );
-    std::process::exit(0);
-
-    // The following is the original harness, retained un-executed so the
-    // file is a single-line edit away from re-enabled. `#[allow(unreachable_code)]`
-    // would normally be needed but the early return uses `std::process::exit`
-    // which has return type `!`, so the rest is unreachable-but-not-warn.
-    #[allow(unreachable_code, unused)]
-    {
+    // Phase L: harness re-enabled to drive MSYS2 compat iteration. The
+    // outer skip block (with std::process::exit(0)) is removed so the
+    // harness runs the 3 sub-tests against bash inside the sandbox.
     use std::path::PathBuf;
     use std::time::Instant;
 
@@ -321,5 +307,4 @@ fn main() {
         }
         std::process::exit(2);
     }
-    } // close `#[allow(unreachable_code, unused)] {` from main entry.
 }
