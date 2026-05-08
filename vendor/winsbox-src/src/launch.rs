@@ -150,19 +150,21 @@ fn build_broker_tokens_with(
 }
 
 fn run_confined(pol: &Policy, manifest_dir: &std::path::Path) -> Result<u32> {
-    let ac = AppContainer::create("ac")?;
+    // Phase G: thread the policy's `stableSidKey` (or fall back to the
+    // broker install-path hash inside `create_with_key`) so the AC
+    // profile name is deterministic across runs. Stable name → stable
+    // SID → manifest cache hit on warm restart.
+    let ac = AppContainer::create_with_key("ac", pol.stable_sid_key.as_deref())?;
     log!("AppContainer sid={} folder={}", ac.sid_string, ac.folder.display());
 
     // ── Phase D-2: ACL stamping. Build a PolicyStamp from the policy's
     //    allow_*/deny_* fields, hash it against the on-disk manifest,
     //    skip if unchanged, otherwise apply + save.
     //
-    //    The stamp targets the per-instance AC SID. With the current
-    //    AppContainer naming (process-id-suffixed) the SID changes
-    //    every run, so the manifest hash will mismatch and we always
-    //    re-stamp. Stable AC SIDs are a follow-up; the wiring below
-    //    is correct shape and becomes a real fast path once the SID
-    //    stops being per-instance.
+    //    Phase G made the AC SID stable across runs (driven by
+    //    `pol.stable_sid_key` or the install-path fallback), so the
+    //    `<sid>.json` manifest file is found on subsequent runs and
+    //    the stamper short-circuits when the policy hash matches.
     //
     //    On exit the stamp is reverted (Drop on `stamp_holder`). The
     //    plan calls out that revert is "only on full uninstall, not
@@ -344,18 +346,31 @@ fn run_confined(pol: &Policy, manifest_dir: &std::path::Path) -> Result<u32> {
 }
 
 /// Phase D-2: holder for the policy stamps applied at startup.
-/// On Drop, reverts the stamps so a per-instance AC SID's ACE doesn't
-/// linger past its profile (the profile gets `DeleteAppContainerProfile`'d
-/// on `AppContainer::Drop`, which orphans any ACE keyed to the SID —
-/// not strictly broken but ugly).
+///
+/// Phase G semantics: with stable AC SIDs, the manifest-cache-hit fast
+/// path *requires* the FS-level ACEs to persist between runs — reverting
+/// them on every Drop would defeat the warm-restart goal. So:
+///
+///   * `applied = true`  → we just stamped fresh ACEs this run; on Drop,
+///     revert them. (Cold start or policy-changed re-apply.)
+///   * `applied = false` → we hit the manifest cache; the ACEs predate
+///     this run. On Drop, leave them alone.
+///
+/// The `DeleteAppContainerProfile` call on `AppContainer::Drop` no longer
+/// matches the SID's lifetime either — the SID is deterministic from
+/// the profile *name* (which is stable), so future runs reuse it. Old
+/// ACEs are still ours.
 struct StampHolder {
     stamp: PolicyStamp,
     sid_owned: windows::Win32::Security::PSID,
+    applied: bool,
 }
 impl Drop for StampHolder {
     fn drop(&mut self) {
-        if let Err(e) = self.stamp.revert(self.sid_owned) {
-            eprintln!("[sbox-exec] policy-stamp revert: {e:#}");
+        if self.applied {
+            if let Err(e) = self.stamp.revert(self.sid_owned) {
+                eprintln!("[sbox-exec] policy-stamp revert: {e:#}");
+            }
         }
         free_psid(self.sid_owned);
     }
@@ -397,14 +412,17 @@ fn maybe_apply_stamps(
     let sid_owned = psid_from_string(&ac.sid_string)
         .with_context(|| format!("psid_from_string({})", ac.sid_string))?;
 
-    // Skip-on-match fast path. With per-instance AC SIDs the manifest
-    // file name (sanitized SID) is different every run so we never hit
-    // this; once stable SIDs land, the warm-restart path becomes <100ms
-    // (just hashing + a fs::read).
+    // Skip-on-match fast path. Phase G made AC SIDs stable across runs
+    // (driven by `pol.stable_sid_key` or an install-path fallback), so
+    // the `<sid>.json` manifest is found on warm restarts and this path
+    // hits whenever the policy hash matches — making the warm-restart
+    // total <100ms (just hashing + an fs::read).
     match store.load(&ac.sid_string) {
         Ok(Some(prev)) if !store.diff(&prev, want_hash) => {
             log!("policy-stamp: hash unchanged ({:#x}); skipping apply", want_hash);
-            return Ok(StampHolder { stamp, sid_owned });
+            // applied=false → do NOT revert on Drop (Phase G: the ACEs
+            // are from a previous run and persist between sessions).
+            return Ok(StampHolder { stamp, sid_owned, applied: false });
         }
         Ok(Some(prev)) => log!(
             "policy-stamp: hash {:#x} → {:#x} (re-applying)",
@@ -437,7 +455,11 @@ fn maybe_apply_stamps(
         log!("policy-stamp: manifest save failed ({e:#}); next run will re-apply");
     }
 
-    Ok(StampHolder { stamp, sid_owned })
+    // applied=true → freshly stamped this run; revert on Drop so a
+    // policy change between runs cleanly removes the previous shape's
+    // ACEs (a hash mismatch on the next run will re-apply with the new
+    // shape, but only after the prior shape's ACEs are gone).
+    Ok(StampHolder { stamp, sid_owned, applied: true })
 }
 
 /// Phase-D return value: everything `run_confined` needs to keep

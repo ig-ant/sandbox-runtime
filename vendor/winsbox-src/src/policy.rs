@@ -19,6 +19,20 @@ pub struct Policy {
     /// AC runs without compat hooks (suitable for non-MSYS workloads
     /// — bash/git/npm need the cdylib for namespace shims).
     pub cdylib_path: Option<String>,
+    /// Phase G: caller-controlled key for deriving a stable AC profile
+    /// name (and thus a stable AC SID across runs). When `Some(k)`,
+    /// the broker hashes `k` to produce the profile-name suffix; same
+    /// `k` across launches → same SID → manifest cache hit → warm
+    /// restart skips the 3.5s ACL stamping walk.
+    ///
+    /// When `None`, the broker falls back to a hash of its own install
+    /// path (`std::env::current_exe()`), which is per-install stable.
+    /// Callers that want per-policy stability (e.g., distinct policies
+    /// in the same install) should pass a stable string here — the
+    /// session id, the workspace dir, etc.
+    ///
+    /// JSON name: `stableSidKey`.
+    pub stable_sid_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]

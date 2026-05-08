@@ -172,6 +172,12 @@ export async function wrapCommandWithSandboxWindows(
   // WINSBOX_STAMP_DIR on its side; we forward it explicitly when set
   // here so the policy is self-contained).
   if (manifestDir) policy.manifestDir = manifestDir
+  // Opt-in: stableSidKey drives a deterministic AC profile name so the
+  // SID stays the same across launches and the broker's manifest cache
+  // hits (skipping the multi-second ACL stamping walk on warm restart).
+  if (p.windowsConfig?.stableSidKey) {
+    policy.stableSidKey = p.windowsConfig.stableSidKey
+  }
 
   const policyPath = path.join(
     os.tmpdir(),

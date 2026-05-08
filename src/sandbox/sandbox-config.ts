@@ -262,6 +262,16 @@ export const WindowsConfigSchema = z.object({
       'Override directory for ACL stamp manifests. Defaults to ' +
         '%LOCALAPPDATA%\\sbox-exec\\stamps\\; env-var fallback WINSBOX_STAMP_DIR.',
     ),
+  stableSidKey: z
+    .string()
+    .optional()
+    .describe(
+      'Caller-controlled key used to derive a stable AC profile name ' +
+        '(and thus a stable AC SID) across launches. Same key + same ' +
+        'install → same SID → manifest-cache hit on warm restart, which ' +
+        'skips the multi-second ACL stamping walk. When unset, the ' +
+        'broker falls back to a hash of its own install path.',
+    ),
   useAlternateDesktop: z.boolean().optional(),
 })
 
