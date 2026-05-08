@@ -454,11 +454,12 @@ fn maybe_apply_stamps(
     })?;
     log!(
         "policy-stamp: {} stamped, {} skipped (idempotent), {} skipped (AC \
-         already accessible), {} soft-failed (access denied), {} denies \
-         emitted, {} denies omitted, {} ms",
+         already accessible), {} soft-failed (access denied), {} soft-failed \
+         (other), {} denies emitted, {} denies omitted, {} ms",
         stats.roots_stamped, stats.roots_skipped_idempotent,
         stats.roots_skipped_already_accessible,
         stats.roots_soft_failed_access_denied,
+        stats.roots_soft_failed_other,
         stats.denies_emitted, stats.denies_omitted_unnecessary,
         stats.elapsed_ms,
     );
@@ -543,11 +544,13 @@ fn try_inject_cdylib_full(
     match stamp.apply(sid_owned) {
         Ok(stats) => log!(
             "cdylib stamp on {}: {} stamped, {} skipped (idempotent), {} \
-             skipped (AC accessible), {} soft-failed, {} ms",
+             skipped (AC accessible), {} soft-failed (access denied), {} \
+             soft-failed (other), {} ms",
             dll_dir.display(),
             stats.roots_stamped, stats.roots_skipped_idempotent,
             stats.roots_skipped_already_accessible,
             stats.roots_soft_failed_access_denied,
+            stats.roots_soft_failed_other,
             stats.elapsed_ms,
         ),
         Err(e) => {

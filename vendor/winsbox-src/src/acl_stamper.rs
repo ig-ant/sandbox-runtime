@@ -93,6 +93,13 @@ pub struct StampStats {
     /// `ERROR_ACCESS_DENIED` (e.g., admin-protected dir) but we
     /// continued instead of aborting the whole `apply()`.
     pub roots_soft_failed_access_denied: usize,
+    /// A path was skipped because it doesn't exist on disk (or the
+    /// underlying `GetNamedSecurityInfoW` failed for any non-AccessDenied
+    /// reason — e.g. `Y:\NUL`/`Y:\CON` which `getDefaultWritePaths`
+    /// emits as DOS-device aliases). Treated as non-fatal so a single
+    /// malformed allow_*/deny_* entry doesn't abort the whole stamp pass
+    /// and silently leave the AC token with NO ACL enforcement at all.
+    pub roots_soft_failed_other: usize,
     pub denies_emitted: usize,
     pub denies_omitted_unnecessary: usize,
     pub elapsed_ms: u128,
@@ -181,11 +188,23 @@ impl PolicyStamp {
                 mask: read_mask(),
                 mode: GRANT_ACCESS,
             };
-            match apply_one(&op, ac_sid)? {
-                ApplyOutcome::Stamped => stats.roots_stamped += 1,
-                ApplyOutcome::SkippedIdempotent => stats.roots_skipped_idempotent += 1,
-                ApplyOutcome::SoftFailedAccessDenied => {
+            match apply_one(&op, ac_sid) {
+                Ok(ApplyOutcome::Stamped) => stats.roots_stamped += 1,
+                Ok(ApplyOutcome::SkippedIdempotent) => stats.roots_skipped_idempotent += 1,
+                Ok(ApplyOutcome::SoftFailedAccessDenied) => {
                     stats.roots_soft_failed_access_denied += 1;
+                }
+                Err(e) => {
+                    // Don't abort the whole apply pass on a single bad
+                    // path — a malformed allow_read entry must not strand
+                    // us with NO ACL enforcement (which would let DENY
+                    // stamps below silently no-op too).
+                    eprintln!(
+                        "[acl_stamper] WARN apply_one(allow_read, {:?}) failed: {e:#}; \
+                         continuing",
+                        p,
+                    );
+                    stats.roots_soft_failed_other += 1;
                 }
             }
         }
@@ -207,11 +226,25 @@ impl PolicyStamp {
                 mask: write_mask(),
                 mode: GRANT_ACCESS,
             };
-            match apply_one(&op, ac_sid)? {
-                ApplyOutcome::Stamped => stats.roots_stamped += 1,
-                ApplyOutcome::SkippedIdempotent => stats.roots_skipped_idempotent += 1,
-                ApplyOutcome::SoftFailedAccessDenied => {
+            match apply_one(&op, ac_sid) {
+                Ok(ApplyOutcome::Stamped) => stats.roots_stamped += 1,
+                Ok(ApplyOutcome::SkippedIdempotent) => stats.roots_skipped_idempotent += 1,
+                Ok(ApplyOutcome::SoftFailedAccessDenied) => {
                     stats.roots_soft_failed_access_denied += 1;
+                }
+                Err(e) => {
+                    // Common failure: `Y:\NUL`/`Y:\CON` from
+                    // getDefaultWritePaths() don't exist on disk →
+                    // GetNamedSecurityInfoW returns ERROR_FILE_NOT_FOUND.
+                    // Pre-fix this would abort the whole apply, leaving
+                    // the AC with no ALLOW *or* DENY ACEs and the inherited
+                    // Everyone:RX from system paths winning every check.
+                    eprintln!(
+                        "[acl_stamper] WARN apply_one(allow_write, {:?}) failed: {e:#}; \
+                         continuing",
+                        p,
+                    );
+                    stats.roots_soft_failed_other += 1;
                 }
             }
         }
@@ -266,15 +299,15 @@ impl PolicyStamp {
                 // log at error severity but still continue so a single
                 // admin-protected deny path doesn't tank the whole
                 // policy apply.
-                match apply_one(&op, ac_sid)? {
-                    ApplyOutcome::Stamped => {
+                match apply_one(&op, ac_sid) {
+                    Ok(ApplyOutcome::Stamped) => {
                         stats.roots_stamped += 1;
                         stats.denies_emitted += 1;
                     }
-                    ApplyOutcome::SkippedIdempotent => {
+                    Ok(ApplyOutcome::SkippedIdempotent) => {
                         stats.roots_skipped_idempotent += 1;
                     }
-                    ApplyOutcome::SoftFailedAccessDenied => {
+                    Ok(ApplyOutcome::SoftFailedAccessDenied) => {
                         stats.roots_soft_failed_access_denied += 1;
                         eprintln!(
                             "[acl_stamper] ERROR: deny stamp on {:?} \
@@ -284,6 +317,15 @@ impl PolicyStamp {
                              admin-protected roots.",
                             p,
                         );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[acl_stamper] ERROR: deny stamp on {:?} failed: \
+                             {e:#}; deny will NOT be enforced for AC SID on \
+                             this path",
+                            p,
+                        );
+                        stats.roots_soft_failed_other += 1;
                     }
                 }
                 // Phase E-3: also DENY for the well-known inherited
