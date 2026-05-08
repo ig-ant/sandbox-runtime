@@ -93,17 +93,42 @@ pub const RESULT_SENTINEL: u32 = 0xACDC_BABE;
 
 // ─── IPC env (process-static, populated at DLL_PROCESS_ATTACH) ─────
 
-/// Process-static IPC environment. `DllMain` writes this from the
-/// `CdylibBuffer`; hook bodies read it on every call. `AtomicU64`
-/// stores so we don't need a `Mutex` on the hot path — only
-/// `DllMain` writes, and it runs strictly before any hook patch.
-struct IpcEnv {
-    section: AtomicU64,
-    ev_req: AtomicU64,
-    ev_resp: AtomicU64,
-    mutex: AtomicU64,
+/// Process-static IPC environment. Two write paths populate it:
+///
+///   * **Phase B/C/D path** (LoadLibraryW): `DllMain` reads
+///     `AC_CDYLIB_BUFFER` from the env block, copies the
+///     [`CdylibBuffer`]'s IPC fields into `IPC`, and signals the wake
+///     event. Used when the broker `LoadLibraryW`s the cdylib via a
+///     remote thread post-loader.
+///   * **Phase E-1 path** (manual map): the broker locates `IPC` via
+///     the `IPC` data export, writes the four `u64`s directly with
+///     `WriteProcessMemory` *pre-resume*, and patches ntdll syscalls
+///     to dispatch into the manual-mapped hooks. No DllMain runs —
+///     the broker handles every initialisation step.
+///
+/// Field ordering and types must NOT change without bumping
+/// [`CDYLIB_VERSION`] — the broker writes four contiguous `u64`s
+/// starting at `&IPC`. `AtomicU64` over a `u64` is `repr(C)` per the
+/// std atomics docs; the broker writes plain `u64` values via
+/// `WriteProcessMemory` and the cdylib reads them as `Atomic*` loads.
+/// The pre-resume write happens-before any AC-side observation since
+/// every AC thread starts after `ResumeThread`, which is a global
+/// synchronisation point.
+#[repr(C)]
+pub struct IpcEnv {
+    pub section: AtomicU64,
+    pub ev_req: AtomicU64,
+    pub ev_resp: AtomicU64,
+    pub mutex: AtomicU64,
 }
-static IPC: IpcEnv = IpcEnv {
+
+/// Phase E-1: exported as a no-mangle data symbol so the broker's
+/// `resolve_target_export("IPC")` returns the in-target VA of this
+/// struct. Pre-resume the broker writes `[u64; 4]` directly here via
+/// `WriteProcessMemory`. Post-resume hook bodies read these as
+/// `AtomicU64::load(Acquire)`.
+#[no_mangle]
+pub static IPC: IpcEnv = IpcEnv {
     section: AtomicU64::new(0),
     ev_req: AtomicU64::new(0),
     ev_resp: AtomicU64::new(0),

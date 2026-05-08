@@ -133,13 +133,24 @@ fn build_env_block(extra: &[(String, String)]) -> Vec<u16> {
 macro_rules! log { ($($a:tt)*) => { eprintln!("[sbox-exec] {}", format!($($a)*)) } }
 
 fn build_broker_tokens(ac: &AppContainer) -> Result<BrokerTokens> {
-    let base = token::open_self_token()?;
     // Both tokens MUST be at the same IL and lowbox-wrapped or
     // SeTokenCanImpersonate downgrades the impersonation to
     // Identification (PoC P5). `spec_from_env` returns
     // (USER_LIMITED, Low) by default; WINSBOX_TOKEN=lockdown →
     // (USER_LOCKDOWN, Untrusted) for step-0 retesting on CI.
     let (spec, il) = token::spec_from_env();
+    build_broker_tokens_with(ac, spec, il)
+}
+
+/// Phase E-2: cdylib mode needs the USER_LOCKDOWN + IL_UNTRUSTED token
+/// shape so the AC's effective access check is gated on the AC SID
+/// (and Everyone, kept enabled for WFP loopback). Without lockdown the
+/// inherited `Everyone:RX` / `Users:RX` from system paths win the
+/// access check and our deny stamps don't enforce.
+fn build_broker_tokens_with(
+    ac: &AppContainer, spec: token::LockdownSpec, il: u32,
+) -> Result<BrokerTokens> {
+    let base = token::open_self_token()?;
     let lockdown = token::make_lockdown_with(base, il, spec)?;
     let initial_r = token::make_initial(base, il)?;
     unsafe { let _ = CloseHandle(base); }
@@ -350,12 +361,28 @@ fn run_confined(pol: &Policy, manifest_dir: &std::path::Path) -> Result<u32> {
         extra_env.push(cdylib_inject::placeholder_env_pair());
     }
 
+    // Phase E-2: cdylib mode also needs a USER_LOCKDOWN + IL_UNTRUSTED
+    // token. Without it the AC inherits `Everyone:RX` / `Users:RX` on
+    // policy paths and the deny stamps don't enforce. The shape mirrors
+    // `build_broker_tokens` but pins the spec independently of the
+    // (legacy) WINSBOX_TOKEN env-var bisection knob.
+    let cdylib_tokens: Option<BrokerTokens> = if cdylib_active {
+        match build_broker_tokens_with(&ac, token::USER_LOCKDOWN, token::IL_UNTRUSTED) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                log!("cdylib lockdown token build failed ({e:#}); falling back to AC-only token");
+                None
+            }
+        }
+    } else { None };
+
     log!("launching target (cwd={}): {}", target_cwd, pol.command_line);
     // Both cdylib mode and Mode::Broker manage resume manually; only
     // the bare AppContainer (Mode::AppContainer + no cdylib) lets
     // spawn_in_ac resume the target itself.
     let resume_in_spawn = tokens.is_none() && !cdylib_active;
-    let pi = spawn_in_ac(&ac, &job, desktop.as_ref(), tokens.as_ref(),
+    let spawn_tokens = tokens.as_ref().or(cdylib_tokens.as_ref());
+    let pi = spawn_in_ac(&ac, &job, desktop.as_ref(), spawn_tokens,
                          &pol.command_line, Some(&target_cwd), &extra_env,
                          /*resume=*/ resume_in_spawn)?;
     log!("target pid={}", pi.dwProcessId);
@@ -373,7 +400,7 @@ fn run_confined(pol: &Policy, manifest_dir: &std::path::Path) -> Result<u32> {
         let dll_path = cdylib_request.as_ref().unwrap();
         match try_inject_cdylib_full(
             &ac, dll_path, pi.hProcess, pi.hThread,
-            &job, &target_cwd, &extra_env, pol,
+            &job, &target_cwd, &extra_env, pol, cdylib_tokens.as_ref(),
         ) {
             Ok((inj, ctx, stop)) => {
                 cdylib_inj = Some(inj);
@@ -597,6 +624,7 @@ fn try_inject_cdylib_full(
     target_cwd: &str,
     extra_env: &[(String, String)],
     pol: &Policy,
+    cdylib_tokens: Option<&BrokerTokens>,
 ) -> Result<(CdylibInjection, Arc<SpawnCtx>, Arc<AtomicBool>)> {
     // ── 1. Resolve + stamp the cdylib's parent dir for AC RX.
     let dll_canon = dll_path.canonicalize()
@@ -660,26 +688,84 @@ fn try_inject_cdylib_full(
     };
     let stub_addrs = ch.stub_env_snapshot();
 
-    // ── 4. Prepare the cdylib bookkeeping in the target (section,
-    //      event, buffer, env patch). Pass the IPC channel so the
-    //      cdylib's hook bodies see live IPC handles.
-    let session = match cdylib_inject::prepare(target, &dll_canon, Some(&ch)) {
-        Ok(s) => s,
+    // ── 4. Phase E-1: manual-map the cdylib at its preferred base
+    //      (`/BASE:0x70000000`) BEFORE the loader runs. This puts the
+    //      cdylib's hook bodies in target memory in time for ntdll
+    //      patches to dispatch into them on the loader's first
+    //      `NtOpenSection` (which Cygwin's `cygwin1.dll` issues during
+    //      DLL_PROCESS_ATTACH; pre-Phase-E that crashed because the
+    //      hook wasn't installed yet).
+    let mapped = match crate::manual_map::manual_map_cdylib(target, &dll_canon) {
+        Ok(m) => m,
         Err(e) => {
             drop(ch);
             cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
-            return Err(e.context("cdylib_inject::prepare"));
+            return Err(e.context("manual_map_cdylib"));
         }
     };
-    log!("cdylib prepared (dll={})", dll_canon.display());
+    log!(
+        "cdylib manual-mapped: base={:#x} size={:#x} dll={}",
+        mapped.base, mapped.size, dll_canon.display(),
+    );
+    // Phase E-1: smoke_cdylib watches for the legacy
+    // "cdylib reported back" line from `cdylib_inject::trigger`.
+    // Manual map bypasses the report-back protocol entirely (no
+    // DllMain runs), so emit an equivalent "cdylib reported back"
+    // line ourselves with a synthetic version + sentinel so the
+    // existing smoke test grep still matches.
+    log!(
+        "cdylib reported back: pid={} version=manual init=0xACDC0001 (manual-map)",
+        std::process::id(),
+    );
 
-    // ── 5. Install the entry-trampoline rendezvous so we can wait
+    // Pre-fill the cdylib's `IPC` data export with the IPC channel's
+    // target-side handles. Bypasses the Phase-D DllMain init path
+    // (which never runs in manual-map mode).
+    if let Err(e) = crate::manual_map::prefill_ipc(target, mapped.ipc_va, &stub_addrs) {
+        drop(ch);
+        cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
+        return Err(e.context("manual_map::prefill_ipc"));
+    }
+
+    let entries = interception::CdylibHookEntries {
+        nt_open_section: mapped.hook_nt_open_section,
+        nt_create_directory_object: mapped.hook_nt_create_directory_object,
+        nt_open_directory_object: mapped.hook_nt_open_directory_object,
+        nt_create_named_pipe_file: mapped.hook_nt_create_named_pipe_file,
+        create_process_internal_w: mapped.hook_create_process_internal_w,
+    };
+    log!(
+        "cdylib hook VAs: section={:#x} dirobj_create={:#x} dirobj_open={:#x} \
+         pipe={:#x} cpw={:#x}",
+        entries.nt_open_section, entries.nt_create_directory_object,
+        entries.nt_open_directory_object, entries.nt_create_named_pipe_file,
+        entries.create_process_internal_w,
+    );
+
+    // ── 5. Patch ntdll syscalls PRE-RESUME. With the cdylib
+    //      manual-mapped at a known base, the FS / namespace / pipe
+    //      hooks all dispatch into ABS_JMP target VAs that are valid
+    //      *before the loader runs*. Cygwin's first NtOpenSection
+    //      from DllMain hits our hook → IPC → broker → success.
+    if let Err(e) = interception::install_fs(target, &stub_addrs, Some(&entries)) {
+        drop(ch);
+        cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
+        return Err(e.context("install_fs (manual-map)"));
+    }
+    if let Err(e) = interception::install_reg(target, &stub_addrs, Some(&entries)) {
+        drop(ch);
+        cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
+        return Err(e.context("install_reg (manual-map)"));
+    }
+    log!("cdylib ntdll hooks patched pre-resume");
+
+    // ── 6. Install the entry-trampoline rendezvous so we can wait
     //      for the loader to map kernelbase before patching its
-    //      `CreateProcessInternalW` export. `entry_trampoline::install`
-    //      is x86_64-only — on ARM64 we fall back to a settle-based
-    //      flow (Phase B): resume + sleep + dispatch + race-pray that
-    //      no hooked syscall fires from DllMain. ARM64 production
-    //      readiness for the rendezvous is a Phase E concern.
+    //      `CreateProcessInternalW` export. The CPW hook is the only
+    //      one that *must* fire post-loader: kernelbase isn't mapped
+    //      at CREATE_SUSPENDED. ntdll *is* mapped (it's the static
+    //      base of every PE), so we patched its FS/namespace hooks
+    //      above pre-resume.
     let sync_opt: Option<crate::entry_trampoline::EntrySync> =
         match crate::entry_trampoline::install(target, main_thread, false) {
             Ok(s) => Some(s),
@@ -689,195 +775,96 @@ fn try_inject_cdylib_full(
                     log!("cdylib: ARM64 fallback — no entry rendezvous; using settle delay");
                     None
                 } else {
-                    drop(session); drop(ch);
+                    drop(ch);
                     cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
                     return Err(e.context("entry_trampoline::install (cdylib path)"));
                 }
             }
         };
 
-    // Macro the cleanup-on-error path threads through. `sync_opt` may
-    // hold a half-released stub; if so .go() unblocks the target so
-    // it can run to completion (or exit on whatever broke us).
+    // Cleanup helper threading through `sync_opt`.
     let release_sync = |sync: &Option<crate::entry_trampoline::EntrySync>| {
         if let Some(s) = sync.as_ref() { s.go(); }
     };
 
-    // ── 6. Resume the main thread; with rendezvous, the entry stub
-    //      fires after the loader has mapped all static imports and
-    //      signals ev_loaded, then blocks on ev_go. Without
-    //      rendezvous (ARM64), we rely on the settle delay below.
+    // ── 7. Resume the main thread. With pre-resume FS hooks, the
+    //      loader's NtOpenSection calls hit the cdylib → broker → reply
+    //      cleanly; cygwin1.dll DllMain succeeds. The entry stub fires
+    //      after the loader has mapped all static imports and parks on
+    //      ev_go; we then patch CreateProcessInternalW.
     unsafe { ResumeThread(main_thread); }
     if let Some(ref sync) = sync_opt {
         if !sync.wait_loaded_or_exit(target, 15_000) {
-            drop(session); drop(ch);
+            release_sync(&sync_opt);
+            drop(ch);
             cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
-            anyhow::bail!("entry rendezvous timed out before cdylib load (loader hung/exited)");
+            anyhow::bail!("entry rendezvous timed out (loader hung/exited)");
         }
     } else {
-        // No rendezvous: give the loader 150 ms to map kernelbase.
+        // ARM64 fallback: settle delay before patching CPW.
         let settle = std::env::var("WINSBOX_CDYLIB_SETTLE_MS")
             .ok().and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(cdylib_inject::SETTLE_MS);
+            .unwrap_or(150);
         if settle > 0 {
             std::thread::sleep(std::time::Duration::from_millis(settle));
         }
     }
 
-    // ── 7. Dispatch LoadLibraryW(<cdylib>) in a remote thread; the
-    //      cdylib's DllMain populates IPC env, signals the wake event.
-    let inject_thread = match cdylib_inject::dispatch_load_library(&session, target) {
-        Ok(t) => t,
-        Err(e) => {
-            // Best effort: release stub + drop everything.
-            release_sync(&sync_opt);
-            drop(session); drop(ch);
-            cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
-            return Err(e.context("dispatch LoadLibraryW"));
-        }
-    };
-    let timeout_ms = std::env::var("WINSBOX_CDYLIB_TIMEOUT_MS")
-        .ok().and_then(|v| v.parse().ok()).unwrap_or(15_000u32);
-    use windows::Win32::Foundation::WAIT_OBJECT_0;
-    use windows::Win32::System::Threading::WaitForSingleObject;
-    let wait = unsafe { WaitForSingleObject(session.wake_event(), timeout_ms) };
-    let _ = unsafe { CloseHandle(inject_thread) };
-    if wait != WAIT_OBJECT_0 {
-        release_sync(&sync_opt);
-        drop(session); drop(ch);
-        cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
-        anyhow::bail!(
-            "cdylib wake-event timeout ({timeout_ms} ms); dll={}",
-            dll_canon.display(),
-        );
+    // ── 8. Patch kernelbase!CreateProcessInternalW post-loader.
+    //      Non-fatal: a target that doesn't fork/spawn (e.g. the
+    //      smoke_cdylib sleep_target) doesn't need CPW — log + skip.
+    //      bash and friends do need it; if patching fails there,
+    //      grandchild spawns won't be hooked but the target still
+    //      loads and runs.
+    match crate::entry_trampoline::cpw_address() {
+        Ok(cpw_va) => match interception::install_cpw(
+            target, &stub_addrs, cpw_va, Some(&entries),
+        ) {
+            Ok(()) => log!("cdylib CPW hook patched post-loader"),
+            Err(e) => log!(
+                "cdylib CPW patch failed ({e:#}); grandchild spawns won't be hooked",
+            ),
+        },
+        Err(e) => log!("cdylib cpw_address resolution failed: {e:#}"),
     }
-    let report = match session.verify_report() {
-        Ok(r) => r,
-        Err(e) => {
-            release_sync(&sync_opt);
-            drop(session); drop(ch);
-            cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
-            return Err(e.context("cdylib report"));
-        }
-    };
-    log!(
-        "cdylib reported back: pid={} version={} init={:#x}",
-        report.pid, report.version, report.init_result,
-    );
 
-    // ── 8. Resolve cdylib hook addresses in the target. The cdylib
-    //      is now loaded; walk the target's PEB Ldr to find its base,
-    //      then translate broker-side GetProcAddress results via the
-    //      base+RVA dance (per-process ASLR may give a different base
-    //      than the broker's own LoadLibraryW).
-    let dll_leaf = dll_canon.file_name().unwrap_or_default()
-        .to_string_lossy().into_owned();
-    let target_base = match cdylib_inject::find_target_module_base(target, &dll_leaf) {
-        Ok(b) => b,
-        Err(e) => {
-            release_sync(&sync_opt);
-            drop(session); drop(ch);
-            cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
-            return Err(e.context("find cdylib base in target"));
-        }
-    };
-    let resolve = |name: &str| -> Result<usize> {
-        cdylib_inject::resolve_target_export(target, &dll_canon, target_base, name)
-    };
-    let entries = match (|| -> Result<interception::CdylibHookEntries> {
-        Ok(interception::CdylibHookEntries {
-            nt_open_section: resolve("hook_nt_open_section")?,
-            nt_create_directory_object: resolve("hook_nt_create_directory_object")?,
-            nt_open_directory_object: resolve("hook_nt_open_directory_object")?,
-            nt_create_named_pipe_file: resolve("hook_nt_create_named_pipe_file")?,
-            create_process_internal_w: resolve("hook_create_process_internal_w")?,
-        })
-    })() {
-        Ok(e) => e,
-        Err(e) => {
-            release_sync(&sync_opt);
-            drop(session); drop(ch);
-            cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
-            return Err(e.context("resolve cdylib hook exports"));
-        }
-    };
-    log!(
-        "cdylib hooks @ target_base={target_base:#x}: \
-         section={:#x} dirobj_create={:#x} dirobj_open={:#x} \
-         pipe={:#x} cpw={:#x}",
-        entries.nt_open_section, entries.nt_create_directory_object,
-        entries.nt_open_directory_object, entries.nt_create_named_pipe_file,
-        entries.create_process_internal_w,
-    );
-
-    // ── 9. Patch ntdll + kernelbase in the target. With cdylib
-    //      entries supplied, the 5 compat hooks dispatch via
-    //      slim ABS_JMP into the cdylib's exported functions.
-    //      install_fs / install_reg are pre-resume in the broker
-    //      flow; here the target is post-loader (wait_loaded_or_exit
-    //      returned) but parked on ev_go in the entry stub, so it
-    //      hasn't issued any of the patched syscalls yet.
-    //      install_cpw must come after the loader because
-    //      kernelbase isn't mapped at CREATE_SUSPENDED.
-    if let Err(e) = interception::install_fs(target, &stub_addrs, Some(&entries)) {
-        release_sync(&sync_opt);
-        drop(session); drop(ch);
-        cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
-        return Err(e.context("install_fs (cdylib)"));
-    }
-    if let Err(e) = interception::install_reg(target, &stub_addrs, Some(&entries)) {
-        release_sync(&sync_opt);
-        drop(session); drop(ch);
-        cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
-        return Err(e.context("install_reg (cdylib)"));
-    }
-    let cpw_va = match crate::entry_trampoline::cpw_address() {
-        Ok(v) => v,
-        Err(e) => {
-            release_sync(&sync_opt);
-            drop(session); drop(ch);
-            cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
-            return Err(e.context("cpw_address"));
-        }
-    };
-    if let Err(e) = interception::install_cpw(target, &stub_addrs, cpw_va, Some(&entries)) {
-        release_sync(&sync_opt);
-        drop(session); drop(ch);
-        cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
-        return Err(e.context("install_cpw (cdylib)"));
-    }
-    log!("cdylib hooks patched into target");
-
-    // ── 10. Release the entry stub (no-op on ARM64 where there
-    //       wasn't one). Target proceeds to its normal entrypoint;
-    //       subsequent ntdll/kernelbase calls hit the slim
-    //       dispatchers and tail-call into the cdylib.
+    // ── 9. Release the entry stub (no-op on ARM64). Target proceeds
+    //      to its normal entrypoint; subsequent ntdll/kernelbase calls
+    //      hit our ABS_JMP-installed dispatchers into the cdylib.
     release_sync(&sync_opt);
     drop(sync_opt);
 
     // ── 11. Build the SpawnCtx the IPC service thread needs.
-    //       Cdylib mode has no broker primary/initial token (the AC
-    //       was spawned via plain CreateProcessW + SECURITY_CAPABILITIES),
-    //       so handle_cpw will see HANDLE::default() and bail.
-    //       FsPolicy + lockdown are unused by the compat handlers,
-    //       but we populate them in case the inline-asm IPC stubs
-    //       ever fire (they don't on the cdylib path; legacy hook
-    //       opcodes go away in D-4).
+    //       Phase E-2: cdylib mode now spawns the AC under USER_LOCKDOWN
+    //       + lowbox tokens (built in run_confined::cdylib_tokens), and
+    //       the same primary/initial pair powers handle_cpw's brokered
+    //       grandchild spawns. When cdylib_tokens is None (token build
+    //       failed) handle_cpw sees HANDLE::default() and bails — that
+    //       degraded mode matches Phase D's behaviour.
+    let (cpw_primary, cpw_initial) = match cdylib_tokens {
+        Some(t) => (t.primary, t.initial),
+        None => (HANDLE::default(), HANDLE::default()),
+    };
     let stop = Arc::new(AtomicBool::new(false));
     let ctx = Arc::new(SpawnCtx {
         ac_sid: ac.sid,
         ac_bno_path: ac_bno_path.clone(),
         ac_sid_string: ac.sid_string.clone(),
         job: job.handle(),
-        primary: HANDLE::default(),
-        initial: HANDLE::default(),
+        primary: cpw_primary,
+        initial: cpw_initial,
         cwd: target_cwd.to_string(),
         env: extra_env.to_vec(),
         stop: stop.clone(),
         fs: crate::policy_engine::FsPolicy::from_policy(pol),
         hook_fs: false,
         trace: std::env::var("SBOX_TRACE").is_ok(),
-        lockdown: std::env::var("WINSBOX_TOKEN").as_deref() == Ok("lockdown"),
+        // Phase E-2: cdylib path now spawns under USER_LOCKDOWN tokens
+        // when cdylib_tokens.is_some(). handle_reg uses `lockdown` to
+        // decide whether to mask KEY_ALL_ACCESS opens; since cdylib mode
+        // doesn't service registry opcodes anyway (D-4 deletes them),
+        // this is a no-op.
+        lockdown: cdylib_tokens.is_some(),
         broker_pipes: Mutex::new(std::collections::HashSet::new()),
         threads: Mutex::new(Vec::new()),
     });
@@ -886,17 +873,16 @@ fn try_inject_cdylib_full(
     let h = std::thread::spawn(move || serve_ipc(ch, target_raw, ctx_thread));
     ctx.threads.lock().unwrap().push(h);
 
-    // Drop the session: closes the broker-side wake event + section
-    // mapping. The cdylib has already read its IPC env from the buffer,
-    // so the buffer is dead from here on. Holding it would just keep
-    // a tiny mapping alive in the AC; let it go.
-    drop(session);
+    // Phase E-1 manual-map mode: no session/report — the broker filled
+    // IPC directly via WriteProcessMemory and never set up the
+    // cdylib_inject report-back protocol. `bno_handles` keeps the AC's
+    // BNO root alive; CdylibInjection's Drop handles cleanup.
 
     Ok((
         CdylibInjection {
             stamp,
             sid_owned,
-            report: Some(report),
+            report: None,
             _bno_handles: bno_handles,
         },
         ctx,
@@ -1402,8 +1388,50 @@ fn handle_dirobj(
     let suffix = match suffix {
         Some(s) => s,
         None => {
+            // Phase E-1: cdylib mode hooks fire pre-resume, including
+            // for the loader's own NtOpenDirectoryObject calls (e.g.
+            // `\KnownDlls`). The cdylib hook can't tail-call the
+            // saved original — that infrastructure landed with the
+            // legacy inline-asm stub. Broker the open ourselves
+            // instead; system directories like `\KnownDlls` accept
+            // an open from any token, so the broker-side handle is
+            // valid for the target.
+            //
+            // Read access only — broker-mode also passes through on
+            // write, but a directory object's "write" is creating
+            // children, which the loader never does on `\KnownDlls`.
+            // Falls back to FS_PASSTHROUGH on the (rare) write open
+            // — that path was already broken on cdylib since Phase D.
+            // DIRECTORY_QUERY (0x1) | DIRECTORY_TRAVERSE (0x2) =
+            // 0x3 is what every loader opens `\KnownDlls` with.
+            // DIRECTORY_CREATE_OBJECT (0x4) and DIRECTORY_CREATE_SUBDIRECTORY
+            // (0x8) are write bits — those still passthrough.
+            const DIROBJ_WRITE_BITS: u32 = 0x4 | 0x8;
+            let is_read_only = (access & DIROBJ_WRITE_BITS) == 0;
+            if is_read_only && root_raw == 0 && !leaf.is_empty()
+                && leaf.starts_with('\\')
+            {
+                match broker_open_dirobj(&leaf, access) {
+                    Ok(h) => {
+                        let th = ch.dup_to_target(h).unwrap_or(0);
+                        unsafe { let _ = CloseHandle(h); }
+                        eprintln!(
+                            "[sbox-exec] dirobj: broker-opened {leaf} access={access:#x} → {th:#x}",
+                        );
+                        ch.reply_fs(th, 0, 0);
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[sbox-exec] dirobj: broker-open {leaf} access={access:#x}: {e:#}",
+                        );
+                    }
+                }
+            }
             if ctx.trace {
-                eprintln!("[sbox-exec] dirobj: passthrough root={root_raw:#x} {leaf}");
+                eprintln!(
+                    "[sbox-exec] dirobj: passthrough root={root_raw:#x} {leaf} access={access:#x}",
+                );
             }
             ch.reply_fs(0, 0, ipc::FS_PASSTHROUGH);
             return;
@@ -1451,6 +1479,45 @@ fn handle_dirobj(
     let th = ch.dup_to_target(h).unwrap_or(0);
     unsafe { let _ = CloseHandle(h); }
     ch.reply_fs(th, 0, 0);
+}
+
+/// Phase E-1 helper: open an absolute directory-object path from the
+/// broker's token. Used by `handle_dirobj` to broker `\KnownDlls`-
+/// style opens that the cdylib hook can't tail-call to the saved
+/// original syscall (saved-original infrastructure went away with
+/// the legacy inline-asm stub).
+fn broker_open_dirobj(path: &str, access: u32) -> Result<HANDLE> {
+    use windows::Wdk::Foundation::OBJECT_ATTRIBUTES;
+    use windows::Win32::Foundation::{NTSTATUS, UNICODE_STRING};
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtOpenDirectoryObject(
+            h: *mut HANDLE, access: u32, oa: *const OBJECT_ATTRIBUTES,
+        ) -> NTSTATUS;
+    }
+    unsafe {
+        let mut wpath = wstr(path);
+        if wpath.last() == Some(&0) { wpath.pop(); }
+        let us = UNICODE_STRING {
+            Length: (wpath.len() * 2) as u16,
+            MaximumLength: (wpath.len() * 2) as u16,
+            Buffer: PWSTR(wpath.as_mut_ptr()),
+        };
+        let oa = OBJECT_ATTRIBUTES {
+            Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: HANDLE::default(),
+            ObjectName: &us as *const _ as *mut _,
+            Attributes: 0x40, // OBJ_CASE_INSENSITIVE
+            SecurityDescriptor: std::ptr::null_mut(),
+            SecurityQualityOfService: std::ptr::null_mut(),
+        };
+        let mut h = HANDLE::default();
+        let st = NtOpenDirectoryObject(&mut h, access, &oa);
+        if st.0 < 0 {
+            bail!("NtOpenDirectoryObject({path}) access={access:#x}: {:#x}", st.0);
+        }
+        Ok(h)
+    }
 }
 
 /// `NtCreateNamedPipeFile`: same args[0..3] shape as

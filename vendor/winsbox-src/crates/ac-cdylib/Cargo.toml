@@ -3,10 +3,19 @@ name = "ac-cdylib"
 version = "0.1.0"
 edition = "2021"
 publish = false
+build = "build.rs"
 
 # `cargo build -p ac-cdylib --release` emits `ac_cdylib.dll` (cargo
 # underscore-mangles the crate name). The broker locates it next to
 # `sbox-exec.exe` (or via WINSBOX_CDYLIB / pol.cdylib_path).
+#
+# Phase E-1: `build.rs` emits link args to pin the cdylib's preferred
+# image base (`/BASE`) and disable ASLR (`/DYNAMICBASE:NO`) so the
+# broker's manual-mapper places the cdylib at the same VA in target
+# memory it would have lived at if the loader had mapped it. The base
+# (`0x70000000`) sits above typical loader heap mappings and below the
+# canonical Win64 user-mode top, so VirtualAllocEx in the target there
+# is collision-free.
 
 [lib]
 crate-type = ["cdylib"]

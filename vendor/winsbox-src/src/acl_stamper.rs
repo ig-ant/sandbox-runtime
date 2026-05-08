@@ -87,6 +87,16 @@ pub struct StampStats {
     pub elapsed_ms: u128,
 }
 
+/// RAII wrapper that `LocalFree`s a SID returned from
+/// `psid_from_string` on drop. Used during the well-known-SID DENY
+/// pass to avoid leaking each `S-1-*` SID we allocate per deny path.
+struct SidGuard(PSID);
+impl Drop for SidGuard {
+    fn drop(&mut self) {
+        free_psid(self.0);
+    }
+}
+
 /// One leaf record we emit. `_kind` is retained for human-readable error
 /// messages even though the apply path doesn't otherwise inspect it.
 #[derive(Debug, Clone)]
@@ -155,6 +165,22 @@ impl PolicyStamp {
             .map(|p| canonical_or_self(p))
             .collect();
 
+        // Phase E-3: well-known SIDs whose inherited ALLOW ACEs would
+        // otherwise let the AC's USER_LOCKDOWN-token access-check pass on
+        // a deny path. Bisection commits 7847a77/b0524ac document why
+        // USER_LOCKDOWN keeps `Everyone` enabled (WFP intra-AC loopback
+        // exemption); without explicit DENY ACEs for these SIDs the
+        // raw-syscall path wins on `Everyone:R`/`Users:R` ancestors.
+        //
+        // We emit DENY ACEs *in addition to* the AC SID's DENY, scoped
+        // strictly to user-specified deny paths. System paths are never
+        // auto-denied here — the policy author chose this path explicitly.
+        const DENY_INHERITED_SIDS: &[&str] = &[
+            "S-1-1-0",      // Everyone
+            "S-1-5-11",     // Authenticated Users
+            "S-1-5-32-545", // BUILTIN\Users
+        ];
+
         for (paths, kind, mask) in [
             (&self.deny_read, "deny_read", read_mask()),
             (&self.deny_write, "deny_write", write_mask()),
@@ -179,6 +205,48 @@ impl PolicyStamp {
                 } else {
                     stats.roots_skipped_idempotent += 1;
                 }
+                // Phase E-3: also DENY for the well-known inherited
+                // ALLOW SIDs the lockdown token keeps enabled. Each
+                // SID is an independent stamp op against the same
+                // path, with the same mask. Idempotency probe handles
+                // the re-apply case per-SID.
+                // Apply all 3 well-known DENYs in one batched
+                // SetEntriesInAclW + TreeSetNamedSecurityInfoW pass.
+                // Per-SID `apply_one` would deny our own access after
+                // the first iteration (Everyone DENY locks even the
+                // broker out of further SetSecurity calls on the
+                // subtree, since the broker-as-user is in `Everyone`).
+                // Batched also halves the kernel walk work.
+                let extra_sids: Vec<(String, PSID)> = DENY_INHERITED_SIDS.iter()
+                    .filter_map(|s| psid_from_string(s).ok().map(|sid| (s.to_string(), sid)))
+                    .collect();
+                let guards: Vec<SidGuard> =
+                    extra_sids.iter().map(|(_, s)| SidGuard(*s)).collect();
+                let pending: Vec<&PSID> =
+                    extra_sids.iter().map(|(_, s)| s)
+                        .filter(|s| {
+                            !root_already_stamped(
+                                p, **s, mask, ACCESS_DENIED_ACE_TYPE,
+                            ).unwrap_or(false)
+                        })
+                        .collect();
+                let already = extra_sids.len() - pending.len();
+                stats.roots_skipped_idempotent += already;
+                if !pending.is_empty() {
+                    match apply_batched_denies(p, mask, &pending) {
+                        Ok(_) => {
+                            stats.roots_stamped += pending.len();
+                            stats.denies_emitted += pending.len();
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[acl_stamper] batched well-known DENY on {:?}: {e:#}",
+                                p,
+                            );
+                        }
+                    }
+                }
+                drop(guards);
             }
         }
 
@@ -190,6 +258,11 @@ impl PolicyStamp {
     /// distinguish "ACEs we added" vs "pre-existing ACEs for this SID":
     /// since the SID is the per-instance AC package SID and we created it,
     /// any ACE for it is ours. This matches the previous `acl.rs` behavior.
+    ///
+    /// Phase E-3: also removes the explicit DENY ACEs we added against
+    /// the well-known SIDs (Everyone, AuthUsers, Users) on deny paths.
+    /// Scoped to DENY-type ACEs only — pre-existing ALLOW ACEs for those
+    /// SIDs (which we never touched) are preserved.
     pub fn revert(&self, ac_sid: PSID) -> Result<()> {
         let mut roots: Vec<PathBuf> = self
             .allow_read
@@ -205,8 +278,108 @@ impl PolicyStamp {
         for p in roots {
             let _ = remove_aces_for_sid(&p, ac_sid);
         }
+
+        // Phase E-3 cleanup: strip the well-known-SID DENY ACEs we added
+        // on deny paths. Use the deny-only variant so inherited ALLOW
+        // ACEs for the same SID stay put.
+        const DENY_INHERITED_SIDS: &[&str] = &[
+            "S-1-1-0", "S-1-5-11", "S-1-5-32-545",
+        ];
+        let deny_paths: Vec<&PathBuf> =
+            self.deny_read.iter().chain(self.deny_write.iter()).collect();
+        for p in deny_paths {
+            for s in DENY_INHERITED_SIDS {
+                let sid = match psid_from_string(s) {
+                    Ok(sid) => sid,
+                    Err(_) => continue,
+                };
+                let _g = SidGuard(sid);
+                let _ = remove_aces_for_sid_typed(p, sid, Some(ACCESS_DENIED_ACE_TYPE));
+            }
+        }
         Ok(())
     }
+}
+
+/// Batch-apply DENY ACEs for multiple SIDs in one
+/// SetEntriesInAclW + TreeSetNamedSecurityInfoW pass. Used by the
+/// Phase E-3 well-known-SID DENY pass: applying Everyone-DENY first
+/// then trying to add Users-DENY would lock the broker (running as
+/// the user, who is in `Everyone`) out of the subsequent
+/// TreeSetNamedSecurityInfoW. Doing them all in one ACL write avoids
+/// the chicken-and-egg.
+fn apply_batched_denies(path: &Path, mask: u32, sids: &[&PSID]) -> Result<()> {
+    if sids.is_empty() {
+        return Ok(());
+    }
+    let path_w = wstr(&path.to_string_lossy());
+
+    // Build one EXPLICIT_ACCESS_W per SID. All DENY, all (OI)(CI), same mask.
+    let mut eas: Vec<EXPLICIT_ACCESS_W> = Vec::with_capacity(sids.len());
+    for s in sids {
+        let mut ea = EXPLICIT_ACCESS_W::default();
+        unsafe {
+            BuildTrusteeWithSidW(&mut ea.Trustee as *mut TRUSTEE_W, **s);
+            BuildExplicitAccessWithNameW(
+                &mut ea as *mut EXPLICIT_ACCESS_W,
+                PCWSTR::null(),
+                mask,
+                DENY_ACCESS,
+                oici(),
+            );
+            // Re-bind the trustee — BuildExplicitAccessWithNameW
+            // overwrites it with a name-based trustee referencing the
+            // null name we just passed.
+            BuildTrusteeWithSidW(&mut ea.Trustee as *mut TRUSTEE_W, **s);
+        }
+        eas.push(ea);
+    }
+
+    let (mut existing_acl_ptr, sd_ptr) = unsafe { fetch_dacl(&path_w)? };
+    let mut new_acl: *mut ACL = std::ptr::null_mut();
+    let rc = unsafe {
+        SetEntriesInAclW(
+            Some(eas.as_slice()),
+            Some(existing_acl_ptr as *const ACL),
+            &mut new_acl,
+        )
+    };
+    if rc != ERROR_SUCCESS {
+        if !sd_ptr.is_null() {
+            unsafe { let _ = LocalFree(HLOCAL(sd_ptr)); }
+        }
+        bail!("SetEntriesInAclW (batch DENY) failed: {:?}", rc);
+    }
+
+    let rc = unsafe {
+        TreeSetNamedSecurityInfoW(
+            pcwstr(&path_w),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            PSID::default(),
+            PSID::default(),
+            Some(new_acl as *const ACL),
+            None,
+            TREE_SEC_INFO_SET,
+            None,
+            PROG_INVOKE_SETTING(0),
+            None,
+        )
+    };
+    if !new_acl.is_null() {
+        unsafe { let _ = LocalFree(HLOCAL(new_acl as *mut c_void)); }
+    }
+    if !sd_ptr.is_null() {
+        unsafe { let _ = LocalFree(HLOCAL(sd_ptr)); }
+    }
+    let _ = &mut existing_acl_ptr;
+    if rc != ERROR_SUCCESS {
+        bail!(
+            "TreeSetNamedSecurityInfoW({:?}) (batch DENY) failed: {:?}",
+            path, rc,
+        );
+    }
+    Ok(())
 }
 
 /// Apply a single stamp operation. Returns `Ok(true)` if a `TreeSetNamedSecurityInfoW`
@@ -473,6 +646,18 @@ fn nested_under_any(path: &Path, allow_set: &HashSet<PathBuf>) -> bool {
 
 /// Strip every ACE for `ac_sid` from `path`. Used by `revert`.
 fn remove_aces_for_sid(path: &Path, ac_sid: PSID) -> Result<()> {
+    remove_aces_for_sid_typed(path, ac_sid, None)
+}
+
+/// Strip ACEs for `target_sid` from `path`, optionally restricted to ACEs of
+/// a specific type (`ACCESS_DENIED_ACE_TYPE` etc.). When `ace_type_filter`
+/// is `None`, every ACE for the SID is removed. When `Some(t)`, only ACEs
+/// whose `AceType == t` are removed — used by Phase E-3 revert to peel our
+/// explicit DENY ACEs off well-known SIDs without touching pre-existing
+/// ALLOW ACEs that the user actually relies on.
+fn remove_aces_for_sid_typed(
+    path: &Path, target_sid: PSID, ace_type_filter: Option<u8>,
+) -> Result<()> {
     let path_w = wstr(&path.to_string_lossy());
     let mut dacl: *mut ACL = std::ptr::null_mut();
     let mut sd: windows::Win32::Security::PSECURITY_DESCRIPTOR =
@@ -493,7 +678,9 @@ fn remove_aces_for_sid(path: &Path, ac_sid: PSID) -> Result<()> {
         return Err(anyhow!("GetNamedSecurityInfoW({:?}): {:?}", path, rc));
     }
 
-    // Build the list of ACEs to keep — every existing ACE whose SID isn't ours.
+    // Build the list of ACEs to keep — every existing ACE whose SID
+    // isn't `target_sid`, plus (when filtering by ACE type) any ACE for
+    // `target_sid` whose type doesn't match the filter.
     let mut keep: Vec<EXPLICIT_ACCESS_W> = Vec::new();
     if !dacl.is_null() {
         unsafe {
@@ -510,7 +697,12 @@ fn remove_aces_for_sid(path: &Path, ac_sid: PSID) -> Result<()> {
                 let ace_mask = *mask_ptr;
                 let sid_ptr = mask_ptr.add(1) as *mut c_void;
                 let candidate = PSID(sid_ptr);
-                if EqualSid(candidate, ac_sid).is_ok() {
+                let sid_matches = EqualSid(candidate, target_sid).is_ok();
+                let type_matches = match ace_type_filter {
+                    Some(t) => header.AceType == t,
+                    None => true,
+                };
+                if sid_matches && type_matches {
                     continue; // drop
                 }
 
@@ -683,12 +875,70 @@ mod tests {
         };
 
         let s = policy.apply(sid).unwrap();
-        assert_eq!(s.denies_emitted, 1, "deny under allow should be emitted");
+        // Phase E-3: 1 DENY for the AC SID + 3 DENYs for well-known
+        // SIDs (Everyone, AuthUsers, Users) per deny path.
+        assert_eq!(s.denies_emitted, 4, "AC SID + 3 well-known SID DENYs");
         assert_eq!(s.denies_omitted_unnecessary, 0);
-        assert!(s.roots_stamped >= 2);
+        assert!(s.roots_stamped >= 5);
 
         policy.revert(sid).unwrap();
         free_psid(sid);
+        cleanup(&root);
+    }
+
+    /// Phase E-3: with USER_LOCKDOWN keeping `Everyone` enabled, the
+    /// stamper must emit explicit DENY ACEs for the well-known SIDs on
+    /// deny paths so a raw-syscall bypass doesn't leak through inherited
+    /// `Everyone:R` from system paths. Verify that:
+    ///  1. The DENY ACEs land on the deny path (one per well-known SID).
+    ///  2. Revert removes only those DENY ACEs, leaving any pre-existing
+    ///     ALLOW ACEs for the same SIDs (e.g. inherited Users:RX) intact.
+    #[test]
+    fn test_well_known_deny_aces_added_and_reverted() {
+        let root = unique_dir("e3-allow");
+        let nested = root.join("private");
+        std::fs::create_dir_all(&nested).unwrap();
+        let ac_sid = psid_from_string(TEST_SID).unwrap();
+        let everyone = psid_from_string("S-1-1-0").unwrap();
+        let users = psid_from_string("S-1-5-32-545").unwrap();
+        let auth_users = psid_from_string("S-1-5-11").unwrap();
+
+        let policy = PolicyStamp {
+            allow_read: vec![root.clone()],
+            deny_read: vec![nested.clone()],
+            ..Default::default()
+        };
+
+        policy.apply(ac_sid).unwrap();
+
+        for (label, s) in [
+            ("Everyone", everyone),
+            ("AuthUsers", auth_users),
+            ("Users", users),
+        ] {
+            let present =
+                root_already_stamped(&nested, s, read_mask(), ACCESS_DENIED_ACE_TYPE)
+                    .unwrap();
+            assert!(present, "DENY ACE for {label} should be present after apply");
+        }
+
+        policy.revert(ac_sid).unwrap();
+
+        for (label, s) in [
+            ("Everyone", everyone),
+            ("AuthUsers", auth_users),
+            ("Users", users),
+        ] {
+            let present =
+                root_already_stamped(&nested, s, read_mask(), ACCESS_DENIED_ACE_TYPE)
+                    .unwrap();
+            assert!(!present, "DENY ACE for {label} should be removed after revert");
+        }
+
+        free_psid(ac_sid);
+        free_psid(everyone);
+        free_psid(users);
+        free_psid(auth_users);
         cleanup(&root);
     }
 

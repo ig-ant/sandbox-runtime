@@ -13,6 +13,7 @@ mod policy;
 #[cfg(windows)] mod entry_trampoline;
 #[cfg(windows)] mod policy_engine;
 #[cfg(windows)] mod cdylib_inject;
+#[cfg(windows)] mod manual_map;
 #[cfg(windows)] mod acl_stamper;
 #[cfg(windows)] mod stamp_manifest;
 #[cfg(windows)] mod launch;
