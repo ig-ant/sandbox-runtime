@@ -21,6 +21,10 @@ path = "src/bin/p11_lsa.rs"
 name = "p12-lockdown"
 path = "src/bin/p12_lockdown.rs"
 
+[[bin]]
+name = "p13-cygwin-ac"
+path = "src/bin/p13_cygwin_ac.rs"
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
