@@ -133,6 +133,18 @@ fn build_broker_tokens_with(
     // makes kernelbase's BaseGetNamedObjectDirectory resolve
     // there, and so handle_dirobj has somewhere to redirect
     // MSYS2/Cygwin's hardcoded \BaseNamedObjects\… creates.
+    //
+    // Phase L: tested `+Everyone` (S-1-1-0) as a capability SID
+    // hoping it would re-open LSA's ALPC port (`\RPC Control\
+    // lsasspirpc`) without also opening outbound network — kernel
+    // rejected it with `STATUS_INVALID_PARAMETER` (0xc000000d).
+    // Capability SIDs live in the `S-1-15-3-…` namespace. The
+    // p11_lsa.rs matrix already enumerated the lpac* / internetClient
+    // capability variants; the only ones that re-open LSA also
+    // re-open outbound network. Decision: keep the LSA wall up,
+    // route around it on a per-test basis (probe_priv.exe replaces
+    // whoami /priv; curl-https is skipped pending Phase M's
+    // broker-side TLS termination).
     let (ac_bno_path, bno_handles) = token::create_ac_bno(&ac.sid_string)?;
     let lock_lb = token::make_lowbox(lockdown, ac.sid, &bno_handles)?;
     let init_lb = token::make_lowbox(initial_r, ac.sid, &bno_handles)?;

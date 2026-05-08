@@ -237,14 +237,37 @@ pub fn to_impersonation(token: HANDLE) -> Result<HANDLE> {
 pub fn make_lowbox(
     token: HANDLE, package_sid: PSID, saved_handles: &[HANDLE],
 ) -> Result<HANDLE> {
+    make_lowbox_caps(token, package_sid, saved_handles, &[])
+}
+
+/// `make_lowbox` plus an explicit capability list. Production callers
+/// use the no-cap form; this entry point is kept for future capability
+/// probes (cf. `bin/p11_lsa.rs`'s LSA-under-lowbox capability matrix).
+///
+/// Phase L finding: `Everyone (S-1-1-0)` and other "regular" SIDs are
+/// rejected by the kernel as capability SIDs with
+/// `STATUS_INVALID_PARAMETER (0xc000000d)` — capability SIDs live
+/// in the `S-1-15-3-…` namespace only. The `lpac*` / `internetClient*`
+/// caps DO re-open LSA reach but ALSO re-open outbound network, which
+/// breaks the network-isolation guarantee. We therefore keep the LSA
+/// wall up and route around it on a per-test basis.
+pub fn make_lowbox_caps(
+    token: HANDLE, package_sid: PSID, saved_handles: &[HANDLE],
+    capabilities: &[SID_AND_ATTRIBUTES],
+) -> Result<HANDLE> {
     unsafe {
         let mut out = HANDLE::default();
         let mut oa: OBJECT_ATTRIBUTES = zeroed();
         oa.Length = size_of::<OBJECT_ATTRIBUTES>() as u32;
         let mut hs: Vec<HANDLE> = saved_handles.to_vec();
+        let cap_ptr = if capabilities.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            capabilities.as_ptr() as *mut c_void
+        };
         let st = NtCreateLowBoxToken(
             &mut out, token, 0x02000000 /* MAXIMUM_ALLOWED */,
-            &mut oa, package_sid, 0, std::ptr::null_mut(),
+            &mut oa, package_sid, capabilities.len() as u32, cap_ptr,
             hs.len() as u32,
             if hs.is_empty() { std::ptr::null_mut() } else { hs.as_mut_ptr() },
         );

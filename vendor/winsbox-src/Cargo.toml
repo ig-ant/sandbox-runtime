@@ -16,6 +16,17 @@ autobins = false
 name = "sbox-exec"
 path = "src/main.rs"
 
+# Phase L: tiny self-contained token-privilege probe used as a drop-in
+# replacement for `whoami /priv` in the windows.test.ts suite. `whoami`
+# humanises each LUID via `LookupPrivilegeName`, which calls into LSA;
+# under the lowbox the LSA ALPC port (`\RPC Control\lsasspirpc`) is
+# unreachable so `whoami /priv` exits non-zero. This probe stays in
+# pure ntdll territory — `OpenProcessToken` + `GetTokenInformation
+# (TokenPrivileges)` — and prints the raw LUIDs.
+[[bin]]
+name = "probe_priv"
+path = "src/bin/probe_priv.rs"
+
 # Phase D-4: probe binaries (`p10`/`p11`/`p12`/`p13`/`spike-inject`)
 # were diagnostic tools that depended on the legacy `acl.rs` module.
 # Their findings are recorded in commit messages + `cheeky-jingling-stream.md`;
