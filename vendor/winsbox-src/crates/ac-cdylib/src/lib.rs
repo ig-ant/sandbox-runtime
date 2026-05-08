@@ -70,7 +70,13 @@ extern "system" {
 /// runs leave the new fields zero-initialised (broker only writes them
 /// when trace mode is on), so the cost on the cold path is one extra
 /// page of zeroed `.bss`-equivalent in the manual-mapped image.
-pub const CDYLIB_VERSION: u32 = 3;
+///
+/// v4 (Phase L cycle 3): TRACE_SYSCALL_COUNT bumped 12 -> 15 to
+/// add NtMapViewOfSection, NtCreateSection,
+/// NtAllocateVirtualMemory — the syscalls the loader exercises
+/// before reaching the original 12 trace family. Wire format
+/// otherwise unchanged.
+pub const CDYLIB_VERSION: u32 = 4;
 
 /// Sentinel return value for `cdylib_init`. Broker verifies on
 /// report-back. Retained as a no-op export so the broker's
@@ -91,7 +97,7 @@ pub const RESULT_SENTINEL: u32 = 0xACDC_BABE;
 /// Number of trace-mode passthrough thunks. Indexed by the
 /// `TRACE_*` syscall-id constants below; must match
 /// `TRACE_SYSCALL_COUNT` on the broker side.
-pub const TRACE_SYSCALL_COUNT: usize = 12;
+pub const TRACE_SYSCALL_COUNT: usize = 15;
 
 // Trace-mode syscall IDs. Each is the index into
 // `IpcEnv.passthrough_trace` *and* the value sent in the
@@ -109,6 +115,10 @@ pub const TRACE_NT_CREATE_EVENT: u64 = 8;
 pub const TRACE_NT_OPEN_EVENT: u64 = 9;
 pub const TRACE_NT_CREATE_MUTANT: u64 = 10;
 pub const TRACE_NT_OPEN_MUTANT: u64 = 11;
+// Phase L cycle 3 additions: loader-time syscalls.
+pub const TRACE_NT_MAP_VIEW_OF_SECTION: u64 = 12;
+pub const TRACE_NT_CREATE_SECTION: u64 = 13;
+pub const TRACE_NT_ALLOCATE_VIRTUAL_MEMORY: u64 = 14;
 
 /// Process-static IPC environment. The broker locates this via the
 /// `IPC` data export, writes the IPC handles directly with
@@ -173,9 +183,10 @@ pub static IPC: IpcEnv = IpcEnv {
     passthrough_nt_open_directory_object: AtomicU64::new(0),
     passthrough_nt_create_named_pipe_file: AtomicU64::new(0),
     passthrough_create_process_internal_w: AtomicU64::new(0),
-    // Repeating `AtomicU64::new(0)` 12× rather than using a `[…; N]`
+    // Repeating `AtomicU64::new(0)` 15× rather than using a `[…; N]`
     // shorthand (which requires `Copy`, and `AtomicU64` isn't).
     passthrough_trace: [
+        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
         AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
         AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
         AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
@@ -888,6 +899,118 @@ pub unsafe extern "system" fn hook_nt_open_mutant_trace(
     ipc_trace_send(
         TRACE_NT_OPEN_MUTANT, st,
         trace_args([oa as u64, desired_access as u64]),
+    );
+    st
+}
+
+// 7. NtMapViewOfSection — every DLL load. Args of interest:
+//    SectionHandle in args[0], BaseAddress* in args[2], ViewSize* in
+//    args[6]. The broker logs the SectionHandle so it can be cross-
+//    referenced with prior NtCreateSection / NtOpenSection calls.
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
+pub unsafe extern "system" fn hook_nt_map_view_of_section_trace(
+    section_handle: HANDLE,
+    process_handle: HANDLE,
+    base_address: *mut *mut c_void,
+    zero_bits: usize,
+    commit_size: usize,
+    section_offset: *mut i64,
+    view_size: *mut usize,
+    inherit_disposition: u32,
+    allocation_type: u32,
+    win32_protect: u32,
+) -> NTSTATUS {
+    let pv = IPC.passthrough_trace[TRACE_NT_MAP_VIEW_OF_SECTION as usize]
+        .load(Ordering::Acquire);
+    if pv == 0 { return STATUS_NOT_IMPLEMENTED; }
+    type Fn10 = unsafe extern "system" fn(
+        HANDLE, HANDLE, *mut *mut c_void, usize, usize, *mut i64,
+        *mut usize, u32, u32, u32,
+    ) -> NTSTATUS;
+    let f: Fn10 = core::mem::transmute(pv as usize);
+    let st = f(
+        section_handle, process_handle, base_address, zero_bits,
+        commit_size, section_offset, view_size,
+        inherit_disposition, allocation_type, win32_protect,
+    );
+    ipc_trace_send(
+        TRACE_NT_MAP_VIEW_OF_SECTION, st,
+        trace_args([
+            section_handle as u64,
+            process_handle as u64,
+            win32_protect as u64,
+        ]),
+    );
+    st
+}
+
+// 8. NtCreateSection — Cygwin's cygheap shared section. Args of
+//    interest: OBJECT_ATTRIBUTES* in args[2] for the section name.
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
+pub unsafe extern "system" fn hook_nt_create_section_trace(
+    out_handle: *mut HANDLE,
+    desired_access: u32,
+    oa: *const c_void,
+    maximum_size: *const i64,
+    section_page_protection: u32,
+    allocation_attributes: u32,
+    file_handle: HANDLE,
+) -> NTSTATUS {
+    let pv = IPC.passthrough_trace[TRACE_NT_CREATE_SECTION as usize]
+        .load(Ordering::Acquire);
+    if pv == 0 { return STATUS_NOT_IMPLEMENTED; }
+    type Fn7 = unsafe extern "system" fn(
+        *mut HANDLE, u32, *const c_void, *const i64, u32, u32, HANDLE,
+    ) -> NTSTATUS;
+    let f: Fn7 = core::mem::transmute(pv as usize);
+    let st = f(
+        out_handle, desired_access, oa, maximum_size,
+        section_page_protection, allocation_attributes, file_handle,
+    );
+    ipc_trace_send(
+        TRACE_NT_CREATE_SECTION, st,
+        trace_args([
+            oa as u64,
+            desired_access as u64,
+            section_page_protection as u64,
+            allocation_attributes as u64,
+        ]),
+    );
+    st
+}
+
+// 9. NtAllocateVirtualMemory — heap/stack init, also Cygwin's mmap
+//    bridge. Very high-frequency; only useful when the trace cuts
+//    off mid-AV.
+#[no_mangle]
+pub unsafe extern "system" fn hook_nt_allocate_virtual_memory_trace(
+    process_handle: HANDLE,
+    base_address: *mut *mut c_void,
+    zero_bits: usize,
+    region_size: *mut usize,
+    allocation_type: u32,
+    protect: u32,
+) -> NTSTATUS {
+    let pv = IPC.passthrough_trace[TRACE_NT_ALLOCATE_VIRTUAL_MEMORY as usize]
+        .load(Ordering::Acquire);
+    if pv == 0 { return STATUS_NOT_IMPLEMENTED; }
+    type Fn6 = unsafe extern "system" fn(
+        HANDLE, *mut *mut c_void, usize, *mut usize, u32, u32,
+    ) -> NTSTATUS;
+    let f: Fn6 = core::mem::transmute(pv as usize);
+    let st = f(
+        process_handle, base_address, zero_bits, region_size,
+        allocation_type, protect,
+    );
+    ipc_trace_send(
+        TRACE_NT_ALLOCATE_VIRTUAL_MEMORY, st,
+        trace_args([
+            process_handle as u64,
+            allocation_type as u64,
+            protect as u64,
+        ]),
     );
     st
 }

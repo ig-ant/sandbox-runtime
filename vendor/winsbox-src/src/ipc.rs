@@ -71,8 +71,18 @@ pub const TRACE_NT_CREATE_EVENT: u64 = 8;
 pub const TRACE_NT_OPEN_EVENT: u64 = 9;
 pub const TRACE_NT_CREATE_MUTANT: u64 = 10;
 pub const TRACE_NT_OPEN_MUTANT: u64 = 11;
+// Phase L cycle 3: extend trace coverage to loader-time syscalls.
+// The original 12 hooks (file/IOCTL/ALPC/registry/sync) emit zero
+// trace lines for Cygwin targets — bash AVs before the first
+// NtCreateFile fires. The loader's pre-DllMain bootstrap uses
+// NtMapViewOfSection (every DLL load), NtCreateSection (Cygwin's
+// shared-cygheap), and NtAllocateVirtualMemory (heap/stack init);
+// adding these gives us a syscall trail right up to the AV.
+pub const TRACE_NT_MAP_VIEW_OF_SECTION: u64 = 12;
+pub const TRACE_NT_CREATE_SECTION: u64 = 13;
+pub const TRACE_NT_ALLOCATE_VIRTUAL_MEMORY: u64 = 14;
 
-pub const TRACE_SYSCALL_COUNT: usize = 12;
+pub const TRACE_SYSCALL_COUNT: usize = 15;
 
 /// (id → ntdll export name) lookup for the install path *and* the
 /// log emitter. Indexed by the `TRACE_*` ids above.
@@ -89,6 +99,9 @@ pub const TRACE_SYSCALL_NAMES: [&str; TRACE_SYSCALL_COUNT] = [
     "NtOpenEvent",
     "NtCreateMutant",
     "NtOpenMutant",
+    "NtMapViewOfSection",
+    "NtCreateSection",
+    "NtAllocateVirtualMemory",
 ];
 
 /// Sentinel `r_status` the broker returns when the cdylib hook

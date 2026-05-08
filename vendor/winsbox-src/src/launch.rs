@@ -248,18 +248,28 @@ fn run_confined(pol: &Policy, manifest_dir: &std::path::Path) -> Result<u32> {
     //    On token-build failure we fall back to a bare AC token
     //    (no enforcement); workloads that need cdylib hooks will
     //    still segfault per P13, but with a clearer error.
-    let broker_tokens: Option<BrokerTokens> = match build_broker_tokens_with(
-        // Phase L cycle 2: tested IL_LOW (0x1000) — same AV. The AC's
-        // package SID already clamps the effective IL to LOW; setting
-        // it to UNTRUSTED at the token level was harmless (and equally
-        // ineffective). Reverted to UNTRUSTED for parity with prior
-        // phases. The AV is not IL-driven.
-        &ac, token::USER_LIMITED, token::IL_UNTRUSTED,
-    ) {
-        Ok(t) => Some(t),
-        Err(e) => {
-            log!("USER_LIMITED token build failed ({e:#}); falling back to AC-only token (no AC-SID enforcement)");
-            None
+    let broker_tokens: Option<BrokerTokens> = if std::env::var("WINSBOX_BARE_AC").is_ok() {
+        // Phase L cycle 3 diagnostic: skip the USER_LIMITED restricted-
+        // token wrap and use a plain AC token via the spawn_in_ac
+        // tokens=None path. If bash AVs without the restricted token,
+        // the AV is purely AC-related; if it survives, USER_LIMITED's
+        // restricting-SID set is incompatible with cygwin1.dll.
+        log!("WINSBOX_BARE_AC=1: skipping USER_LIMITED token; AC-only");
+        None
+    } else {
+        match build_broker_tokens_with(
+            // Phase L cycle 2: tested IL_LOW (0x1000) — same AV. The AC's
+            // package SID already clamps the effective IL to LOW; setting
+            // it to UNTRUSTED at the token level was harmless (and equally
+            // ineffective). Reverted to UNTRUSTED for parity with prior
+            // phases. The AV is not IL-driven.
+            &ac, token::USER_LIMITED, token::IL_UNTRUSTED,
+        ) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                log!("USER_LIMITED token build failed ({e:#}); falling back to AC-only token (no AC-SID enforcement)");
+                None
+            }
         }
     };
 
@@ -1165,6 +1175,20 @@ fn trace_arg_summary(target: HANDLE, id: usize, req: &ipc::Wire) -> String {
         TRACE_NT_OPEN_MUTANT => format!(
             "name={:?} access={:#x}",
             oa_path(req.args[1]), req.args[2] as u32,
+        ),
+        // Phase L cycle 3 additions: loader-time syscalls.
+        TRACE_NT_MAP_VIEW_OF_SECTION => format!(
+            "sect_h={:#x} proc_h={:#x} prot={:#x}",
+            req.args[1], req.args[2], req.args[3] as u32,
+        ),
+        TRACE_NT_CREATE_SECTION => format!(
+            "name={:?} access={:#x} prot={:#x} attr={:#x}",
+            oa_path(req.args[1]), req.args[2] as u32,
+            req.args[3] as u32, req.args[4] as u32,
+        ),
+        TRACE_NT_ALLOCATE_VIRTUAL_MEMORY => format!(
+            "proc_h={:#x} type={:#x} prot={:#x}",
+            req.args[1], req.args[2] as u32, req.args[3] as u32,
         ),
         _ => format!("(unknown id {id})"),
     }

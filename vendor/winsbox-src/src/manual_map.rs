@@ -233,9 +233,12 @@ pub fn manual_map_cdylib(target: HANDLE, dll_path: &Path) -> Result<ManualMapped
     let hook_create_process_internal_w =
         resolve_target_export_va(dll_path, base, "hook_create_process_internal_w")?;
 
-    // Phase K: resolve the 12 trace-mode hook export VAs. Order
-    // matches `crate::ipc::TRACE_SYSCALL_NAMES` (and the cdylib's
-    // `TRACE_*` constants).
+    // Phase K + Phase L cycle 3: resolve the 15 trace-mode hook
+    // export VAs. Order matches `crate::ipc::TRACE_SYSCALL_NAMES`
+    // (and the cdylib's `TRACE_*` constants). The trailing 3
+    // (NtMapViewOfSection, NtCreateSection, NtAllocateVirtualMemory)
+    // were added in Phase L cycle 3 to capture loader-time syscalls
+    // before the existing trace hooks fire.
     let trace_export_names = [
         "hook_nt_create_file_trace",
         "hook_nt_open_file_trace",
@@ -249,6 +252,9 @@ pub fn manual_map_cdylib(target: HANDLE, dll_path: &Path) -> Result<ManualMapped
         "hook_nt_open_event_trace",
         "hook_nt_create_mutant_trace",
         "hook_nt_open_mutant_trace",
+        "hook_nt_map_view_of_section_trace",
+        "hook_nt_create_section_trace",
+        "hook_nt_allocate_virtual_memory_trace",
     ];
     let mut hook_trace = [0usize; crate::ipc::TRACE_SYSCALL_COUNT];
     for (i, name) in trace_export_names.iter().enumerate() {
