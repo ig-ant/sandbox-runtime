@@ -48,6 +48,31 @@ export function getSboxExecPath(cfg?: WindowsConfig): string {
   return candidates[0]
 }
 
+/**
+ * Resolve `ac_cdylib.dll`. Mirrors `getSboxExecPath`, but returns
+ * `undefined` when the cdylib is not present so the broker treats it
+ * as no-cdylib (native-PE-only workloads do not require it).
+ */
+export function getAcCdylibPath(cfg?: WindowsConfig): string | undefined {
+  if (cfg?.cdylibPath) {
+    return fs.existsSync(cfg.cdylibPath) ? cfg.cdylibPath : undefined
+  }
+  if (process.env.WINSBOX_CDYLIB) {
+    return fs.existsSync(process.env.WINSBOX_CDYLIB)
+      ? process.env.WINSBOX_CDYLIB
+      : undefined
+  }
+  const arch = process.arch === 'arm64' ? 'arm64' : 'x64'
+  const candidates = [
+    path.join(pkgRoot(), 'vendor', 'winsbox', arch, 'ac_cdylib.dll'),
+    path.join(pkgRoot(), 'dist', 'vendor', 'winsbox', arch, 'ac_cdylib.dll'),
+  ]
+  for (const c of candidates) {
+    if (fs.existsSync(c)) return c
+  }
+  return undefined
+}
+
 export function checkWindowsDependencies(
   cfg?: WindowsConfig,
 ): SandboxDependencyCheck {
@@ -81,12 +106,17 @@ function envPairs(
   return pairs
 }
 
-function defaultMode(cfg?: WindowsConfig): 'stub' | 'app-container' | 'broker' {
-  if (cfg?.mode) return cfg.mode
-  const p = process.env.WINSBOX_PHASE
-  if (p === '2') return 'broker'
-  if (p === '1') return 'app-container'
-  return 'stub'
+// One-shot deprecation warning for the obsolete WINSBOX_PHASE env var.
+let warnedDeprecatedPhase = false
+function warnIfPhaseEnvSet(): void {
+  if (warnedDeprecatedPhase) return
+  if (process.env.WINSBOX_PHASE !== undefined) {
+    process.stderr.write(
+      '[winsbox] WINSBOX_PHASE is deprecated and ignored; the sandbox now ' +
+        'has a single mode (ACL stamping + cdylib hooks).\n',
+    )
+    warnedDeprecatedPhase = true
+  }
 }
 
 /**
@@ -98,6 +128,7 @@ function defaultMode(cfg?: WindowsConfig): 'stub' | 'app-container' | 'broker' {
 export async function wrapCommandWithSandboxWindows(
   p: WindowsSandboxParams,
 ): Promise<string> {
+  warnIfPhaseEnvSet()
   const exe = getSboxExecPath(p.windowsConfig)
   const shell = p.binShell || 'cmd'
   // Build the inner command line. cmd.exe /d /s /c "<cmd>" with /s makes
@@ -107,7 +138,11 @@ export async function wrapCommandWithSandboxWindows(
       ? `${shell} -NoProfile -Command ${p.command}`
       : `${shell} /d /s /c "${p.command}"`
 
-  const policy = {
+  const cdylibPath = getAcCdylibPath(p.windowsConfig)
+  const manifestDir =
+    p.windowsConfig?.manifestDir ?? process.env.WINSBOX_STAMP_DIR
+
+  const policy: Record<string, unknown> = {
     commandLine: inner,
     cwd: process.cwd(),
     env: envPairs(
@@ -129,14 +164,14 @@ export async function wrapCommandWithSandboxWindows(
     // Off by default until conhost-on-alt-desktop is sorted; the Job
     // UI restrictions already block the cross-process window vectors.
     useAlternateDesktop: p.windowsConfig?.useAlternateDesktop ?? false,
-    // Hook NtCreateFile/NtOpenFile so reads/writes go through the
-    // broker's policy engine instead of relying on Phase-1 ACL
-    // grants alone. Lets the lockdown token open paths the AC SID
-    // wasn't granted on (tool install dirs, ambient reads).
-    brokerFs:
-      p.windowsConfig?.brokerFs ?? defaultMode(p.windowsConfig) === 'broker',
-    mode: defaultMode(p.windowsConfig),
   }
+  // Opt-in: only emit cdylibPath when we resolved a real DLL. Native-PE
+  // workloads do not need it; the broker treats absence as no-cdylib.
+  if (cdylibPath) policy.cdylibPath = cdylibPath
+  // Opt-in: stamp manifest directory override (broker also honours
+  // WINSBOX_STAMP_DIR on its side; we forward it explicitly when set
+  // here so the policy is self-contained).
+  if (manifestDir) policy.manifestDir = manifestDir
 
   const policyPath = path.join(
     os.tmpdir(),

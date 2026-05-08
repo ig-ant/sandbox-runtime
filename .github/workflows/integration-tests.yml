@@ -91,7 +91,7 @@ jobs:
         if: matrix.os == 'linux'
         run: npm run build:seccomp
 
-      - name: Build sbox-exec (Windows)
+      - name: Build sbox-exec + ac-cdylib (Windows)
         if: matrix.os == 'windows'
         # Don't go through bun: on windows-11-arm bun runs under x64
         # emulation, so process.arch lies. RUNNER_ARCH is authoritative.
@@ -99,9 +99,11 @@ jobs:
         run: |
           set -euxo pipefail
           cargo build --release --manifest-path vendor/winsbox-src/Cargo.toml
+          cargo build --release --manifest-path vendor/winsbox-src/Cargo.toml -p ac-cdylib
           arch=$([ "$RUNNER_ARCH" = "ARM64" ] && echo arm64 || echo x64)
           mkdir -p "vendor/winsbox/$arch"
           cp vendor/winsbox-src/target/release/sbox-exec.exe "vendor/winsbox/$arch/"
+          cp vendor/winsbox-src/target/release/ac_cdylib.dll "vendor/winsbox/$arch/"
           # Native Windows path so Node's fs.existsSync can find it.
           winpath=$(cygpath -w "$PWD/vendor/winsbox/$arch/sbox-exec.exe")
           echo "SBOX_EXEC_PATH=$winpath" >> "$GITHUB_ENV"
@@ -114,17 +116,12 @@ jobs:
         run: npm test
 
       - name: Run tests (Windows)
-        # Single canonical Windows path. Earlier matrix had separate
-        # WINSBOX_TOKEN=lockdown and lockdown+alt-desktop runs as
-        # bisection probes; the lockdown shape is being removed in
-        # the ACL-stamping rebuild, so they're no longer informative.
-        # The full suite has POSIX-shell assumptions and a Bun-on-Windows
-        # crash in parent-proxy-tunnel.test.ts; scope to the Windows suite
-        # for now. Porting the rest is tracked separately.
+        # Single canonical Windows path. The full Bun suite has POSIX-shell
+        # assumptions and a Bun-on-Windows crash in
+        # parent-proxy-tunnel.test.ts; scope to the Windows suite for now.
+        # Porting the rest is tracked separately.
         if: matrix.os == 'windows'
         run: bun test --timeout 25000 test/sandbox/windows.test.ts
-        env:
-          WINSBOX_PHASE: '2'
 
       - name: Run Node.js fallback tests
         if: matrix.os != 'windows'

@@ -240,28 +240,29 @@ export const SeccompConfigSchema = z.object({
 })
 
 /**
- * Windows-specific configuration (sbox-exec.exe path, launch mode).
+ * Windows-specific configuration (sbox-exec.exe path, cdylib, manifest dir).
  */
 export const WindowsConfigSchema = z.object({
   sboxExecPath: z
     .string()
     .optional()
     .describe('Override path to sbox-exec.exe'),
-  mode: z
-    .enum(['stub', 'app-container', 'broker'])
+  cdylibPath: z
+    .string()
     .optional()
     .describe(
-      'Launch mode. Defaults from WINSBOX_PHASE env (stub|1|2). ' +
-        'stub = no confinement (test scaffold); app-container = Phase 1; broker = Phase 2.',
+      'Override path to ac_cdylib.dll. Defaults next to sbox-exec.exe; ' +
+        'env-var fallback WINSBOX_CDYLIB. Required for MSYS2/Cygwin tool ' +
+        'compatibility (bash, git, npm); optional for native-PE workloads.',
+    ),
+  manifestDir: z
+    .string()
+    .optional()
+    .describe(
+      'Override directory for ACL stamp manifests. Defaults to ' +
+        '%LOCALAPPDATA%\\sbox-exec\\stamps\\; env-var fallback WINSBOX_STAMP_DIR.',
     ),
   useAlternateDesktop: z.boolean().optional(),
-  brokerFs: z
-    .boolean()
-    .optional()
-    .describe(
-      'Hook NtCreateFile/NtOpenFile so file opens go through the ' +
-        'broker policy engine. Default true in broker mode.',
-    ),
 })
 
 /**

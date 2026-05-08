@@ -6,15 +6,6 @@ import * as net from 'node:net'
 import { SandboxManager } from '../../src/index.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
 
-export type Phase = 'stub' | '1' | '2'
-const ORDER: Phase[] = ['stub', '1', '2']
-export const PHASE: Phase = ((): Phase => {
-  const v = process.env.WINSBOX_PHASE
-  return v === '1' || v === '2' ? v : 'stub'
-})()
-export const phaseGte = (p: Phase): boolean =>
-  ORDER.indexOf(PHASE) >= ORDER.indexOf(p)
-
 export interface RunResult {
   exitCode: number
   stdout: string
@@ -55,15 +46,11 @@ export async function makeFixture(): Promise<Fixture> {
       deniedDomains: [],
     },
     filesystem: {
-      // Phase-1 AC is deny-read-by-default, so allowRead must cover the
-      // tool install dirs + USERPROFILE for the compat tests (see plan
-      // §"known Phase-1 limitation"). Phase 2 ignores allowRead and
-      // applies allow-all-except-denyRead.
-      // Phase-1 ACL grants propagate to every existing child, so
-      // broad roots (USERPROFILE, Program Files) take minutes. Keep
-      // allowRead to the small fixture tree only; system dirs are
-      // already ACL'd to ALL APPLICATION PACKAGES. Compat tests that
-      // need user-profile reads are tagged since:'2'.
+      // ACL stamping uses (OI)(CI) ALLOW on each allowRead root and
+      // (OI)(CI) DENY on each denyRead/denyWrite path that nests
+      // under an ALLOW. System dirs are already ACL'd to
+      // ALL APPLICATION PACKAGES; we only need to add the fixture
+      // tree explicitly here.
       allowRead: [base],
       denyRead: [denyRead],
       allowWrite: [allowWrite],
