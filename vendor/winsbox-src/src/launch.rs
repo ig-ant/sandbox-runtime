@@ -66,7 +66,6 @@ struct SpawnCtx {
     ac_bno_path: String,
     job: HANDLE,
     primary: HANDLE,
-    initial: HANDLE,
     cwd: String,
     env: Vec<(String, String)>,
     stop: Arc<AtomicBool>,
@@ -795,9 +794,9 @@ fn try_inject_cdylib_full(
     //       prefilled it above), the cdylib hook VAs are patched,
     //       and `serve_ipc` will service the loader's IPC requests
     //       as they come in. Then the rendezvous can proceed.
-    let (cpw_primary, cpw_initial) = match broker_tokens {
-        Some(t) => (t.primary, t.initial),
-        None => (HANDLE::default(), HANDLE::default()),
+    let cpw_primary = match broker_tokens {
+        Some(t) => t.primary,
+        None => HANDLE::default(),
     };
     let stop = Arc::new(AtomicBool::new(false));
     let ctx = Arc::new(SpawnCtx {
@@ -805,7 +804,6 @@ fn try_inject_cdylib_full(
         ac_bno_path: ac_bno_path.clone(),
         job: job.handle(),
         primary: cpw_primary,
-        initial: cpw_initial,
         cwd: target_cwd.to_string(),
         env: extra_env.to_vec(),
         stop: stop.clone(),
@@ -1666,8 +1664,9 @@ fn broker_spawn(
         // caller-table values that become valid in the child
         // without rewriting. The caller's primary token is
         // already the lockdown token, so token inheritance is
-        // a no-op vs. the explicit hToken; SetThreadToken
-        // below still applies the initial impersonation.
+        // a no-op vs. the explicit hToken. We do NOT layer
+        // an additional impersonation on the grandchild's main
+        // thread (see below near CreateProcessAsUserW).
         let mut sz = 0usize;
         let _ = InitializeProcThreadAttributeList(
             LPPROC_THREAD_ATTRIBUTE_LIST::default(), 1, 0, &mut sz);
@@ -1699,9 +1698,20 @@ fn broker_spawn(
             PCWSTR(cwd_w.as_ptr()), &six.StartupInfo, &mut pi,
         ).with_context(|| format!("CreateProcessAsUserW(brokered, {cmdline})"))?;
         DeleteProcThreadAttributeList(attrs);
-        if let Err(e) = SetThreadToken(Some(&pi.hThread), ctx.initial) {
-            eprintln!("[sbox-exec] broker_spawn: SetThreadToken: {e}");
-        }
+        // Phase L wall 2 (whoami /priv): we used to SetThreadToken
+        // the grandchild's main thread to `ctx.initial`
+        // (USER_RESTRICTED_SAME_ACCESS, restricting SIDs = user +
+        // enabled groups, no Everyone). LSA's per-AC RPC endpoint
+        // (\Sessions\1\AppContainerNamedObjects\<sid>\RPC Control\
+        // LSARPC_ENDPOINT) DACL grants Everyone, so the
+        // restricted-pass intersection failed and
+        // `LookupPrivilegeNameW` (whoami → LSA) returned
+        // STATUS_INVALID_HANDLE. Dropping the call leaves the
+        // grandchild's main thread on the *primary* lowbox token
+        // (USER_LIMITED+IL_UNTRUSTED), which keeps the AC SID as
+        // the access-check boundary and unblocks LSA. The "thread
+        // more restricted than process" envelope was a USER_LOCKDOWN
+        // -era pattern; under USER_LIMITED it's redundant.
         // PARENT_PROCESS makes the child inherit the caller's
         // Job (= ctx.job), so explicit assignment is usually
         // redundant; tolerate ALREADY_ASSIGNED.

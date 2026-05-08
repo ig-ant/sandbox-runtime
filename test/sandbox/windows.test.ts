@@ -1,7 +1,6 @@
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test'
 import * as fs from 'node:fs'
 import * as path from 'node:path'
-import { fileURLToPath } from 'node:url'
 import { isWindows } from '../helpers/platform.js'
 import {
   makeFixture,
@@ -243,32 +242,33 @@ d('windows sandbox', () => {
   )
 
   test(
-    'token has only SeChangeNotifyPrivilege (probe_priv.exe)',
+    'whoami /priv shows only SeChangeNotifyPrivilege',
     async () => {
       // `whoami /priv` calls LSA via `LookupPrivilegeNameW` to humanise
-      // each LUID, but the lowbox token can't reach the LSA ALPC port
-      // (`\RPC Control\lsasspirpc`) so `whoami` exits non-zero. We use
-      // a tiny ntdll-only probe (`probe_priv.exe`, built from
-      // `vendor/winsbox-src/src/bin/probe_priv.rs` and staged next to
-      // `sbox-exec.exe`) that prints raw `0xHIGH:0xLOW` LUIDs without
-      // the LSA round-trip. Exactly one LUID — `0x0:0x17`,
-      // SeChangeNotifyPrivilege's well-known value on every shipping
-      // Windows release — must appear; nothing else.
-      const arch = process.arch === 'arm64' ? 'arm64' : 'x64'
-      const here = path.dirname(fileURLToPath(import.meta.url))
-      const probe = path.resolve(
-        here, '../..',
-        'vendor', 'winsbox', arch, 'probe_priv.exe',
-      )
-      expect(fs.existsSync(probe)).toBe(true)
-      const r = await runSandboxed(`"${probe}"`, fx.config)
+      // each LUID. Earlier we worked around an LSA wall by using a
+      // ntdll-only probe; the real wall was actually the broker's
+      // grandchild SetThreadToken layering USER_RESTRICTED_SAME_ACCESS
+      // on top of the lowbox primary, whose restricting-SID set
+      // (user + enabled groups, no Everyone) intersected against
+      // LSA's per-AC RPC endpoint DACL (grants Everyone) to a null
+      // pass. Dropping the redundant impersonation lets LSA through.
+      //
+      // PATH ordering matters too: the broker now prepends
+      // `%SystemRoot%\System32` to PATH (windows-sandbox-utils.ts) so
+      // bare `whoami` resolves to the native System32 binary, not
+      // Git-for-Windows' Cygwin shim (which AVs in cygwin1.dll's
+      // DllMain — Phase L wall 1).
+      const r = await runSandboxed('whoami /priv', fx.config)
       expect(r.exitCode).toBe(0)
-      const luids = r.stdout
+      // Exactly one privilege is expected on the lockdown token; assert
+      // its presence and that no other Se*Privilege is visible.
+      expect(r.stdout).toMatch(/SeChangeNotifyPrivilege/)
+      const otherPrivs = r.stdout
         .split(/\r?\n/)
         .map(l => l.trim())
-        .filter(l => /^0x[0-9a-f]+:0x[0-9a-f]+$/.test(l))
-      // SeChangeNotifyPrivilege LUID = (HighPart=0, LowPart=0x17).
-      expect(luids).toEqual(['0x0:0x17'])
+        .filter(l => /^Se\w+Privilege\b/.test(l))
+        .filter(l => !l.startsWith('SeChangeNotifyPrivilege'))
+      expect(otherPrivs).toEqual([])
     },
     20_000,
   )

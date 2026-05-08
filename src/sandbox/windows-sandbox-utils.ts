@@ -103,6 +103,27 @@ function envPairs(
   // Windows uses TEMP/TMP, not TMPDIR.
   const tmpdir = process.env.CLAUDE_TMPDIR || path.join(os.tmpdir(), 'claude')
   pairs.push(['TEMP', tmpdir], ['TMP', tmpdir])
+
+  // Force System32-first PATH so cmd.exe resolves native binaries
+  // (whoami, hostname, find, ...) before any user-PATH Cygwin shims.
+  // Git for Windows ships its own `whoami.exe`/`hostname.exe` under
+  // `C:\Program Files\Git\usr\bin` which load `cygwin1.dll`; that DLL
+  // AVs in `DllMain` under our lockdown token (Phase L wall 1). The
+  // user's PATH commonly lists the Git dir before System32, so without
+  // this prepend the AC sees the broken Cygwin variants first.
+  const systemRoot = process.env.SystemRoot ?? 'C:\\Windows'
+  const sysDirs = [
+    `${systemRoot}\\System32`,
+    systemRoot,
+    `${systemRoot}\\System32\\Wbem`,
+  ].join(';')
+  const inheritedPath = process.env.PATH ?? process.env.Path ?? ''
+  pairs.push(['PATH', `${sysDirs};${inheritedPath}`])
+  // SystemRoot/windir aren't strictly needed for the PATH-first
+  // resolution above, but explicit values guarantee `%SystemRoot%`
+  // expansion inside user commands works regardless of how the
+  // broker's own env was sourced.
+  pairs.push(['SystemRoot', systemRoot], ['windir', systemRoot])
   return pairs
 }
 
