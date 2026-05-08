@@ -1,4 +1,4 @@
-use crate::policy::{Mode, Policy};
+use crate::policy::Policy;
 use crate::util::{pcwstr, wstr};
 use anyhow::{bail, Context, Result};
 use std::ffi::c_void;
@@ -17,7 +17,6 @@ use windows::Win32::System::Threading::{
     STARTUPINFOEXW, STARTUPINFOW,
 };
 
-use crate::acl::{AclJournal, FULL, MODIFY, READ_EXECUTE};
 use crate::acl_stamper::{psid_from_string, free_psid, PolicyStamp};
 use crate::appcontainer::AppContainer;
 use crate::cdylib_inject;
@@ -29,19 +28,19 @@ use crate::netbridge;
 use crate::token;
 use std::sync::{atomic::AtomicBool, atomic::Ordering, Arc, Mutex};
 
-/// Pair of tokens for Mode::Broker. `primary` is the lowbox-wrapped
-/// lockdown token used for CreateProcessAsUser; `initial` is the
-/// matched impersonation token set on the main thread for loader init.
+/// Lowbox-wrapped USER_LIMITED + IL_UNTRUSTED token pair used to
+/// spawn the AC target. `primary` goes to `CreateProcessAsUserW`;
+/// `initial` is the matched impersonation token set on the main
+/// thread for loader init (must match `primary` on restricted-flag
+/// + IL + lowbox per `SeTokenCanImpersonate`).
 struct BrokerTokens {
     primary: HANDLE,
     initial: HANDLE,
-    /// `\Sessions\<N>\AppContainerNamedObjects\<AC-SID>` — the
-    /// per-AC named-object root the broker pre-created.
-    /// `handle_dirobj` redirects `\BaseNamedObjects\…` here.
-    ac_bno_path: String,
     /// Directory-object handles for the AC BNO root + its
     /// `RPC Control` subdir. Kept open for the broker's
-    /// lifetime so the directories aren't torn down.
+    /// lifetime so the directories aren't torn down. The path string
+    /// itself is unused at this layer — it's re-derived inside
+    /// `try_inject_cdylib_full` for the cdylib's `SpawnCtx.ac_bno_path`.
     _bno_handles: Vec<HANDLE>,
 }
 impl Drop for BrokerTokens {
@@ -65,29 +64,15 @@ struct SpawnCtx {
     /// Per-AC named-object root for `handle_dirobj`'s
     /// `\BaseNamedObjects\…` → per-AC redirect.
     ac_bno_path: String,
-    ac_sid_string: String,
     job: HANDLE,
     primary: HANDLE,
     initial: HANDLE,
     cwd: String,
     env: Vec<(String, String)>,
     stop: Arc<AtomicBool>,
-    fs: crate::policy_engine::FsPolicy,
-    /// Whether to install the NtCreateFile/NtOpenFile hooks. When
-    /// false the Phase-1 ACL grants are the only FS boundary and
-    /// reads of paths the AC SID isn't granted on fail in the
-    /// target with no broker involvement.
-    hook_fs: bool,
-    /// `SBOX_TRACE=1`: log every brokered FS/registry/section
-    /// open with path + status, including successes.
+    /// `SBOX_TRACE=1`: log every brokered section/dirobj/pipe op
+    /// with path + status, including successes.
     trace: bool,
-    /// `WINSBOX_TOKEN=lockdown`: changes registry brokering
-    /// behaviour — under lockdown, KEY_ALL_ACCESS opens are
-    /// masked to KEY_READ and brokered (passthrough fails the
-    /// normal-SID check); under USER_LIMITED they passthrough
-    /// (succeeds, and brokering them all caused an
-    /// `ExitProcess`-time spinlock hang at 12e3d0d).
-    lockdown: bool,
     /// Lower-cased leaf names of named pipes the broker
     /// created via `handle_named_pipe`. The broker only
     /// opens the *client* end (NtCreateFile on
@@ -105,10 +90,9 @@ unsafe impl Send for SpawnCtx {}
 unsafe impl Sync for SpawnCtx {}
 
 pub fn run(pol: &Policy, manifest_dir: &std::path::Path) -> Result<u32> {
-    // Phase D-3: the policy schema no longer carries a mode field.
-    // Default = AppContainer + cdylib + ACL stamps. `WINSBOX_LEGACY_BROKER=1`
-    // selects the pre-D inline-asm-stub broker path during the
-    // staged rollback (removed in D-4 once cdylib-mode bash works).
+    // Single production path: AppContainer + USER_LIMITED lowbox token
+    // + ACL stamps; cdylib injection is a per-policy opt-in that adds
+    // the in-AC compat hooks needed for MSYS2/Cygwin workloads.
     run_confined(pol, manifest_dir)
 }
 
@@ -126,27 +110,15 @@ fn build_env_block(extra: &[(String, String)]) -> Vec<u16> {
     out
 }
 
-// Phase D-3: `run_stub` (no AC, no broker, just CreateProcessW) was
-// removed; every run path goes through `run_confined`. Callers wanting
-// a true no-sandbox run can shell out directly.
-
 macro_rules! log { ($($a:tt)*) => { eprintln!("[sbox-exec] {}", format!($($a)*)) } }
 
-fn build_broker_tokens(ac: &AppContainer) -> Result<BrokerTokens> {
-    // Both tokens MUST be at the same IL and lowbox-wrapped or
-    // SeTokenCanImpersonate downgrades the impersonation to
-    // Identification (PoC P5). `spec_from_env` returns
-    // (USER_LIMITED, Low) by default; WINSBOX_TOKEN=lockdown →
-    // (USER_LOCKDOWN, Untrusted) for step-0 retesting on CI.
-    let (spec, il) = token::spec_from_env();
-    build_broker_tokens_with(ac, spec, il)
-}
-
-/// Phase E-2: cdylib mode needs the USER_LOCKDOWN + IL_UNTRUSTED token
-/// shape so the AC's effective access check is gated on the AC SID
-/// (and Everyone, kept enabled for WFP loopback). Without lockdown the
-/// inherited `Everyone:RX` / `Users:RX` from system paths win the
-/// access check and our deny stamps don't enforce.
+/// Build a USER_LIMITED + IL_UNTRUSTED lowbox token pair for the AC
+/// target. The broker uses this token shape so policy ACL stamps
+/// actually enforce — without lockdown the inherited
+/// `Everyone:RX` / `Users:RX` from system paths win the access check
+/// and our AC-SID DENY stamps don't override (they need to be the
+/// only relevant pass on the access-check, which means the SID has
+/// to be the restricting boundary).
 fn build_broker_tokens_with(
     ac: &AppContainer, spec: token::LockdownSpec, il: u32,
 ) -> Result<BrokerTokens> {
@@ -173,23 +145,17 @@ fn build_broker_tokens_with(
         "broker tokens: primary={spec:?}+lowbox, initial=USER_RESTRICTED_SAME_ACCESS+lowbox, IL={:#x}; ac_bno={ac_bno_path}",
         il,
     );
-    Ok(BrokerTokens { primary, initial, ac_bno_path, _bno_handles: bno_handles })
+    let _ = ac_bno_path;
+    Ok(BrokerTokens { primary, initial, _bno_handles: bno_handles })
 }
 
 fn run_confined(pol: &Policy, manifest_dir: &std::path::Path) -> Result<u32> {
-    let mode = Mode::from_env();
-    log!("mode={:?} (legacy_broker={})",
-         mode, mode == Mode::Broker);
     let ac = AppContainer::create("ac")?;
     log!("AppContainer sid={} folder={}", ac.sid_string, ac.folder.display());
 
     // ── Phase D-2: ACL stamping. Build a PolicyStamp from the policy's
     //    allow_*/deny_* fields, hash it against the on-disk manifest,
-    //    skip if unchanged, otherwise apply + save. Skipped under
-    //    legacy-broker mode: that path keeps the inline-asm IPC stubs
-    //    + AclJournal grants for backward compatibility while the
-    //    cdylib path's bash workload is being verified (D-4 deletes
-    //    the legacy path).
+    //    skip if unchanged, otherwise apply + save.
     //
     //    The stamp targets the per-instance AC SID. With the current
     //    AppContainer naming (process-id-suffixed) the SID changes
@@ -198,21 +164,16 @@ fn run_confined(pol: &Policy, manifest_dir: &std::path::Path) -> Result<u32> {
     //    is correct shape and becomes a real fast path once the SID
     //    stops being per-instance.
     //
-    //    On exit the stamp is reverted (Drop on `stamp_holder`),
-    //    matching the existing AclJournal lifecycle. The plan calls
-    //    out that revert is "only on full uninstall, not per-session";
-    //    that aligns with stable-SID stamping. Until then per-session
-    //    revert is the safe default — leaving stamps from a deleted
-    //    AC profile around would be lint.
-    let stamp_holder = if mode == Mode::Broker {
-        None
-    } else {
-        match maybe_apply_stamps(pol, &ac, manifest_dir) {
-            Ok(holder) => Some(holder),
-            Err(e) => {
-                log!("stamp apply failed ({e:#}); continuing without policy stamps");
-                None
-            }
+    //    On exit the stamp is reverted (Drop on `stamp_holder`). The
+    //    plan calls out that revert is "only on full uninstall, not
+    //    per-session"; that aligns with stable-SID stamping. Until
+    //    then per-session revert is the safe default — leaving stamps
+    //    from a deleted AC profile around would be lint.
+    let stamp_holder = match maybe_apply_stamps(pol, &ac, manifest_dir) {
+        Ok(holder) => Some(holder),
+        Err(e) => {
+            log!("stamp apply failed ({e:#}); continuing without policy stamps");
+            None
         }
     };
     let job = Job::new()?;
@@ -225,59 +186,8 @@ fn run_confined(pol: &Policy, manifest_dir: &std::path::Path) -> Result<u32> {
             Err(e) => { log!("alt desktop unavailable ({e}); continuing without"); None }
         }
     } else { None };
-    let mut acls = AclJournal::default();
 
-    // The AC needs to read+execute this binary (for the inside relay).
     let self_exe = std::env::current_exe()?;
-    acls.grant(self_exe.to_str().unwrap(), &ac.sid_string, READ_EXECUTE)?;
-    if let Some(dir) = self_exe.parent() {
-        if let Err(e) = acls.grant(dir.to_str().unwrap(), &ac.sid_string, READ_EXECUTE) {
-            log!("ACL grant self-dir: {e:#}");
-        }
-    }
-
-    // Phase D-3: legacy AclJournal allow/deny grants only fire under
-    // the staged-rollback Mode::Broker path. The default AppContainer
-    // path uses Phase D-2's PolicyStamp (above) for read/write/deny
-    // policy. The legacy_broker path keeps the icacls behaviour intact
-    // while bash workloads are being verified end-to-end on cdylib.
-    if mode == Mode::Broker {
-        const RESTRICTED_SID: &str = "S-1-5-12";
-        let ac_sid = ac.sid_string.clone();
-        let both = [ac_sid.as_str(), RESTRICTED_SID];
-        // legacy: broker_fs implied, allowRead handled by FS hooks.
-        let grant_sids: &[&str] = &both[..1];
-        let mut acl_op = |op: &str, p: &str, perm: &str, deny: bool, sids: &[&str]| {
-            for sid in sids {
-                let r = if deny { acls.deny(p, sid, perm) }
-                        else    { acls.grant(p, sid, perm) };
-                if let Err(e) = r { log!("ACL {op} {p} ({sid}): {e:#}"); }
-            }
-        };
-        for p in &pol.allow_write {
-            let leaf = std::path::Path::new(p).file_name()
-                .map(|f| f.to_string_lossy().to_ascii_uppercase()).unwrap_or_default();
-            if matches!(leaf.as_str(), "NUL" | "CON" | "PRN" | "AUX") { continue; }
-            std::fs::create_dir_all(p).ok();
-            acl_op("allow-write", p, MODIFY, false, grant_sids);
-        }
-        for p in &pol.deny_write {
-            if std::path::Path::new(p).exists() {
-                acl_op("deny-write", p, MODIFY, true, &both);
-            }
-        }
-        for p in &pol.deny_read {
-            if std::path::Path::new(p).exists() {
-                acl_op("deny-read", p, FULL, true, &both);
-                log!("icacls {p}:\n{}", crate::acl::dump(p).trim_end());
-            }
-        }
-        log!(
-            "ACLs (legacy-broker): allow-write {} deny {}",
-            pol.allow_write.len(),
-            pol.deny_read.len() + pol.deny_write.len(),
-        );
-    }
 
     // Network bridge: only if the policy carries proxy ports. Failures
     // here are logged but non-fatal — the AC simply has no network,
@@ -286,7 +196,7 @@ fn run_confined(pol: &Policy, manifest_dir: &std::path::Path) -> Result<u32> {
     let mut relay_pi: Option<PROCESS_INFORMATION> = None;
     if let Some(hp) = pol.network.http_proxy_port {
         let sp = pol.network.socks_proxy_port;
-        match setup_bridge(&ac, &job, desktop.as_ref(), &mut acls, &self_exe, hp, sp) {
+        match setup_bridge(&ac, &job, desktop.as_ref(), &self_exe, hp, sp) {
             Ok((pi, ports)) => {
                 relay_pi = Some(pi);
                 log!("bridge up: ports={:?}", ports);
@@ -307,22 +217,6 @@ fn run_confined(pol: &Policy, manifest_dir: &std::path::Path) -> Result<u32> {
         log!("no proxy ports in policy; skipping bridge");
     }
 
-    // Phase D-3: legacy-broker mode layers a restricted lowbox token
-    // on top. Hard error on failure — silently degrading to
-    // AppContainer-only gave a false green when CreateRestrictedToken
-    // rejected the package SID in the restricting list. Removed in D-4
-    // once the cdylib path's bash workload is verified.
-    let tokens = if mode == Mode::Broker {
-        #[cfg(not(target_arch = "x86_64"))]
-        anyhow::bail!(
-            "WINSBOX_LEGACY_BROKER=1 requires x86_64 interception thunks; \
-             unset WINSBOX_LEGACY_BROKER to use the cdylib path on {}",
-            std::env::consts::ARCH,
-        );
-        #[allow(unreachable_code)]
-        Some(build_broker_tokens(&ac).context("broker token build")?)
-    } else { None };
-
     // The AC must be able to read its cwd or cmd.exe fails with "The
     // current directory is invalid". Use the first allow_write (or the
     // AC package folder) instead of the broker's cwd, which the AC
@@ -332,70 +226,76 @@ fn run_confined(pol: &Policy, manifest_dir: &std::path::Path) -> Result<u32> {
         .cloned()
         .unwrap_or_else(|| ac.folder.to_string_lossy().into_owned());
 
-    // ── Phase B: optional cdylib injection. ─────────────────────────
-    // pol.cdylib_path (or WINSBOX_CDYLIB env override) selects the
-    // dll we LoadLibraryW into the target post-spawn. When set, we:
-    //   (a) push a placeholder AC_CDYLIB_BUFFER env var so the
-    //       in-target env block has space for the buffer VA,
-    //   (b) ACL-stamp the dll's parent dir for AC RX via Phase A's
-    //       PolicyStamp (NOT the legacy AclJournal),
-    //   (c) spawn SUSPENDED, prepare() the section/event/buffer,
-    //   (d) resume + trigger_async() — wait happens in a background
-    //       thread so the broker's main flow can move on.
+    // ── Build the USER_LIMITED + IL_UNTRUSTED lowbox token pair.
+    //    Always-on in AppContainer mode (the only production mode);
+    //    the token shape is what makes policy ACL stamps actually
+    //    enforce. With USER_LIMITED:
     //
-    // Mode::Broker (full hook stack) is gated off for now: the
-    // entry_trampoline rendezvous and broker IPC owns the resume
-    // sequencing, and grafting a parallel cdylib-LoadLibrary onto
-    // it is a Phase-C concern. Logged + skipped non-fatally.
+    //      * `Everyone` stays enabled → WFP's intra-AC-loopback
+    //        exemption still grants outbound through netbridge.
+    //      * `AuthUsers` / `Users` stay enabled → CRYPTBASE / CNG /
+    //        LSA bootstrap can reach inherited `BUILTIN\Users:RX`
+    //        ACEs on system paths.
+    //      * The restricting list is the USER_LIMITED set, so the
+    //        normal-SID pass against the AC SID is the boundary.
+    //      * Explicit AC-SID DENY stamps override inherited ALLOWs
+    //        (kernel evaluates DENY first regardless of group
+    //        enabled-status), so the policy deny-list still
+    //        enforces.
+    //
+    //    On token-build failure we fall back to a bare AC token
+    //    (no enforcement); workloads that need cdylib hooks will
+    //    still segfault per P13, but with a clearer error.
+    let broker_tokens: Option<BrokerTokens> = match build_broker_tokens_with(
+        &ac, token::USER_LIMITED, token::IL_UNTRUSTED,
+    ) {
+        Ok(t) => Some(t),
+        Err(e) => {
+            log!("USER_LIMITED token build failed ({e:#}); falling back to AC-only token (no AC-SID enforcement)");
+            None
+        }
+    };
+
+    // ── Optional cdylib injection. `pol.cdylib_path` (or `WINSBOX_CDYLIB`
+    //    env override) selects the dll the broker manual-maps into the
+    //    target pre-resume. When set, we:
+    //      (a) push a placeholder AC_CDYLIB_BUFFER env var so the
+    //          in-target env block has space for the buffer VA,
+    //      (b) ACL-stamp the dll's parent dir for AC RX via the
+    //          PolicyStamp,
+    //      (c) spawn SUSPENDED, manual-map the cdylib pre-resume,
+    //          patch ntdll syscalls, install the entry rendezvous,
+    //          resume, then patch CPW post-loader.
+    //
+    //    The token is built unconditionally (above); the cdylib path
+    //    adds the in-AC compat hooks on top of that token.
     let cdylib_request: Option<std::path::PathBuf> = pol.cdylib_path
         .as_deref()
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::var("WINSBOX_CDYLIB").ok().map(std::path::PathBuf::from));
-    let cdylib_active = cdylib_request.is_some() && tokens.is_none();
-    if cdylib_request.is_some() && tokens.is_some() {
-        log!("cdylib injection requested but Mode::Broker is incompatible \
-              with Phase-B scaffolding; skipping (Phase C extends entry \
-              trampoline to LoadLibrary the cdylib in-thread)");
-    }
+    let cdylib_active = cdylib_request.is_some();
     if cdylib_active {
         extra_env.push(cdylib_inject::placeholder_env_pair());
     }
 
-    // Phase E-5c: cdylib mode uses USER_LIMITED (Everyone + AuthUsers +
-    // Users enabled) instead of USER_LOCKDOWN. Cygwin's CRYPTBASE/CNG/LSA
-    // bootstrap needs object access via `BUILTIN\Users:RX` inherited
-    // ACEs, which USER_LOCKDOWN denies. USER_LIMITED keeps Everyone
-    // enabled (WFP intra-AC loopback exemption preserved -> network
-    // sandbox holds), and explicit DENY stamps still override inherited
-    // ALLOWs (kernel evaluates DENY first regardless of enabled status),
-    // so the deny-list stays enforced.
-    let cdylib_tokens: Option<BrokerTokens> = if cdylib_active {
-        match build_broker_tokens_with(&ac, token::USER_LIMITED, token::IL_UNTRUSTED) {
-            Ok(t) => Some(t),
-            Err(e) => {
-                log!("cdylib lockdown token build failed ({e:#}); falling back to AC-only token");
-                None
-            }
-        }
-    } else { None };
-
     log!("launching target (cwd={}): {}", target_cwd, pol.command_line);
-    // Both cdylib mode and Mode::Broker manage resume manually; only
-    // the bare AppContainer (Mode::AppContainer + no cdylib) lets
+    // The cdylib path needs manual resume (the entry-trampoline
+    // rendezvous + CPW patching happen post-spawn before the
+    // target should run). The native-PE-only path (no cdylib) lets
     // spawn_in_ac resume the target itself.
-    let resume_in_spawn = tokens.is_none() && !cdylib_active;
-    let spawn_tokens = tokens.as_ref().or(cdylib_tokens.as_ref());
+    let resume_in_spawn = !cdylib_active;
+    let spawn_tokens = broker_tokens.as_ref();
     let pi = spawn_in_ac(&ac, &job, desktop.as_ref(), spawn_tokens,
                          &pol.command_line, Some(&target_cwd), &extra_env,
                          /*resume=*/ resume_in_spawn)?;
     log!("target pid={}", pi.dwProcessId);
 
-    // Cdylib injection: full Phase-D pipeline — stamp, IPC channel,
-    // BNO precreate, entry-trampoline rendezvous, LoadLibraryW,
-    // resolve cdylib hook entries, install the 5 compat hooks via
-    // slim dispatchers, spawn serve_ipc. On any failure the target
-    // continues without the cdylib (workloads that need it segfault
-    // in DLL_PROCESS_ATTACH per P13 — but that's a clean failure).
+    // Cdylib injection: full pipeline — stamp, IPC channel, BNO
+    // precreate, manual-map cdylib pre-resume, patch ntdll, spawn
+    // serve_ipc, install entry rendezvous, resume, patch CPW. On any
+    // failure the target continues without the cdylib (workloads that
+    // need it segfault in DLL_PROCESS_ATTACH per P13 — but that's a
+    // clean failure).
     let mut cdylib_inj: Option<CdylibInjection> = None;
     let mut cdylib_ctx: Option<Arc<SpawnCtx>> = None;
     let mut cdylib_stop: Option<Arc<AtomicBool>> = None;
@@ -403,7 +303,7 @@ fn run_confined(pol: &Policy, manifest_dir: &std::path::Path) -> Result<u32> {
         let dll_path = cdylib_request.as_ref().unwrap();
         match try_inject_cdylib_full(
             &ac, dll_path, pi.hProcess, pi.hThread,
-            &job, &target_cwd, &extra_env, pol, cdylib_tokens.as_ref(),
+            &job, &target_cwd, &extra_env, broker_tokens.as_ref(),
         ) {
             Ok((inj, ctx, stop)) => {
                 cdylib_inj = Some(inj);
@@ -417,50 +317,8 @@ fn run_confined(pol: &Policy, manifest_dir: &std::path::Path) -> Result<u32> {
         }
     }
 
-    // Phase-2b: under the restricted+lowbox primary the target
-    // cannot CreateProcess natively (P10). Hook NtCreateUserProcess
-    // so each spawn comes back to the broker over IPC; the broker
-    // performs the create with the same recipe used for the
-    // immediate target (so the loader survives), recursively
-    // installs the hook in the grandchild, and DuplicateHandle's
-    // the result back. One service thread per channel.
-    let stop_broker = Arc::new(AtomicBool::new(false));
-    let ctx = tokens.as_ref().map(|t| Arc::new(SpawnCtx {
-        ac_sid: ac.sid,
-        ac_bno_path: t.ac_bno_path.clone(),
-        ac_sid_string: ac.sid_string.clone(),
-        job: job.handle(),
-        primary: t.primary,
-        initial: t.initial,
-        cwd: target_cwd.clone(),
-        env: extra_env.clone(),
-        stop: stop_broker.clone(),
-        fs: crate::policy_engine::FsPolicy::from_policy(pol),
-        // Legacy-broker mode: always hook FS. Phase D-3 removed the
-        // policy.broker_fs field — the env-var-gated legacy path is
-        // either fully on or doesn't run at all.
-        hook_fs: true,
-        trace: std::env::var("SBOX_TRACE").is_ok(),
-        lockdown: std::env::var("WINSBOX_TOKEN").as_deref() == Ok("lockdown"),
-        broker_pipes: Mutex::new(std::collections::HashSet::new()),
-        threads: Mutex::new(Vec::new()),
-    }));
-    if let Some(ctx) = ctx.as_ref() {
-        match install_broker_hook(pi.hProcess, pi.hThread, false, ctx.clone()) {
-            Ok(()) => log!("interception installed on target"),
-            Err(e) => {
-                log!("interception install failed ({e:#}); grandchild spawns will fail");
-                unsafe { ResumeThread(pi.hThread); }
-            }
-        }
-    }
-
     unsafe { WaitForSingleObject(pi.hProcess, INFINITE); }
-    stop_broker.store(true, Ordering::Relaxed);
     if let Some(ref s) = cdylib_stop { s.store(true, Ordering::Relaxed); }
-    if let Some(ctx) = ctx {
-        for h in ctx.threads.lock().unwrap().drain(..) { let _ = h.join(); }
-    }
     if let Some(ctx) = cdylib_ctx.as_ref() {
         for h in ctx.threads.lock().unwrap().drain(..) { let _ = h.join(); }
     }
@@ -478,10 +336,10 @@ fn run_confined(pol: &Policy, manifest_dir: &std::path::Path) -> Result<u32> {
             let _ = CloseHandle(rpi.hProcess);
         }
     }
-    drop(acls); // revert before AC profile delete (Drop on `ac`)
     drop(stamp_holder); // revert policy stamps before AC profile delete
     drop(desktop);
     drop(job);
+    drop(broker_tokens);
     Ok(code)
 }
 
@@ -630,8 +488,7 @@ fn try_inject_cdylib_full(
     job: &Job,
     target_cwd: &str,
     extra_env: &[(String, String)],
-    pol: &Policy,
-    cdylib_tokens: Option<&BrokerTokens>,
+    broker_tokens: Option<&BrokerTokens>,
 ) -> Result<(CdylibInjection, Arc<SpawnCtx>, Arc<AtomicBool>)> {
     // ── 1. Resolve + stamp the cdylib's parent dir for AC RX.
     let dll_canon = dll_path.canonicalize()
@@ -802,7 +659,7 @@ fn try_inject_cdylib_full(
     //       prefilled it above), the cdylib hook VAs are patched,
     //       and `serve_ipc` will service the loader's IPC requests
     //       as they come in. Then the rendezvous can proceed.
-    let (cpw_primary, cpw_initial) = match cdylib_tokens {
+    let (cpw_primary, cpw_initial) = match broker_tokens {
         Some(t) => (t.primary, t.initial),
         None => (HANDLE::default(), HANDLE::default()),
     };
@@ -810,22 +667,13 @@ fn try_inject_cdylib_full(
     let ctx = Arc::new(SpawnCtx {
         ac_sid: ac.sid,
         ac_bno_path: ac_bno_path.clone(),
-        ac_sid_string: ac.sid_string.clone(),
         job: job.handle(),
         primary: cpw_primary,
         initial: cpw_initial,
         cwd: target_cwd.to_string(),
         env: extra_env.to_vec(),
         stop: stop.clone(),
-        fs: crate::policy_engine::FsPolicy::from_policy(pol),
-        hook_fs: false,
         trace: std::env::var("SBOX_TRACE").is_ok(),
-        // Phase E-2: cdylib path now spawns under USER_LOCKDOWN tokens
-        // when cdylib_tokens.is_some(). handle_reg uses `lockdown` to
-        // decide whether to mask KEY_ALL_ACCESS opens; since cdylib
-        // mode doesn't service registry opcodes anyway (D-4 deletes
-        // them), this is a no-op.
-        lockdown: cdylib_tokens.is_some(),
         broker_pipes: Mutex::new(std::collections::HashSet::new()),
         threads: Mutex::new(Vec::new()),
     });
@@ -1086,67 +934,21 @@ fn spawn_in_ac(
     }
 }
 
-// ─── Phase-2b broker-mediated spawn ────────────────────────────────
+// ─── Per-channel IPC service loop ─────────────────────────────────
 
-/// Create an IPC channel for `target`, patch the ntdll FS hooks
-/// (ntdll is mapped at `CREATE_SUSPENDED`), install the
-/// entry-point rendezvous, **resume** the target so its loader
-/// runs (with FS opens already brokered — required for
-/// USER_LOCKDOWN, where parallel-loader worker threads run under
-/// the NULL-restricting process token and would otherwise
-/// `0xc0000135` on any non-KnownDll import; P12), wait for the
-/// rendezvous, patch `kernelbase!CreateProcessInternalW`, and let
-/// the target continue. Called once for the immediate target and
-/// recursively for each grandchild the broker spawns. The target
-/// must be SUSPENDED on entry; on success it is running unless
-/// `suspend_after` (the stub re-suspends itself post-rendezvous
-/// so the *caller*'s `ResumeThread` is what releases it —
-/// honours `CREATE_SUSPENDED`).
-fn install_broker_hook(
-    target: HANDLE, thread: HANDLE, suspend_after: bool, ctx: Arc<SpawnCtx>,
-) -> Result<()> {
-    let ch = ipc::Channel::create(target)?;
-    let addrs = ch.stub_env_snapshot();
-    let sync = crate::entry_trampoline::install(target, thread, suspend_after)?;
-    let mut pt = interception::PassthroughThunks::default();
-    if ctx.hook_fs {
-        // Phase C: Mode::Broker still uses the legacy inline-asm IPC
-        // stubs (cdylib = None). The cdylib path is exercised through
-        // the run_confined cdylib_active branch above. install_cpw on
-        // ARM64 requires cdylib; Mode::Broker on ARM64 was already
-        // gated off in run_confined.
-        interception::install_fs(target, &addrs, None, &mut pt)?;
-        interception::install_reg(target, &addrs, None, &mut pt)?;
-    }
-    let target_raw = target.0 as isize;
-    let ctx_thread = ctx.clone();
-    let _ = std::thread::spawn(move || serve_ipc(ch, target_raw, ctx_thread));
-    unsafe { ResumeThread(thread); }
-    if !sync.wait_loaded_or_exit(target, 15_000) {
-        bail!("entry rendezvous timed out (loader hung/exited)");
-    }
-    // Loader done; kernelbase is mapped and the target is parked
-    // in the entry stub.
-    let cpw = crate::entry_trampoline::cpw_address()?;
-    interception::install_cpw(target, &addrs, cpw, None, &mut pt)?;
-    let _ = ctx;
-    sync.go();
-    Ok(())
-}
-
-/// Per-channel service loop. Dispatches on `Wire.op`.
+/// Per-channel service loop. Dispatches on `Wire.op`. Phase D-4
+/// dropped the FS / Attr / Reg ops along with their handlers — ACL
+/// stamping owns FS/Reg policy now. What remains: CPW for brokered
+/// spawn, the section / dirobj namespace redirects for Cygwin BNO,
+/// and the named-pipe broker for Cygwin signal pipes.
 fn serve_ipc(ch: ipc::Channel, target_raw: isize, ctx: Arc<SpawnCtx>) {
     let target = HANDLE(target_raw as *mut c_void);
     while !ctx.stop.load(Ordering::Relaxed) {
         let req = match ch.wait_request(250) { Some(r) => r, None => continue };
         match req.op {
             ipc::OP_CPW => handle_cpw(&ch, target, &req, &ctx),
-            ipc::OP_NTCREATEFILE | ipc::OP_NTOPENFILE =>
-                handle_fs(&ch, target, &req, &ctx),
-            ipc::OP_NTOPENKEY | ipc::OP_NTOPENKEYEX | ipc::OP_NTOPENSECTION =>
-                handle_reg(&ch, target, &req, &ctx),
-            ipc::OP_NTQUERYATTR | ipc::OP_NTQUERYFULLATTR =>
-                handle_attr(&ch, target, &req, &ctx),
+            ipc::OP_NTOPENSECTION =>
+                handle_section(&ch, target, &req, &ctx),
             ipc::OP_NTCREATEDIROBJ | ipc::OP_NTOPENDIROBJ =>
                 handle_dirobj(&ch, target, &req, &ctx),
             ipc::OP_NTCREATENAMEDPIPE =>
@@ -1182,25 +984,26 @@ fn handle_cpw(ch: &ipc::Channel, target: HANDLE, req: &ipc::Wire, ctx: &Arc<Spaw
         "[sbox-exec] ipc: brokered spawn: {cmdline}  (flags={caller_flags:#x} si.flags={:#x} cbReserved2={} app={app:?})",
         si.dwFlags.0, reserved2.len(),
     );
-    let suspend_after = caller_flags & 0x00000004 /* CREATE_SUSPENDED */ != 0;
     let app_opt = (!app.is_empty()).then_some(app.as_str());
     let mut envb = read_target_env(target, req.args[7] as usize, caller_flags, ctx);
     match broker_spawn(ctx, target, app_opt, &cmdline, cwd.as_deref(),
                        caller_flags, &si, &reserved2, &mut envb) {
         Ok(child) => {
-            if let Err(e) = install_broker_hook(
-                child.hProcess, child.hThread, suspend_after, ctx.clone(),
-            ) {
-                eprintln!("[sbox-exec] ipc: recurse hook failed: {e:#}; child runs unhooked");
-                unsafe { ResumeThread(child.hThread); }
-            }
+            // D-4: grandchildren run un-hooked. The legacy
+            // `install_broker_hook` recursive cdylib install is
+            // gone — for native PE workloads grandchildren don't
+            // need compat hooks; for MSYS2/Cygwin the in-target
+            // segfault is a known follow-up (see
+            // `examples/smoke_bash.rs`). Resume the grandchild
+            // immediately so it runs.
+            unsafe { ResumeThread(child.hThread); }
             let p = ch.dup_to_target(child.hProcess).unwrap_or(0);
             let t = ch.dup_to_target(child.hThread).unwrap_or(0);
             ch.reply_cpw_ok(p, t, child.dwProcessId, child.dwThreadId);
-            // Keep child.hProcess open: the recursive Channel
-            // holds it for future dup_to_target calls. Job
-            // KILL_ON_JOB_CLOSE bounds the leak.
-            unsafe { let _ = CloseHandle(child.hThread); }
+            unsafe {
+                let _ = CloseHandle(child.hThread);
+                let _ = CloseHandle(child.hProcess);
+            }
         }
         Err(e) => {
             let gle = unsafe {
@@ -1212,235 +1015,20 @@ fn handle_cpw(ch: &ipc::Channel, target: HANDLE, req: &ipc::Wire, ctx: &Arc<Spaw
     }
 }
 
-fn handle_fs(ch: &ipc::Channel, target: HANDLE, req: &ipc::Wire, ctx: &Arc<SpawnCtx>) {
-    // NtCreateFile/NtOpenFile args:
-    //   [0]=PHANDLE FileHandle, [1]=DesiredAccess,
-    //   [2]=POBJECT_ATTRIBUTES, [3]=PIO_STATUS_BLOCK,
-    //   create: [4]=AllocationSize [5]=FileAttributes [6]=ShareAccess
-    //           [7]=CreateDisposition [8]=CreateOptions [9]=EaBuffer [10]=EaLength
-    //   open:   [4]=ShareAccess [5]=OpenOptions
-    let access = req.args[1] as u32;
-    let oa_va = req.args[2] as usize;
-    let path = match read_target_obj_path(target, oa_va) {
-        Ok(p) => p,
-        Err(e) => {
-            // RootDirectory that isn't a file handle.
-            // Cygwin's fhandler_pipe::nt_create opens the
-            // client end RootDirectory-relative to
-            // `\Device\NamedPipe\` (which
-            // GetFinalPathNameByHandle can't resolve). If
-            // the leaf is a pipe the broker created, broker
-            // the client open via the absolute path so the
-            // target gets a handle to its own pipe.
-            // Otherwise passthrough.
-            if let Ok((_root, leaf)) = read_target_oa_raw(target, oa_va) {
-                let leaf_l = leaf.to_ascii_lowercase();
-                if ctx.broker_pipes.lock().unwrap().contains(&leaf_l) {
-                    format!(r"\??\pipe\{leaf}")
-                } else {
-                    eprintln!("[sbox-exec] fs: passthrough ({e:#})");
-                    ch.reply_fs(0, 0, ipc::FS_PASSTHROUGH);
-                    return;
-                }
-            } else {
-                eprintln!("[sbox-exec] fs: passthrough ({e:#})");
-                ch.reply_fs(0, 0, ipc::FS_PASSTHROUGH);
-                return;
-            }
-        }
-    };
-    use crate::policy_engine::Decision;
-    // Client-end open of a pipe whose server end this broker
-    // created (Cygwin/MSYS2 sigwait & pty pipes). The pipe's
-    // DACL is the broker's default so the lowbox target can't
-    // passthrough-open it; the broker can. Restricted to the
-    // recorded set so the sandbox cannot reach a *host*
-    // process's `msys-*` pipe via the broker.
-    let lower = path.to_ascii_lowercase();
-    let is_own_pipe = lower
-        .strip_prefix(r"\??\pipe\")
-        .or_else(|| lower.strip_prefix(r"\device\namedpipe\"))
-        .is_some_and(|leaf| ctx.broker_pipes.lock().unwrap().contains(leaf));
-    let decision = if is_own_pipe { Decision::Allow }
-                   else { ctx.fs.evaluate(&path, access) };
-    match decision {
-        Decision::Deny(why) => {
-            eprintln!("[sbox-exec] fs: DENY {path} ({why}, access={access:#x})");
-            ch.reply_fs(0, 0, 0xC0000022u32 as i32 /* STATUS_ACCESS_DENIED */);
-            return;
-        }
-        Decision::AllowAsTarget => {
-            // Tell the stub to tail-jmp the saved original
-            // syscall so the *target* does the open under its
-            // own lowbox token — required for AFD/ConDrv where
-            // the endpoint must be created inside the target's
-            // AppContainer process, not the broker's.
-            ch.reply_fs(0, 0, ipc::FS_PASSTHROUGH);
-            return;
-        }
-        Decision::Allow => {}
-    }
-    match broker_open(req, &path, HANDLE::default()) {
-        Ok((h, info)) => {
-            let th = ch.dup_to_target(h).unwrap_or(0);
-            unsafe { let _ = CloseHandle(h); }
-            if ctx.trace {
-                eprintln!("[sbox-exec] fs: ok {path} access={access:#x} → h={th:#x}");
-            }
-            ch.reply_fs(th, info, 0);
-        }
-        Err(st) => {
-            if ctx.trace || (st != 0xC0000034u32 as i32 && st != 0xC000003Au32 as i32) {
-                eprintln!("[sbox-exec] fs: open {path}: {st:#x} access={access:#x}");
-            }
-            if st == 0xC000000Du32 as i32 {
-                eprintln!(
-                    "[sbox-exec] fs:   args op={} a4={:#x} a5={:#x} a6={:#x} a7={:#x} a8={:#x} a9={:#x} a10={:#x}",
-                    req.op, req.args[4], req.args[5], req.args[6],
-                    req.args[7], req.args[8], req.args[9], req.args[10],
-                );
-            }
-            ch.reply_fs(0, 0, st);
-        }
-    }
-}
-
-/// Issue the brokered `NtCreateFile`/`NtOpenFile` with the
-/// caller's flags. If `impersonate` is non-null, the open
-/// happens under that token (used for `\Device\*` so the
-/// endpoint is created in the target's AppContainer); otherwise
-/// under the broker's full token. Returns the broker-side
-/// handle + `IO_STATUS_BLOCK.Information`, or the raw `NTSTATUS`.
-fn broker_open(
-    req: &ipc::Wire, nt_path: &str, impersonate: HANDLE,
-) -> std::result::Result<(HANDLE, u64), i32> {
-    use windows::Wdk::Foundation::OBJECT_ATTRIBUTES;
-    use windows::Win32::Foundation::{NTSTATUS, UNICODE_STRING};
-    #[link(name = "ntdll")]
-    extern "system" {
-        fn NtCreateFile(h: *mut HANDLE, access: u32,
-            oa: *const OBJECT_ATTRIBUTES, iosb: *mut [usize; 2],
-            alloc: *const u64, fattrs: u32, share: u32, disp: u32,
-            opts: u32, ea: *const c_void, ea_len: u32) -> NTSTATUS;
-        fn NtOpenFile(h: *mut HANDLE, access: u32,
-            oa: *const OBJECT_ATTRIBUTES, iosb: *mut [usize; 2],
-            share: u32, opts: u32) -> NTSTATUS;
-    }
-    unsafe {
-        let mut wpath = wstr(nt_path);
-        // Strip the trailing NUL — UNICODE_STRING.Length excludes it.
-        if wpath.last() == Some(&0) { wpath.pop(); }
-        let us = UNICODE_STRING {
-            Length: (wpath.len() * 2) as u16,
-            MaximumLength: (wpath.len() * 2) as u16,
-            Buffer: PWSTR(wpath.as_mut_ptr()),
-        };
-        let oa = OBJECT_ATTRIBUTES {
-            Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
-            RootDirectory: HANDLE::default(),
-            ObjectName: &us as *const _ as *mut _,
-            Attributes: 0x40 /* OBJ_CASE_INSENSITIVE */,
-            SecurityDescriptor: std::ptr::null_mut(),
-            SecurityQualityOfService: std::ptr::null_mut(),
-        };
-        if !impersonate.is_invalid() {
-            let _ = SetThreadToken(None, impersonate);
-        }
-        let mut h = HANDLE::default();
-        let mut iosb = [0usize; 2];
-        let access = req.args[1] as u32;
-        let st = if req.op == ipc::OP_NTCREATEFILE {
-            // FILE_CONTAINS_EXTENDED_CREATE_INFORMATION (0x10000000,
-            // Win11 22H2+) means EaBuffer carries an
-            // EXTENDED_CREATE_INFORMATION struct; CopyFile2 sets
-            // it. Stripping EaBuffer while leaving the flag set →
-            // STATUS_INVALID_PARAMETER. Strip the flag too.
-            const FILE_CONTAINS_EXTENDED_CREATE_INFORMATION: u32 = 0x10000000;
-            let opts = req.args[8] as u32
-                & !FILE_CONTAINS_EXTENDED_CREATE_INFORMATION;
-            NtCreateFile(&mut h, access, &oa, &mut iosb,
-                std::ptr::null(),               // AllocationSize: ignore
-                req.args[5] as u32,             // FileAttributes
-                req.args[6] as u32,             // ShareAccess
-                req.args[7] as u32,             // CreateDisposition
-                opts,                           // CreateOptions
-                std::ptr::null(), 0)            // EaBuffer/Length: drop
-        } else {
-            NtOpenFile(&mut h, access, &oa, &mut iosb,
-                req.args[4] as u32,             // ShareAccess
-                req.args[5] as u32)             // OpenOptions
-        };
-        if !impersonate.is_invalid() {
-            let _ = SetThreadToken(None, None);
-        }
-        if st.0 < 0 { Err(st.0) } else { Ok((h, iosb[1] as u64)) }
-    }
-}
-
-/// `NtQuery{,Full}AttributesFile`: args[0]=POBJECT_ATTRIBUTES,
-/// args[1]=out struct. Read-only by definition; evaluate
-/// against the FS policy (denyRead → ACCESS_DENIED, else
-/// re-issue under the broker's token). Result struct (≤56
-/// bytes) goes back via the section at `ATTR_OFF`.
-fn handle_attr(
-    ch: &ipc::Channel, target: HANDLE, req: &ipc::Wire, ctx: &Arc<SpawnCtx>,
+/// `NtOpenSection` namespace handler (D-4: collapsed from `handle_reg`
+/// to a passthrough). The cdylib hooks `NtOpenSection` to give the
+/// broker a chance to redirect Cygwin's shared-state sections, but
+/// the legacy redirect logic was bound to `WINSBOX_TOKEN=lockdown`
+/// quirks that are gone post-D-4. Reply `FS_PASSTHROUGH` so the
+/// kernel handles the open under the AC's own token; ACL stamps
+/// gate which sections it can reach.
+fn handle_section(
+    ch: &ipc::Channel, _target: HANDLE, _req: &ipc::Wire, ctx: &Arc<SpawnCtx>,
 ) {
-    #[link(name = "ntdll")]
-    extern "system" {
-        fn NtQueryAttributesFile(
-            oa: *const c_void, out: *mut [u8; 56],
-        ) -> windows::Win32::Foundation::NTSTATUS;
-        fn NtQueryFullAttributesFile(
-            oa: *const c_void, out: *mut [u8; 56],
-        ) -> windows::Win32::Foundation::NTSTATUS;
-    }
-    let path = match read_target_obj_path(target, req.args[0] as usize) {
-        Ok(p) => p,
-        Err(_) => { ch.reply_fs(0, 0, ipc::FS_PASSTHROUGH); return; }
-    };
-    use crate::policy_engine::Decision;
-    match ctx.fs.evaluate(&path, 0x0080 /* FILE_READ_ATTRIBUTES */) {
-        Decision::Deny(why) => {
-            eprintln!("[sbox-exec] attr: DENY {path} ({why})");
-            ch.reply_attr(0xC0000022u32 as i32, &[0u8; 56]);
-            return;
-        }
-        Decision::AllowAsTarget => {
-            ch.reply_fs(0, 0, ipc::FS_PASSTHROUGH);
-            return;
-        }
-        Decision::Allow => {}
-    }
-    use windows::Wdk::Foundation::OBJECT_ATTRIBUTES;
-    use windows::Win32::Foundation::UNICODE_STRING;
-    let st;
-    let mut out = [0u8; 56];
-    unsafe {
-        let mut wpath = wstr(&path);
-        if wpath.last() == Some(&0) { wpath.pop(); }
-        let us = UNICODE_STRING {
-            Length: (wpath.len() * 2) as u16,
-            MaximumLength: (wpath.len() * 2) as u16,
-            Buffer: PWSTR(wpath.as_mut_ptr()),
-        };
-        let oa = OBJECT_ATTRIBUTES {
-            Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
-            RootDirectory: HANDLE::default(),
-            ObjectName: &us as *const _ as *mut _,
-            Attributes: 0x40,
-            SecurityDescriptor: std::ptr::null_mut(),
-            SecurityQualityOfService: std::ptr::null_mut(),
-        };
-        st = if req.op == ipc::OP_NTQUERYFULLATTR {
-            NtQueryFullAttributesFile(&oa as *const _ as *const c_void, &mut out)
-        } else {
-            NtQueryAttributesFile(&oa as *const _ as *const c_void, &mut out)
-        };
-    }
     if ctx.trace {
-        eprintln!("[sbox-exec] attr: {path} → {:#x}", st.0);
+        eprintln!("[sbox-exec] sec: passthrough");
     }
-    ch.reply_attr(st.0, &out);
+    ch.reply_fs(0, 0, ipc::FS_PASSTHROUGH);
 }
 
 /// `NtCreateDirectoryObject` / `NtOpenDirectoryObject`:
@@ -1727,161 +1315,6 @@ fn bno_suffix(leaf: &str) -> Option<String> {
     None
 }
 
-/// `NtOpenKey` / `NtOpenKeyEx` / `NtOpenSection`:
-/// args[0]=PHANDLE, [1]=DesiredAccess, [2]=POBJECT_ATTRIBUTES,
-/// (NtOpenKeyEx only) [3]=OpenOptions. v1: default-allow-read;
-/// passthrough on any write bit (lockdown token denies). The
-/// broker dup's the caller's `RootDirectory` and re-issues the
-/// open relative to it — no path stringification needed for
-/// default-allow-read. With `SBOX_TRACE`, logs every call so
-/// the sequence before a failure is visible.
-fn handle_reg(
-    ch: &ipc::Channel, target: HANDLE, req: &ipc::Wire, ctx: &Arc<SpawnCtx>,
-) {
-    const MAXIMUM_ALLOWED: u32 = 0x02000000;
-    const KEY_READ: u32 = 0x20019;
-    const KEY_WOW64: u32 = 0x0100 | 0x0200;
-    const KEY_WRITE_BITS: u32 =
-        0x0002 /* KEY_SET_VALUE */ | 0x0004 /* KEY_CREATE_SUB_KEY */ |
-        0x0020 /* KEY_CREATE_LINK */ | 0x00010000 | 0x00040000 |
-        0x00080000 | 0x40000000 | 0x10000000;
-    const KEY_READ_INTENT: u32 =
-        0x0001 /*QUERY_VALUE*/ | 0x0008 /*ENUM_SUBKEYS*/ |
-        0x0010 /*NOTIFY*/ | 0x80000000 | MAXIMUM_ALLOWED;
-    const SEC_WRITE_BITS: u32 =
-        0x0002 /* SECTION_MAP_WRITE */ | 0x0010 /* SECTION_EXTEND_SIZE */ |
-        0x00010000 | 0x00040000 | 0x00080000 | 0x40000000 | 0x10000000;
-    let req_access = req.args[1] as u32;
-    let tag = if req.op == ipc::OP_NTOPENSECTION { "sec" } else { "reg" };
-    let (root_raw, leaf) = match read_target_oa_raw(target, req.args[2] as usize) {
-        Ok(r) => r,
-        Err(e) => {
-            if ctx.trace {
-                eprintln!("[sbox-exec] {tag}: passthrough oa-read ({e:#})");
-            }
-            ch.reply_fs(0, 0, ipc::FS_PASSTHROUGH);
-            return;
-        }
-    };
-    // Passthrough on any explicit write bit. Under
-    // USER_LIMITED the target's token opens it directly;
-    // under USER_LOCKDOWN the `Restricting::Lockdown` list
-    // (Everyone, RESTRICTED, Logon) plus the lowbox-added
-    // ALL APP PACKAGES enabled group lets system registry/
-    // sections through anyway. Brokering every
-    // KEY_ALL_ACCESS open (12e3d0d tried this) adds hundreds
-    // of IPCs and risks an `ExitProcess`-time hang where a
-    // thread is killed mid-stub holding the section
-    // spinlock and a `DLL_PROCESS_DETACH` callback then
-    // spins forever.
-    let write_bits = if req.op == ipc::OP_NTOPENSECTION {
-        SEC_WRITE_BITS
-    } else { KEY_WRITE_BITS };
-    // Sections always passthrough on write. Registry under
-    // USER_LIMITED passthroughs on write (target's token
-    // succeeds; brokering all of these caused the 12e3d0d
-    // ExitProcess-spinlock hang). Registry under
-    // USER_LOCKDOWN: passthrough fails the normal-SID check
-    // (ALL APP PACKAGES has read-only on registry), so mask
-    // to KEY_READ and broker — the dup'd handle is read-only
-    // so writes through it still fail. The spinlock hang is
-    // a known risk under lockdown until the section gets a
-    // proper mutant; lockdown is opt-in via WINSBOX_TOKEN.
-    let mask_writes = ctx.lockdown && req.op != ipc::OP_NTOPENSECTION;
-    if req_access & write_bits != 0 && !mask_writes {
-        if ctx.trace {
-            eprintln!("[sbox-exec] {tag}: passthrough write access={req_access:#x} {leaf}");
-        }
-        ch.reply_fs(0, 0, ipc::FS_PASSTHROUGH);
-        return;
-    }
-    if mask_writes
-        && req_access & KEY_READ_INTENT == 0
-        && req_access & write_bits != 0
-    {
-        if ctx.trace {
-            eprintln!("[sbox-exec] {tag}: passthrough write-only access={req_access:#x} {leaf}");
-        }
-        ch.reply_fs(0, 0, ipc::FS_PASSTHROUGH);
-        return;
-    }
-    // MAXIMUM_ALLOWED under the broker's token would resolve
-    // to write — substitute the read mask. Under lockdown
-    // every brokered registry open uses KEY_READ regardless.
-    let access = if req.op == ipc::OP_NTOPENSECTION {
-        req_access & !MAXIMUM_ALLOWED
-    } else if mask_writes || req_access & MAXIMUM_ALLOWED != 0 {
-        KEY_READ | (req_access & KEY_WOW64)
-    } else {
-        req_access
-    };
-    let root_h = if root_raw != 0 {
-        match dup_from_target(target, root_raw) {
-            Ok(h) => h,
-            Err(_) => { ch.reply_fs(0, 0, ipc::FS_PASSTHROUGH); return; }
-        }
-    } else { HANDLE::default() };
-    let opts = if req.op == ipc::OP_NTOPENKEYEX { req.args[3] as u32 } else { 0 };
-    let st = broker_open_handle(req.op, &leaf, root_h, access, opts);
-    if root_raw != 0 { unsafe { let _ = CloseHandle(root_h); } }
-    match st {
-        Ok(h) => {
-            let th = ch.dup_to_target(h).unwrap_or(0);
-            unsafe { let _ = CloseHandle(h); }
-            if ctx.trace {
-                eprintln!("[sbox-exec] {tag}: ok root={root_raw:#x} {leaf} → h={th:#x}");
-            }
-            ch.reply_fs(th, 0, 0);
-        }
-        Err(st) => {
-            if ctx.trace || st == 0xC0000022u32 as i32 {
-                eprintln!(
-                    "[sbox-exec] {tag}: {st:#x} root={root_raw:#x} {leaf} access={access:#x}",
-                );
-            }
-            ch.reply_fs(0, 0, st);
-        }
-    }
-}
-
-fn broker_open_handle(
-    op: u64, leaf: &str, root: HANDLE, access: u32, opts: u32,
-) -> std::result::Result<HANDLE, i32> {
-    use windows::Wdk::Foundation::OBJECT_ATTRIBUTES;
-    use windows::Win32::Foundation::{NTSTATUS, UNICODE_STRING};
-    #[link(name = "ntdll")]
-    extern "system" {
-        fn NtOpenKeyEx(h: *mut HANDLE, access: u32,
-            oa: *const OBJECT_ATTRIBUTES, opts: u32) -> NTSTATUS;
-        fn NtOpenSection(h: *mut HANDLE, access: u32,
-            oa: *const OBJECT_ATTRIBUTES) -> NTSTATUS;
-    }
-    unsafe {
-        let mut wleaf = wstr(leaf);
-        if wleaf.last() == Some(&0) { wleaf.pop(); }
-        let us = UNICODE_STRING {
-            Length: (wleaf.len() * 2) as u16,
-            MaximumLength: (wleaf.len() * 2) as u16,
-            Buffer: PWSTR(wleaf.as_mut_ptr()),
-        };
-        let oa = OBJECT_ATTRIBUTES {
-            Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
-            RootDirectory: root,
-            ObjectName: &us as *const _ as *mut _,
-            Attributes: 0x40 /* OBJ_CASE_INSENSITIVE */,
-            SecurityDescriptor: std::ptr::null_mut(),
-            SecurityQualityOfService: std::ptr::null_mut(),
-        };
-        let mut h = HANDLE::default();
-        let st = if op == ipc::OP_NTOPENSECTION {
-            NtOpenSection(&mut h, access, &oa)
-        } else {
-            NtOpenKeyEx(&mut h, access, &oa, opts)
-        };
-        if st.0 < 0 { Err(st.0) } else { Ok(h) }
-    }
-}
-
 /// Read `OBJECT_ATTRIBUTES.{RootDirectory, ObjectName}` from
 /// target memory without resolving the root to a path string.
 fn read_target_oa_raw(target: HANDLE, oa_va: usize) -> Result<(u64, String)> {
@@ -1905,78 +1338,6 @@ fn read_target_oa_raw(target: HANDLE, oa_va: usize) -> Result<(u64, String)> {
     Ok((oa.root, leaf))
 }
 
-fn dup_from_target(target: HANDLE, raw: u64) -> Result<HANDLE> {
-    use windows::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS};
-    use windows::Win32::System::Threading::GetCurrentProcess;
-    unsafe {
-        let mut h = HANDLE::default();
-        DuplicateHandle(
-            target, HANDLE(raw as *mut c_void),
-            GetCurrentProcess(), &mut h, 0, false, DUPLICATE_SAME_ACCESS,
-        ).context("DuplicateHandle from target")?;
-        Ok(h)
-    }
-}
-
-/// Read `OBJECT_ATTRIBUTES.ObjectName` from target memory and
-/// return the NT path. For `RootDirectory`-relative opens,
-/// duplicates the root handle into the broker,
-/// `GetFinalPathNameByHandle`s it, and returns
-/// `\??\<root-dos-path>\<leaf>`.
-fn read_target_obj_path(target: HANDLE, oa_va: usize) -> Result<String> {
-    if oa_va == 0 { bail!("null OBJECT_ATTRIBUTES"); }
-    #[repr(C)] #[derive(Clone, Copy)]
-    struct ObjAttrs {
-        length: u32, _pad: u32, root: u64, name: u64,
-        attrs: u32, _pad2: u32, sd: u64, sqos: u64,
-    }
-    #[repr(C)] #[derive(Clone, Copy)]
-    struct UStr { len: u16, max: u16, _pad: u32, buf: u64 }
-    let oa: ObjAttrs = interception::read_remote(target, oa_va)?;
-    let leaf = if oa.name == 0 {
-        String::new()
-    } else {
-        let us: UStr = interception::read_remote(target, oa.name as usize)?;
-        if us.len > 32768 { bail!("ObjectName length {}", us.len); }
-        if us.len == 0 { String::new() }
-        else { interception::read_remote_wstr(target, us.buf as usize, us.len as usize)? }
-    };
-    if oa.root == 0 {
-        if leaf.is_empty() { bail!("null ObjectName"); }
-        return Ok(leaf);
-    }
-    // Relative open: resolve the root directory's path. The root
-    // handle was returned by an earlier brokered open, so it's a
-    // value the broker put in the target's table; dup it back.
-    use windows::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS};
-    use windows::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
-    use windows::Win32::System::Threading::GetCurrentProcess;
-    let root = unsafe {
-        let mut h = HANDLE::default();
-        DuplicateHandle(
-            target, HANDLE(oa.root as *mut c_void),
-            GetCurrentProcess(), &mut h, 0, false, DUPLICATE_SAME_ACCESS,
-        ).context("dup RootDirectory")?;
-        h
-    };
-    let mut buf = [0u16; 1024];
-    let n = unsafe {
-        GetFinalPathNameByHandleW(root, &mut buf,
-            windows::Win32::Storage::FileSystem::FILE_NAME_NORMALIZED)
-    };
-    unsafe { let _ = CloseHandle(root); }
-    if n == 0 || n as usize >= buf.len() {
-        bail!("GetFinalPathNameByHandle on RootDirectory");
-    }
-    // Returns `\\?\C:\…`; convert to `\??\C:\…\<leaf>`.
-    let dos = String::from_utf16_lossy(&buf[..n as usize]);
-    let dos = dos.strip_prefix(r"\\?\").unwrap_or(&dos);
-    if leaf.is_empty() {
-        Ok(format!(r"\??\{dos}"))
-    } else {
-        Ok(format!(r"\??\{dos}\{leaf}"))
-    }
-}
 
 /// Spawn `cmdline` under the same restricted+lowbox token + Job +
 /// initial-impersonation recipe used for the immediate target,
@@ -2012,41 +1373,13 @@ fn broker_spawn(
         0x00000020 | 0x00000040 | 0x00000080 | 0x00008000 |
         0x00000100 | 0x00100000; /* *_PRIORITY_CLASS */
     let fwd = PROCESS_CREATION_FLAGS(caller_flags & PASS_THROUGH);
-    // The loader runs under the lowbox initial token (must
-    // match the lowbox primary per SeTokenCanImpersonate), so it
-    // can only read directories ACL'd for ALL APPLICATION
-    // PACKAGES or the AC SID. Grant the AC SID + RESTRICTED on
-    // the exe's directory so static-import DLLs alongside it
-    // load. The grant is to a per-instance SID; the orphaned
-    // ACE is inert once the AC profile is deleted.
-    if let Some(app) = app {
-        if let Some(dir) = std::path::Path::new(app).parent() {
-            // `app` is sandboxed-caller-controlled. Gate the
-            // grant on the same policy that gates brokered
-            // reads so a confined process can't make the
-            // broker ACL an arbitrary directory by passing it
-            // as lpApplicationName. Only the AC SID is granted
-            // (per-instance, inert once the profile is
-            // deleted) — the loader runs under the *initial*
-            // token whose restricting list already includes
-            // the user SID, so the RESTRICTED grant isn't
-            // needed here and would persist on disk.
-            let nt = format!(r"\??\{}", dir.display());
-            use crate::policy_engine::Decision;
-            if matches!(ctx.fs.evaluate(&nt, 0x0001 /*FILE_READ_DATA*/),
-                        Decision::Allow)
-            {
-                let _ = crate::acl::grant_oneshot(
-                    &dir.to_string_lossy(), &ctx.ac_sid_string, READ_EXECUTE,
-                );
-            } else {
-                eprintln!(
-                    "[sbox-exec] broker_spawn: skip exe-dir grant on {} (policy deny)",
-                    dir.display(),
-                );
-            }
-        }
-    }
+    // D-4: the legacy exe-dir grant via icacls is gone (acl.rs
+    // deleted). The AC's loader reads static-import DLLs through
+    // the ALL-APP-PACKAGES inherited grant on system paths plus
+    // any allow_read ACL stamps the policy applies. Grandchild
+    // app dirs not covered by either fail to load — that's a
+    // policy hole the caller must close in their `allowRead` set.
+    let _ = app; // keep app available below; documents the drop above.
     unsafe {
         let mut cmd = wstr(cmdline);
         let app_w = app.map(wstr);
@@ -2329,14 +1662,31 @@ fn setup_bridge(
     ac: &AppContainer,
     job: &Job,
     desktop: Option<&AltDesktop>,
-    acls: &mut AclJournal,
     self_exe: &std::path::Path,
     http_port: u16,
     socks_port: Option<u16>,
 ) -> Result<(PROCESS_INFORMATION, Vec<u16>)> {
     let (sock_dir, needs_acl) = netbridge::socket_dir(&ac.folder);
     if needs_acl {
-        acls.grant(sock_dir.to_str().unwrap(), &ac.sid_string, MODIFY)?;
+        // D-4: AclJournal is gone; stamp the sock dir for the AC SID
+        // via a one-shot icacls call. The dir lives under the AC's
+        // profile folder which `DeleteAppContainerProfile` removes on
+        // exit, so the ACE doesn't outlive the AC.
+        let spec = format!("*{}:(OI)(CI)M", ac.sid_string);
+        let out = std::process::Command::new("icacls")
+            .arg(sock_dir.to_str().unwrap())
+            .arg("/grant")
+            .arg(&spec)
+            .output()
+            .context("icacls grant on sock_dir")?;
+        if !out.status.success() {
+            bail!(
+                "icacls grant {} {}: {}",
+                sock_dir.display(),
+                spec,
+                String::from_utf8_lossy(&out.stderr),
+            );
+        }
     }
     let http_sock = sock_dir.join("h.sock");
     let socks_sock = sock_dir.join("s.sock");

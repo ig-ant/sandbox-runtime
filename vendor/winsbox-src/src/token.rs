@@ -15,6 +15,7 @@ use anyhow::{Context, Result};
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use windows::Wdk::Foundation::OBJECT_ATTRIBUTES;
+#[allow(unused_imports)]
 use windows::Win32::Foundation::{CloseHandle, HANDLE, LUID, NTSTATUS};
 use windows::Win32::Security::{
     AllocateAndInitializeSid, CreateRestrictedToken, DuplicateTokenEx, FreeSid,

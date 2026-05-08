@@ -67,7 +67,6 @@ use windows::Win32::Foundation::{GetLastError, HANDLE};
 use windows::Win32::System::Diagnostics::Debug::{
     IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER,
 };
-use windows::Win32::System::Diagnostics::Debug::WriteProcessMemory;
 use windows::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress, LoadLibraryA};
 use windows::Win32::System::Memory::{
     VirtualAllocEx, VirtualProtectEx, MEM_COMMIT, MEM_RESERVE,

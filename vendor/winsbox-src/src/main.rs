@@ -1,7 +1,6 @@
 mod policy;
 #[cfg(windows)] mod util;
 #[cfg(windows)] mod appcontainer;
-#[cfg(windows)] mod acl;
 #[cfg(windows)] mod job;
 #[cfg(windows)] mod desktop;
 #[cfg(windows)] mod netbridge;
@@ -11,7 +10,6 @@ mod policy;
 #[cfg(all(windows, target_arch = "aarch64"))] mod interception_arm64;
 #[cfg(windows)] mod interception;
 #[cfg(windows)] mod entry_trampoline;
-#[cfg(windows)] mod policy_engine;
 #[cfg(windows)] mod cdylib_inject;
 #[cfg(windows)] mod manual_map;
 #[cfg(windows)] mod acl_stamper;

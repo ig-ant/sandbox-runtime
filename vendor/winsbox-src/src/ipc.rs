@@ -34,28 +34,22 @@ use windows::Win32::System::Threading::{
     CreateEventW, CreateMutexW, GetCurrentProcess, SetEvent, WaitForSingleObject,
 };
 
+// Op-codes for the cdylib hook bodies' IPC frames. The legacy
+// FS/Reg/Attr ops (NtCreateFile / NtOpenFile / NtQuery*Attributes /
+// NtOpenKey* / NtOpenSection) were dropped in D-4: ACL stamping
+// replaces broker-mediated FS/Reg policy, and `NtOpenSection`
+// returned only for namespace-redirect cases (kept here as
+// `OP_NTOPENSECTION`).
 pub const OP_CPW: u64 = 0;
-pub const OP_NTCREATEFILE: u64 = 1;
-pub const OP_NTOPENFILE: u64 = 2;
-pub const OP_NTOPENKEY: u64 = 3;
-pub const OP_NTOPENKEYEX: u64 = 4;
 pub const OP_NTOPENSECTION: u64 = 5;
-pub const OP_NTQUERYATTR: u64 = 6;
-pub const OP_NTQUERYFULLATTR: u64 = 7;
 pub const OP_NTCREATEDIROBJ: u64 = 8;
 pub const OP_NTOPENDIROBJ: u64 = 9;
 pub const OP_NTCREATENAMEDPIPE: u64 = 10;
 
-/// Section offset for the `NtQuery*AttributesFile` result
-/// struct (max 56 bytes = `FILE_NETWORK_OPEN_INFORMATION`).
-/// Past `Wire` (0x88).
-pub const ATTR_OFF: usize = 0x90;
-
-/// Sentinel `r_status` the broker returns when the FS stub
-/// should reload its spilled args and tail-jmp to the saved
-/// original syscall stub — i.e. let the *target* do the open
-/// under its own token. Used for `\Device\*` so AFD/ConDrv
-/// endpoints are created in the target's AppContainer.
+/// Sentinel `r_status` the broker returns when the cdylib hook
+/// should tail-call the saved-original syscall (the kernel handles
+/// the open natively) instead of returning the broker's reply.
+/// Used for `\Device\*` and any path the broker doesn't redirect.
 pub const FS_PASSTHROUGH: i32 = 0xE0000001u32 as i32;
 
 /// Section layout shared by every hook stub. The stub writes `op`
@@ -197,16 +191,6 @@ impl Channel {
         unsafe {
             (*self.view).r0 = handle;
             (*self.view).r1 = iosb_info;
-            (*self.view).r_status = status;
-            let _ = SetEvent(self.ev_resp);
-        }
-    }
-    /// Write the `NtQuery*AttributesFile` result struct into the
-    /// section at `ATTR_OFF` and reply with `status`.
-    pub fn reply_attr(&self, status: i32, attrs: &[u8; 56]) {
-        unsafe {
-            let dst = (self.view as *mut u8).add(ATTR_OFF);
-            std::ptr::copy_nonoverlapping(attrs.as_ptr(), dst, 56);
             (*self.view).r_status = status;
             let _ = SetEvent(self.ev_resp);
         }

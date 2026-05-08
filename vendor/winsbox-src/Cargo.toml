@@ -7,30 +7,20 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 default-run = "sbox-exec"
+# D-4: src/bin/* are vestigial probe binaries that depended on the
+# deleted acl.rs module. Disable cargo auto-discovery; the kept
+# binaries are listed explicitly via [[bin]] below.
+autobins = false
 
 [[bin]]
 name = "sbox-exec"
 path = "src/main.rs"
 
-[[bin]]
-name = "p10-grandchild"
-path = "src/bin/p10_grandchild.rs"
-
-[[bin]]
-name = "p11-lsa"
-path = "src/bin/p11_lsa.rs"
-
-[[bin]]
-name = "p12-lockdown"
-path = "src/bin/p12_lockdown.rs"
-
-[[bin]]
-name = "p13-cygwin-ac"
-path = "src/bin/p13_cygwin_ac.rs"
-
-[[bin]]
-name = "spike-inject"
-path = "src/bin/spike_inject.rs"
+# Phase D-4: probe binaries (`p10`/`p11`/`p12`/`p13`/`spike-inject`)
+# were diagnostic tools that depended on the legacy `acl.rs` module.
+# Their findings are recorded in commit messages + `cheeky-jingling-stream.md`;
+# the source files stay in `src/bin/` for future ad-hoc reuse but
+# are no longer part of the build.
 
 [dependencies]
 anyhow = "1"

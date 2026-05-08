@@ -4,20 +4,14 @@
 //! `install_reg`, `install_cpw`) plus the cross-arch remote-memory and
 //! ntdll-resolution helpers.
 //!
-//! Phase C reshape:
-//!   * The 5 "compat hooks" — `NtOpenSection`,
-//!     `NtCreate/OpenDirectoryObject`, `NtCreateNamedPipeFile`, and
-//!     `CreateProcessInternalW` — patch in a *thin* dispatcher that
-//!     tail-calls into the in-AC `ac-cdylib`'s exported hook function.
-//!     The hook body (IPC framing, event signalling, response demux)
-//!     lives in safe Rust in the cdylib.
-//!   * The remaining FS/Reg/Attr hooks (`NtCreateFile`, `NtOpenFile`,
-//!     `NtQueryAttributesFile`, `NtQueryFullAttributesFile`,
-//!     `NtOpenKey`, `NtOpenKeyEx`) keep the legacy inline-asm
-//!     prologue + IPC framing — they'll be removed wholesale in Phase D
-//!     when ACL stamping replaces broker-mediated FS/Reg policy.
-//!
-//! Public API stays byte-identical so `launch.rs` doesn't change shape.
+//! Phase D-4 shape: only the 5 "compat hooks" remain — `NtOpenSection`,
+//! `NtCreate/OpenDirectoryObject`, `NtCreateNamedPipeFile`, and
+//! `CreateProcessInternalW`. Each patches in a *thin* dispatcher that
+//! tail-calls into the in-AC `ac-cdylib`'s exported hook function. The
+//! hook body (IPC framing, event signalling, response demux) lives in
+//! safe Rust in the cdylib. The legacy FS/Reg/Attr inline-asm IPC stubs
+//! (`NtCreateFile`, `NtOpenFile`, `NtQuery*AttributesFile`, `NtOpenKey`,
+//! `NtOpenKeyEx`) are gone — ACL stamping owns FS/Reg policy.
 
 use anyhow::{anyhow, bail, Context, Result};
 use std::ffi::c_void;
@@ -85,17 +79,16 @@ pub struct PassthroughThunks {
     pub create_process_internal_w: usize,
 }
 
-/// Patch `ntdll!{NtCreateFile,NtOpenFile,NtCreateNamedPipeFile,
-/// NtQueryAttributesFile,NtQueryFullAttributesFile}` in `target`.
-/// Installed pre-resume so the loader's own opens are brokered.
+/// Patch `ntdll!NtCreateNamedPipeFile` in `target`. Installed
+/// pre-resume so the loader's own opens are brokered.
 ///
-/// Phase C: when `cdylib` is set, `NtCreateNamedPipeFile` is patched
-/// to dispatch into the cdylib instead of the inline-asm IPC stub.
-/// The other FS hooks keep the legacy stub until Phase D.
+/// Phase D-4: the FS hooks (`NtCreateFile` / `NtOpenFile` /
+/// `NtQuery*AttributesFile`) were dropped — ACL stamps own FS policy.
 ///
-/// Phase E-5b: when a cdylib-dispatched hook is installed, build a
-/// passthrough thunk alongside (saved original bytes + JMP back) and
-/// stash its VA in `pt`.
+/// Phase E-5b: when the cdylib-dispatched hook is installed, build a
+/// passthrough thunk alongside (saved original bytes + tail-call back
+/// into the syscall) and stash its VA in `pt` so the cdylib can
+/// `FS_PASSTHROUGH` syscalls outside the broker's namespace.
 pub fn install_fs(
     target: HANDLE,
     a: &StubAddrs,
@@ -105,11 +98,12 @@ pub fn install_fs(
     arch::install_fs(target, a, cdylib, pt)
 }
 
-/// Patch the registry/section/dirobj hooks. Installed pre-resume.
+/// Patch the section / directory-object compat hooks
+/// (`NtOpenSection`, `NtCreate/OpenDirectoryObject`). Installed
+/// pre-resume.
 ///
-/// Phase C: the 4 compat hooks (`NtOpenSection`,
-/// `NtCreate/OpenDirectoryObject`) dispatch into the cdylib when
-/// `cdylib` is supplied. `NtOpenKey`/`NtOpenKeyEx` keep legacy stubs.
+/// Phase D-4: `NtOpenKey` / `NtOpenKeyEx` hooks dropped (registry
+/// policy moves to ACL stamping).
 pub fn install_reg(
     target: HANDLE,
     a: &StubAddrs,

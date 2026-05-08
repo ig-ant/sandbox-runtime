@@ -7,15 +7,21 @@
 //! (`kernelbase!CreateProcessInternalW`). PoC P7 validated the
 //! mechanism; this is the productionised x64 version.
 
+#[allow(unused_imports)]
 use crate::interception::{alloc_remote_rx, ntdll_export};
+#[allow(unused_imports)]
 use crate::ipc::dup_into;
 #[allow(unused_imports)] use anyhow::{bail, Context, Result};
+#[allow(unused_imports)]
 use std::mem::size_of;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
+#[allow(unused_imports)]
 use windows::Win32::Security::SECURITY_ATTRIBUTES;
+#[allow(unused_imports)]
 use windows::Win32::System::Diagnostics::Debug::{
     GetThreadContext, SetThreadContext, CONTEXT, CONTEXT_FULL_AMD64,
 };
+#[allow(unused_imports)]
 use windows::Win32::System::Threading::{
     CreateEventW, SetEvent, WaitForSingleObject, INFINITE,
 };
