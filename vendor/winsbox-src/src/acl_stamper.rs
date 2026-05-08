@@ -147,6 +147,28 @@ enum ApplyOutcome {
 /// — and admin-protected dirs we can't write to anyway.
 const ALL_APP_PACKAGES_SID: &str = "S-1-15-2-1";
 
+/// Well-known "restricted code" SID. The broker's USER_LIMITED lockdown
+/// token is a **restricted** token whose restricting-SID list is
+/// `[Everyone, AuthUsers, Users, Logon, RESTRICTED]` (see
+/// `token.rs::make_lockdown_with`). On a restricted token every access
+/// check has *two* passes: the normal one against the token's groups
+/// (where the AC SID lives — our explicit ALLOW grants pass this), AND
+/// a second one against the restricting-SID set. Both must succeed.
+///
+/// User-tree paths under `%TEMP%` only inherit `Everyone:RX` / `Users:RX`
+/// (read+execute, no write); the user's own SID is not in the restricting
+/// list. So a write to an `allow_write` path under `%TEMP%` passes the
+/// AC-SID check but fails the restricting-SID check — manifesting as
+/// `Access is denied` even though icacls shows the AC's `(M)` ACE.
+///
+/// Granting `RESTRICTED` (`S-1-5-12`) at the same mask as the AC SID
+/// lets the restricting-SID pass succeed for any path we explicitly
+/// stamp. RESTRICTED isn't on any normal user/group token, so this ALLOW
+/// is invisible to anything other than restricted tokens — i.e., it
+/// doesn't widen access for the broker, regular processes, or the
+/// non-AC user.
+const RESTRICTED_CODE_SID: &str = "S-1-5-12";
+
 impl PolicyStamp {
     /// Apply against an AC SID. Idempotent: any root whose existing DACL
     /// already contains our exact ACE *and* whose probe leaf inherits it
@@ -170,6 +192,54 @@ impl PolicyStamp {
         // and we skip it. DENY paths below skip this probe — even
         // an existing ALL-APP-PACKAGES ALLOW means we DO need an
         // explicit DENY to override.
+        //
+        // Phase L follow-up: the broker's USER_LIMITED lockdown token is
+        // a *restricted* token (`token.rs::make_lockdown_with`) whose
+        // restricting-SID list = `[Everyone, AuthUsers, Users, Logon,
+        // RESTRICTED]`. Restricted-token access checks require BOTH the
+        // normal-SID pass *and* the restricting-SID pass to succeed.
+        // The AC SID's ALLOW grant satisfies the normal-SID pass — but
+        // fixture paths under `%TEMP%` only inherit `Everyone:RX` /
+        // `Users:RX`, so the restricting-SID pass *fails* on any write
+        // (and on reads to dirs that don't already have inherited RX
+        // for those well-known groups). Stamping `RESTRICTED` (S-1-5-12)
+        // alongside the AC SID's stamp gives the restricting-SID pass a
+        // matching grant, unblocking writes/reads on user-tree paths.
+        // RESTRICTED isn't on any normal token, so granting it doesn't
+        // widen access for non-restricted callers (broker, etc.).
+        let restricted_sid_owned = psid_from_string(RESTRICTED_CODE_SID).ok();
+        let _restricted_guard = restricted_sid_owned.map(SidGuard);
+        let restricted_sid = restricted_sid_owned.unwrap_or(PSID::default());
+
+        let apply_allow = |p: &Path, kind: &'static str, mask: u32, stats: &mut StampStats| {
+            // Helper closure: stamp `(p, sid, mask, GRANT)` and bump
+            // stats. Used twice per allow path — once for the AC SID and
+            // once for the RESTRICTED SID — so both passes of the
+            // restricted-token access check succeed.
+            let mut do_stamp = |sid: PSID, sid_label: &str| {
+                let op = StampOp { path: p.to_path_buf(), kind, mask, mode: GRANT_ACCESS };
+                match apply_one(&op, sid) {
+                    Ok(ApplyOutcome::Stamped) => stats.roots_stamped += 1,
+                    Ok(ApplyOutcome::SkippedIdempotent) => stats.roots_skipped_idempotent += 1,
+                    Ok(ApplyOutcome::SoftFailedAccessDenied) => {
+                        stats.roots_soft_failed_access_denied += 1;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[acl_stamper] WARN apply_one({kind}, sid={sid_label}, {:?}) \
+                             failed: {e:#}; continuing",
+                            p,
+                        );
+                        stats.roots_soft_failed_other += 1;
+                    }
+                }
+            };
+            do_stamp(ac_sid, "ac");
+            if !restricted_sid.0.is_null() {
+                do_stamp(restricted_sid, "RESTRICTED");
+            }
+        };
+
         for p in &self.allow_read {
             if excluded(p) {
                 continue;
@@ -182,31 +252,7 @@ impl PolicyStamp {
                 stats.roots_skipped_already_accessible += 1;
                 continue;
             }
-            let op = StampOp {
-                path: p.clone(),
-                kind: "allow_read",
-                mask: read_mask(),
-                mode: GRANT_ACCESS,
-            };
-            match apply_one(&op, ac_sid) {
-                Ok(ApplyOutcome::Stamped) => stats.roots_stamped += 1,
-                Ok(ApplyOutcome::SkippedIdempotent) => stats.roots_skipped_idempotent += 1,
-                Ok(ApplyOutcome::SoftFailedAccessDenied) => {
-                    stats.roots_soft_failed_access_denied += 1;
-                }
-                Err(e) => {
-                    // Don't abort the whole apply pass on a single bad
-                    // path — a malformed allow_read entry must not strand
-                    // us with NO ACL enforcement (which would let DENY
-                    // stamps below silently no-op too).
-                    eprintln!(
-                        "[acl_stamper] WARN apply_one(allow_read, {:?}) failed: {e:#}; \
-                         continuing",
-                        p,
-                    );
-                    stats.roots_soft_failed_other += 1;
-                }
-            }
+            apply_allow(p, "allow_read", read_mask(), &mut stats);
         }
         for p in &self.allow_write {
             if excluded(p) {
@@ -220,33 +266,7 @@ impl PolicyStamp {
                 stats.roots_skipped_already_accessible += 1;
                 continue;
             }
-            let op = StampOp {
-                path: p.clone(),
-                kind: "allow_write",
-                mask: write_mask(),
-                mode: GRANT_ACCESS,
-            };
-            match apply_one(&op, ac_sid) {
-                Ok(ApplyOutcome::Stamped) => stats.roots_stamped += 1,
-                Ok(ApplyOutcome::SkippedIdempotent) => stats.roots_skipped_idempotent += 1,
-                Ok(ApplyOutcome::SoftFailedAccessDenied) => {
-                    stats.roots_soft_failed_access_denied += 1;
-                }
-                Err(e) => {
-                    // Common failure: `Y:\NUL`/`Y:\CON` from
-                    // getDefaultWritePaths() don't exist on disk →
-                    // GetNamedSecurityInfoW returns ERROR_FILE_NOT_FOUND.
-                    // Pre-fix this would abort the whole apply, leaving
-                    // the AC with no ALLOW *or* DENY ACEs and the inherited
-                    // Everyone:RX from system paths winning every check.
-                    eprintln!(
-                        "[acl_stamper] WARN apply_one(allow_write, {:?}) failed: {e:#}; \
-                         continuing",
-                        p,
-                    );
-                    stats.roots_soft_failed_other += 1;
-                }
-            }
+            apply_allow(p, "allow_write", write_mask(), &mut stats);
         }
 
         // 2. DENY stamps — only when nested under an ALLOW.
@@ -398,8 +418,26 @@ impl PolicyStamp {
         roots.sort();
         roots.dedup();
 
-        for p in roots {
-            let _ = remove_aces_for_sid(&p, ac_sid);
+        for p in &roots {
+            let _ = remove_aces_for_sid(p, ac_sid);
+        }
+
+        // Phase L follow-up cleanup: strip the explicit ALLOW ACEs we
+        // added against `RESTRICTED` (S-1-5-12) on allow paths so the
+        // grant doesn't outlive the AC. Scoped to ALLOW-type ACEs only
+        // so any pre-existing DENY for the same SID (unlikely but
+        // possible) stays put. Best-effort like the AC-SID strip above.
+        let allow_paths: Vec<&PathBuf> =
+            self.allow_read.iter().chain(self.allow_write.iter()).collect();
+        if !allow_paths.is_empty() {
+            if let Ok(restricted_sid) = psid_from_string(RESTRICTED_CODE_SID) {
+                let _g = SidGuard(restricted_sid);
+                for p in allow_paths {
+                    let _ = remove_aces_for_sid_typed(
+                        p, restricted_sid, Some(ACCESS_ALLOWED_ACE_TYPE),
+                    );
+                }
+            }
         }
 
         // Phase E-3 cleanup: strip the well-known-SID DENY ACEs we added
@@ -1086,13 +1124,17 @@ mod tests {
             ..Default::default()
         };
 
+        // Each allow path now stamps twice: once for the AC SID and
+        // once for `RESTRICTED` (S-1-5-12) so that restricted-token
+        // access checks pass on both the normal- and restricting-SID
+        // passes (see the comment block in `apply`).
         let s1 = policy.apply(sid).unwrap();
-        assert_eq!(s1.roots_stamped, 1, "first apply should stamp");
+        assert_eq!(s1.roots_stamped, 2, "first apply should stamp AC + RESTRICTED");
         assert_eq!(s1.roots_skipped_idempotent, 0);
 
         let s2 = policy.apply(sid).unwrap();
         assert_eq!(s2.roots_stamped, 0, "second apply should be a no-op");
-        assert_eq!(s2.roots_skipped_idempotent, 1);
+        assert_eq!(s2.roots_skipped_idempotent, 2, "both ACEs should be idempotent");
 
         policy.revert(sid).unwrap();
         free_psid(sid);

@@ -364,25 +364,36 @@ fn run_confined(pol: &Policy, manifest_dir: &std::path::Path) -> Result<u32> {
 ///
 /// Phase G semantics: with stable AC SIDs, the manifest-cache-hit fast
 /// path *requires* the FS-level ACEs to persist between runs — reverting
-/// them on every Drop would defeat the warm-restart goal. So:
+/// them on every Drop would defeat the warm-restart goal AND break
+/// successive runs whose hash matches the cache (they'd skip the apply
+/// pass and find the ACEs gone).
 ///
-///   * `applied = true`  → we just stamped fresh ACEs this run; on Drop,
-///     revert them. (Cold start or policy-changed re-apply.)
-///   * `applied = false` → we hit the manifest cache; the ACEs predate
-///     this run. On Drop, leave them alone.
-///
-/// The `DeleteAppContainerProfile` call on `AppContainer::Drop` no longer
-/// matches the SID's lifetime either — the SID is deterministic from
-/// the profile *name* (which is stable), so future runs reuse it. Old
-/// ACEs are still ours.
+/// We track `applied` purely for the optional revert-on-error path:
+/// if a *partial* apply panics mid-walk, the Drop strips whatever we
+/// did install so the manifest's recorded hash continues to match an
+/// empty / pre-existing on-disk state. On the success path the
+/// manifest write happens AFTER the full apply succeeds, and the
+/// caller's `mem::forget`-equivalent (`disarm_revert`) prevents Drop
+/// from stripping the ACEs we just persisted.
 struct StampHolder {
     stamp: PolicyStamp,
     sid_owned: windows::Win32::Security::PSID,
-    applied: bool,
+    /// When true, Drop reverts the ACEs we installed this run. Set to
+    /// false after the manifest has been saved successfully — the ACEs
+    /// are now persistent state that future cache-hit runs depend on.
+    revert_on_drop: bool,
+}
+impl StampHolder {
+    /// Mark the stamps as persisted; Drop will leave the ACEs alone.
+    /// Called after a successful manifest save so future cache-hit
+    /// runs find the ACEs still on disk.
+    fn disarm_revert(&mut self) {
+        self.revert_on_drop = false;
+    }
 }
 impl Drop for StampHolder {
     fn drop(&mut self) {
-        if self.applied {
+        if self.revert_on_drop {
             if let Err(e) = self.stamp.revert(self.sid_owned) {
                 eprintln!("[sbox-exec] policy-stamp revert: {e:#}");
             }
@@ -435,9 +446,8 @@ fn maybe_apply_stamps(
     match store.load(&ac.sid_string) {
         Ok(Some(prev)) if !store.diff(&prev, want_hash) => {
             log!("policy-stamp: hash unchanged ({:#x}); skipping apply", want_hash);
-            // applied=false → do NOT revert on Drop (Phase G: the ACEs
-            // are from a previous run and persist between sessions).
-            return Ok(StampHolder { stamp, sid_owned, applied: false });
+            // No fresh apply this run → nothing to revert on Drop.
+            return Ok(StampHolder { stamp, sid_owned, revert_on_drop: false });
         }
         Ok(Some(prev)) => log!(
             "policy-stamp: hash {:#x} → {:#x} (re-applying)",
@@ -464,18 +474,31 @@ fn maybe_apply_stamps(
         stats.elapsed_ms,
     );
 
-    let manifest = crate::stamp_manifest::StampManifest::from_policy(
-        ac.sid_string.clone(), &stamp,
-    );
-    if let Err(e) = store.save(&manifest) {
-        log!("policy-stamp: manifest save failed ({e:#}); next run will re-apply");
-    }
+    // Construct the holder armed for revert; if anything between here
+    // and the manifest save panics (or we early-return on a failure),
+    // Drop strips the ACEs we just installed so the on-disk state
+    // matches the (still-old) manifest. After a successful save we
+    // disarm the holder — the ACEs are now persistent state that the
+    // next cache-hit run depends on (Phase G warm restart).
+    let mut holder = StampHolder { stamp, sid_owned, revert_on_drop: true };
 
-    // applied=true → freshly stamped this run; revert on Drop so a
-    // policy change between runs cleanly removes the previous shape's
-    // ACEs (a hash mismatch on the next run will re-apply with the new
-    // shape, but only after the prior shape's ACEs are gone).
-    Ok(StampHolder { stamp, sid_owned, applied: true })
+    let manifest = crate::stamp_manifest::StampManifest::from_policy(
+        ac.sid_string.clone(), &holder.stamp,
+    );
+    match store.save(&manifest) {
+        Ok(()) => {
+            // Stamps + manifest are both persistent now. Don't revert
+            // on Drop — the next run will hash-match and skip apply.
+            holder.disarm_revert();
+        }
+        Err(e) => {
+            log!("policy-stamp: manifest save failed ({e:#}); next run will re-apply");
+            // Leave the holder armed: if the broker exits before the
+            // next attempt at save, Drop strips the orphan ACEs so the
+            // old manifest stays consistent with on-disk state.
+        }
+    }
+    Ok(holder)
 }
 
 /// Phase-D return value: everything `run_confined` needs to keep
