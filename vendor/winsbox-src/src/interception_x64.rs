@@ -89,16 +89,19 @@ pub fn install_reg(
                         &emit_handle_stub(&env, op, n_args, saved as u64))?;
     }
     // Compat hooks: Phase C dispatches into cdylib.
+    // Closures captured into an array slot must share a type; none of
+    // these capture anything, so coerce each to a `fn` pointer.
+    type GetVa = fn(&CdylibHookEntries) -> usize;
     for (name, _op, get_va) in [
         ("NtOpenSection",
          crate::ipc::OP_NTOPENSECTION,
-         |c: &CdylibHookEntries| c.nt_open_section),
+         (|c: &CdylibHookEntries| c.nt_open_section) as GetVa),
         ("NtCreateDirectoryObject",
          crate::ipc::OP_NTCREATEDIROBJ,
-         |c: &CdylibHookEntries| c.nt_create_directory_object),
+         (|c: &CdylibHookEntries| c.nt_create_directory_object) as GetVa),
         ("NtOpenDirectoryObject",
          crate::ipc::OP_NTOPENDIROBJ,
-         |c: &CdylibHookEntries| c.nt_open_directory_object),
+         (|c: &CdylibHookEntries| c.nt_open_directory_object) as GetVa),
     ] {
         let va = ntdll_export(name)?;
         if let Some(c) = cdylib.filter(|c| get_va(c) != 0) {
