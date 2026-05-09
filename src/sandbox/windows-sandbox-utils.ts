@@ -124,6 +124,20 @@ function envPairs(
   // expansion inside user commands works regardless of how the
   // broker's own env was sourced.
   pairs.push(['SystemRoot', systemRoot], ['windir', systemRoot])
+
+  // Forward home-locator vars. Without these, git on Windows can't
+  // find `~/.gitconfig` and exits 0x80 ("fatal: ...") at startup;
+  // similar story for any tool that reads dotfiles. Forwarding them
+  // alone isn't sufficient when the resolved home directory is
+  // outside `allowRead` (the AC's stat() returns ACCESS_DENIED, also
+  // fatal) — callers that need git to actually use a config should
+  // either include the home dir in `allowRead` or override `HOME` to
+  // a path inside `allowWrite`. Forwarding here at least gives the
+  // tool the information it needs to attempt the lookup.
+  for (const k of ['USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'HOME']) {
+    const v = process.env[k]
+    if (v) pairs.push([k, v])
+  }
   return pairs
 }
 
