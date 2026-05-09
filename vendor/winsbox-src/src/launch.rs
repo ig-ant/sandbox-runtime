@@ -2026,16 +2026,65 @@ fn inject_cdylib_into_grandchild(
 
     let t0 = std::time::Instant::now();
 
-    // ── 1. IPC channel for this grandchild.
-    let ch = ipc::Channel::create(target_proc)
-        .context("ipc::Channel::create (grandchild)")?;
+    // ── 0b. Dup the grandchild's process HANDLE up-front so the
+    //        long-lived `Channel` and `serve_ipc` thread don't capture
+    //        the caller-owned `target_proc` value. `handle_cpw` (our
+    //        only caller) closes its `child.hProcess` (== `target_proc`)
+    //        as soon as we return; the channel needs a HANDLE that
+    //        outlives that close so `ch.dup_to_target(...)` still works
+    //        when the great-grandchild path fires later.
+    //
+    //        Pre-fix: we created `ch` against `target_proc` and only
+    //        dup'd later for `serve_ipc`'s `target` argument. `Channel`
+    //        cached `target_proc` in `self.target`; once `handle_cpw`
+    //        closed that handle, every subsequent
+    //        `DuplicateHandle(..., self.target, ...)` failed with
+    //        ERROR_INVALID_HANDLE. The depth-1 child's PI hProcess/hThread
+    //        write to the wrapper therefore came back as 0/0 (`unwrap_or(0)`),
+    //        and the wrapper's `GetExitCodeProcess(NULL)` failed —
+    //        observed as Git-for-Windows `cmd/git.exe` printing
+    //        "error reading exit code: The handle is invalid." and
+    //        exiting 1. We reuse `owned_target` for both ch.target and
+    //        serve_ipc's target, closed exactly once on serve_ipc exit.
+    let owned_target = unsafe {
+        use windows::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS};
+        use windows::Win32::System::Threading::GetCurrentProcess;
+        let mut out = HANDLE::default();
+        DuplicateHandle(
+            GetCurrentProcess(), target_proc, GetCurrentProcess(), &mut out,
+            0, false, DUPLICATE_SAME_ACCESS,
+        ).context("DuplicateHandle(target_proc) for grandchild ch+serve_ipc")?;
+        out
+    };
+
+    // ── 1. IPC channel for this grandchild. Bind it to `owned_target`
+    //       (NOT `target_proc`); see comment above for why. The
+    //       synchronous setup steps (manual_map, install_*, prefill_*)
+    //       still use `target_proc` since they execute before
+    //       `handle_cpw` closes it.
+    let ch = match ipc::Channel::create(owned_target) {
+        Ok(c) => c,
+        Err(e) => {
+            unsafe { let _ = CloseHandle(owned_target); }
+            return Err(e.context("ipc::Channel::create (grandchild)"));
+        }
+    };
     let stub_addrs = ch.stub_env_snapshot();
+
+    // Bail helper: every pre-serve_ipc error path needs to free both
+    // the channel and the broker-side `owned_target` HANDLE (it has
+    // not yet been moved into the serve_ipc thread). `Channel::drop`
+    // does NOT close `target`, so we close it explicitly here.
+    let bail_close = |ch: ipc::Channel| unsafe {
+        drop(ch);
+        let _ = CloseHandle(owned_target);
+    };
 
     // ── 2. Manual-map the cdylib.
     let mapped = match crate::manual_map::manual_map_cdylib(target_proc, dll_canon) {
         Ok(m) => m,
         Err(e) => {
-            drop(ch);
+            bail_close(ch);
             return Err(e.context("manual_map_cdylib (grandchild)"));
         }
     };
@@ -2055,27 +2104,27 @@ fn inject_cdylib_into_grandchild(
     };
     let mut pt = interception::PassthroughThunks::default();
     if let Err(e) = interception::install_fs(target_proc, &stub_addrs, Some(&entries), &mut pt) {
-        drop(ch);
+        bail_close(ch);
         return Err(e.context("install_fs (grandchild)"));
     }
     if let Err(e) = interception::install_reg(target_proc, &stub_addrs, Some(&entries), &mut pt) {
-        drop(ch);
+        bail_close(ch);
         return Err(e.context("install_reg (grandchild)"));
     }
     if let Err(e) = interception::install_denylog(target_proc, Some(&entries), &mut pt) {
-        drop(ch);
+        bail_close(ch);
         return Err(e.context("install_denylog (grandchild)"));
     }
 
     // ── 4. Pre-fill IPC.
     if let Err(e) = crate::manual_map::prefill_ipc(target_proc, mapped.ipc_va, &stub_addrs, &pt) {
-        drop(ch);
+        bail_close(ch);
         return Err(e.context("prefill_ipc (grandchild)"));
     }
     if let Err(e) = crate::manual_map::prefill_denylog_passthroughs(
         target_proc, mapped.ipc_va, pt.nt_create_file_denylog, pt.nt_open_file_denylog,
     ) {
-        drop(ch);
+        bail_close(ch);
         return Err(e.context("prefill_denylog_passthroughs (grandchild)"));
     }
 
@@ -2117,23 +2166,12 @@ fn inject_cdylib_into_grandchild(
         host_machine: parent_ctx.host_machine,
         ac_sid_string: parent_ctx.ac_sid_string.clone(),
     });
-    // Phase N-2 Part B: dup the grandchild's process HANDLE so the
-    // grandchild's serve_ipc thread owns a handle that outlives the
-    // caller's. handle_cpw closes its `child.hProcess` after
-    // inject_cdylib_into_grandchild returns; without dup, the
-    // grandchild's serve_ipc would be left holding an invalid HANDLE
-    // value and read_target_oa_raw / dup_to_target / etc. would fail
-    // with ERROR_INVALID_HANDLE.
-    let owned_target = unsafe {
-        use windows::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS};
-        use windows::Win32::System::Threading::GetCurrentProcess;
-        let mut out = HANDLE::default();
-        DuplicateHandle(
-            GetCurrentProcess(), target_proc, GetCurrentProcess(), &mut out,
-            0, false, DUPLICATE_SAME_ACCESS,
-        ).context("DuplicateHandle(target_proc) for grandchild serve_ipc")?
-        ; out
-    };
+    // Phase N-2 Part B: `owned_target` (dup'd at the top) is the
+    // long-lived HANDLE shared between `ch.target` (used by the
+    // serve_ipc loop's `dup_to_target`) and the `target` parameter
+    // we pass into `serve_ipc` itself. We pass it as `isize` since
+    // raw `HANDLE` is not `Send`; the serve_ipc tail closes it
+    // exactly once after the grandchild's subtree winds down.
     let target_raw = owned_target.0 as isize;
     let ctx_thread = gc_ctx.clone();
     let h = std::thread::spawn(move || {
@@ -2146,6 +2184,8 @@ fn inject_cdylib_into_grandchild(
             let _ = jh.join();
         }
         // Drop the owned target handle now that no one needs it.
+        // `Channel::drop` (run when serve_ipc returns) closes the
+        // section/events but NOT `target`; we own that close here.
         unsafe { let _ = CloseHandle(HANDLE(target_raw as *mut c_void)); }
     });
     parent_ctx.threads.lock().unwrap().push(h);
