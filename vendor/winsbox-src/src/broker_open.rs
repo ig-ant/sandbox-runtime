@@ -236,6 +236,53 @@ const RESERVED_DOS_DEVICES: &[&str] = &[
     "nul", "con", "prn", "aux",
 ];
 
+/// Read-only kernel devices we let through the broker. These are
+/// system-wide devices (not per-process like `nul`) but are
+/// effectively read-only from a normal user-mode process: write
+/// IOCTLs require admin privileges (`SeManageVolumePrivilege` or the
+/// like) that the broker's user token doesn't carry under the test
+/// runner, and the AC token gets a handle whose `GrantedAccess` mask
+/// only covers read bits, so subsequent IOCTLs are filtered at the
+/// kernel. Brokering reads on these devices lets MinGW/Cygwin tools
+/// (git, bash, sh) canonicalize paths and enumerate mount points
+/// instead of failing on `STATUS_ACCESS_DENIED`.
+///
+/// `MountPointManager` (`\Device\MountPointManager`, accessible as
+/// `\??\MountPointManager`): used by Win32 path-canonicalization to
+/// translate volume-GUID paths ↔ drive letters, and by msys2/cygwin
+/// `mount` enumeration. `git --version` opens it on Git for Windows
+/// during locale detection; without read access the canonicalization
+/// path returns `STATUS_ACCESS_DENIED` and some tool versions surface
+/// it as a fatal error.
+///
+/// Threat model: read IOCTLs only enumerate mount metadata that any
+/// authenticated user can already see via `mountvol` / `Get-Volume`.
+/// They don't expose file contents, ACLs, or arbitrary kernel state.
+/// A broker-mediated open with `FILE_READ_ATTRIBUTES | SYNCHRONIZE`
+/// (the typical access mask we observe from git) gives the AC a
+/// handle that can only be used for read IOCTLs; write IOCTLs like
+/// `IOCTL_MOUNTMGR_CREATE_POINT` are gated on the granted access.
+///
+/// Comparison is case-insensitive against the **whole normalised
+/// path** (not just the leaf), since these device names don't have
+/// drive-letter prefixes after [`normalize_nt_path`].
+const READ_ONLY_KERNEL_DEVICES: &[&str] = &[
+    "mountpointmanager",
+];
+
+/// Whether `path` (already passed through [`normalize_nt_path`]) is
+/// one of the read-only kernel devices the broker permits. Exposed
+/// for the broker's `NtCreateFile` re-issue path: kernel devices
+/// like `\??\MountPointManager` deny the loader-style
+/// `desired_access | GENERIC_READ` widening (the device's ACL only
+/// grants `FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY` to standard
+/// users), so the broker uses the caller's exact access mask
+/// instead of widening when this returns true.
+pub fn is_read_only_kernel_device(path: &str) -> bool {
+    let lc = path.to_ascii_lowercase();
+    READ_ONLY_KERNEL_DEVICES.contains(&lc.as_str())
+}
+
 /// Run the policy check against a normalised DOS path. The caller is
 /// responsible for stripping the NT-namespace prefix first via
 /// [`normalize_nt_path`].
@@ -256,6 +303,20 @@ pub fn is_path_allowed_for_broker_open(
     let leaf = path_lc.rsplit(['\\', '/']).next().unwrap_or(&path_lc);
     let leaf_base = leaf.split(['.', ':']).next().unwrap_or(leaf);
     if RESERVED_DOS_DEVICES.contains(&leaf_base) {
+        return Decision::Allow;
+    }
+
+    // Phase N-7 (CI fix): read-only kernel devices. These are system
+    // devices like `MountPointManager` used by MinGW/Cygwin tools for
+    // path canonicalization. Allowed only for read access — write
+    // bits route to the standard reject path so a malicious AC can't
+    // dispatch privileged IOCTLs through the broker handle. The
+    // device names lack drive-letter prefixes after `normalize_nt_
+    // path` strips `\??\`, so we compare against the whole normalised
+    // path rather than the leaf (avoids confusing
+    // `C:\some\path\MountPointManager` — a real-FS file — with the
+    // kernel device).
+    if !want_write && is_read_only_kernel_device(path) {
         return Decision::Allow;
     }
 
@@ -602,5 +663,90 @@ mod tests {
             r"C:\nul\actually-a-file", 0x0001, &pl,
         );
         assert_eq!(d, Decision::Reject(RejectReason::NotInAllowList));
+    }
+
+    /// Phase N-7: `MountPointManager` is a read-only kernel device
+    /// used by MinGW/Cygwin git for path canonicalization. The
+    /// broker grants reads on it — both lowercase and the case
+    /// Win32 callers actually pass — but rejects writes.
+    #[test]
+    fn read_only_kernel_devices_allow_reads() {
+        let pl = lists();
+        // `\??\MountPointManager` normalises to `MountPointManager`.
+        let d = is_path_allowed_for_broker_open(
+            "MountPointManager", 0x0001 /* FILE_READ_DATA */, &pl,
+        );
+        assert_eq!(d, Decision::Allow);
+        // The actual access mask `git --version` requests:
+        //   FILE_READ_ATTRIBUTES (0x80) | SYNCHRONIZE (0x100000)
+        let d = is_path_allowed_for_broker_open(
+            "MountPointManager", 0x100080, &pl,
+        );
+        assert_eq!(d, Decision::Allow);
+        // Case-insensitive.
+        let d = is_path_allowed_for_broker_open(
+            "mountpointmanager", 0x0001, &pl,
+        );
+        assert_eq!(d, Decision::Allow);
+        let d = is_path_allowed_for_broker_open(
+            "MOUNTPOINTMANAGER", 0x0001, &pl,
+        );
+        assert_eq!(d, Decision::Allow);
+    }
+
+    /// Writes to a read-only kernel device are rejected. Even though
+    /// the kernel would itself filter privileged IOCTLs based on the
+    /// granted access mask, we reject at the broker so a misbehaving
+    /// AC can't ever obtain a write handle to the device.
+    #[test]
+    fn read_only_kernel_devices_reject_writes() {
+        let pl = lists();
+        let d = is_path_allowed_for_broker_open(
+            "MountPointManager", FILE_WRITE_DATA, &pl,
+        );
+        assert_eq!(d, Decision::Reject(RejectReason::NotInAllowList));
+        let d = is_path_allowed_for_broker_open(
+            "MountPointManager", GENERIC_WRITE, &pl,
+        );
+        assert_eq!(d, Decision::Reject(RejectReason::NotInAllowList));
+    }
+
+    /// A real-FS path whose leaf happens to be `MountPointManager`
+    /// (e.g. `C:\some\dir\MountPointManager` — a hypothetical file
+    /// under the user's allow tree) does NOT short-circuit to the
+    /// kernel-device allow. The kernel-device check matches the
+    /// **full normalised path**, not just the leaf, so any path with
+    /// a drive letter prefix falls through to the standard policy.
+    #[test]
+    fn read_only_kernel_devices_do_not_match_real_fs_paths() {
+        let pl = lists();
+        // Path with a drive letter must NOT be classified as the
+        // kernel device — the unique `\??\MountPointManager` form
+        // (no drive letter) is the only one that hits the allow.
+        let d = is_path_allowed_for_broker_open(
+            r"C:\fake\MountPointManager", 0x0001, &pl,
+        );
+        assert_eq!(d, Decision::Reject(RejectReason::NotInAllowList));
+        // The same path under an allow_read prefix still goes
+        // through the standard allow-list logic (Allow, because the
+        // fixture's allow_read covers `C:\fixture\base\…`).
+        let d = is_path_allowed_for_broker_open(
+            r"C:\fixture\base\MountPointManager", 0x0001, &pl,
+        );
+        assert_eq!(d, Decision::Allow);
+    }
+
+    /// Defence-in-depth: a denyRead path whose leaf looks like a
+    /// kernel device must still be denied. The kernel-device check
+    /// only matches when the entire normalised path equals the
+    /// device name (no drive prefix), so a denyRead path keeps its
+    /// drive prefix and falls through to the deny check.
+    #[test]
+    fn deny_read_with_kernel_device_leaf_still_denied() {
+        let pl = lists();
+        let d = is_path_allowed_for_broker_open(
+            r"C:\fixture\base\denyRead\MountPointManager", 0x0001, &pl,
+        );
+        assert_eq!(d, Decision::Reject(RejectReason::DenyRead));
     }
 }

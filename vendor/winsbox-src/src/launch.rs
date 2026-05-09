@@ -1493,9 +1493,16 @@ fn handle_broker_open(
     // didn't explicitly ask for write access — many ACs hit
     // STATUS_ACCESS_DENIED on EXECUTE+READ when a wider mask would
     // succeed.
+    //
+    // Phase N-7: read-only kernel devices like `\??\MountPointManager`
+    // deny `GENERIC_READ` (their DACL only grants
+    // `FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY` to standard users),
+    // so don't widen for those. Use the caller's exact mask instead.
     let want_write = crate::broker_open::is_write_access(desired_access)
         && !crate::broker_open::is_maximum_allowed(desired_access);
     let broker_access = if want_write {
+        desired_access
+    } else if crate::broker_open::is_read_only_kernel_device(&path) {
         desired_access
     } else {
         // Honour the caller's read intent but ensure GENERIC_READ
