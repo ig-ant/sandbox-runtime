@@ -12,9 +12,9 @@ use windows::Win32::System::Threading::{
     GetExitCodeProcess, InitializeProcThreadAttributeList, ResumeThread,
     SetThreadToken, TerminateProcess, UpdateProcThreadAttribute,
     WaitForSingleObject, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
-    EXTENDED_STARTUPINFO_PRESENT, INFINITE, LPPROC_THREAD_ATTRIBUTE_LIST,
-    PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
-    STARTUPINFOEXW, STARTUPINFOW,
+    DEBUG_ONLY_THIS_PROCESS, EXTENDED_STARTUPINFO_PRESENT, INFINITE,
+    LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
+    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTUPINFOEXW, STARTUPINFOW,
 };
 
 use crate::acl_stamper::{psid_from_string, free_psid, PolicyStamp};
@@ -397,7 +397,22 @@ fn run_confined(pol: &Policy, manifest_dir: &std::path::Path) -> Result<u32> {
         .as_deref()
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::var("WINSBOX_CDYLIB").ok().map(std::path::PathBuf::from));
-    let cdylib_active = cdylib_request.is_some();
+    // Phase N-6 step 3: WINSBOX_DEBUG_ATTACH=1 spawns the target with
+    // DEBUG_ONLY_THIS_PROCESS so the broker's main thread can drain
+    // CREATE_PROCESS / LOAD_DLL / EXCEPTION debug events. Cdylib
+    // injection is skipped: the bash AV happens during cygwin1.dll
+    // DLL_PROCESS_ATTACH before any hooked syscall fires (Phase L
+    // cycle 4 finding), so the cdylib's loader-time hooks don't get
+    // a chance to run. Skipping it also avoids the deadlock between
+    // the entry-trampoline rendezvous (which blocks the broker's
+    // main thread on `wait_loaded_or_exit`) and debug-event drain
+    // (which the same main thread must handle to let the loader run).
+    let debug_attach = std::env::var("WINSBOX_DEBUG_ATTACH")
+        .ok().is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let cdylib_active = cdylib_request.is_some() && !debug_attach;
+    if cdylib_request.is_some() && debug_attach {
+        log!("WINSBOX_DEBUG_ATTACH=1: skipping cdylib injection for AV diagnosis");
+    }
     if cdylib_active {
         extra_env.push(cdylib_inject::placeholder_env_pair());
     }
@@ -406,13 +421,42 @@ fn run_confined(pol: &Policy, manifest_dir: &std::path::Path) -> Result<u32> {
     // The cdylib path needs manual resume (the entry-trampoline
     // rendezvous + CPW patching happen post-spawn before the
     // target should run). The native-PE-only path (no cdylib) lets
-    // spawn_in_ac resume the target itself.
-    let resume_in_spawn = !cdylib_active;
+    // spawn_in_ac resume the target itself. Debug-attach also needs
+    // manual resume — we drain the initial CREATE_PROCESS event
+    // first, then `DebugSession::run_to_completion` resumes + drains.
+    let resume_in_spawn = !cdylib_active && !debug_attach;
     let spawn_tokens = broker_tokens.as_ref();
-    let pi = spawn_in_ac(&ac, &job, desktop.as_ref(), spawn_tokens,
-                         &pol.command_line, Some(&target_cwd), &extra_env,
-                         /*resume=*/ resume_in_spawn)?;
+    let pi = if debug_attach {
+        // Phase N-6: AC + lowbox + DEBUG_ONLY_THIS_PROCESS doesn't
+        // deliver debug events to a non-admin debugger thread (the
+        // kernel silently drops the DebugObject when creating a
+        // lowbox process without SeDebugPrivilege). Spawn outside
+        // the AppContainer entirely for the AV diagnostic — the
+        // target still runs as the user, and either the AV
+        // reproduces (we capture RIP/module/offset) or it doesn't
+        // (telling us the AV is purely AC-induced — itself useful).
+        log!("WINSBOX_DEBUG_ATTACH=1: bypassing AppContainer for debug-event delivery");
+        spawn_for_debug(&job, desktop.as_ref(), &pol.command_line, Some(&target_cwd), &extra_env)?
+    } else {
+        spawn_in_ac(&ac, &job, desktop.as_ref(), spawn_tokens,
+                    &pol.command_line, Some(&target_cwd), &extra_env,
+                    /*resume=*/ resume_in_spawn,
+                    /*debug_attach=*/ false)?
+    };
     log!("target pid={}", pi.dwProcessId);
+
+    // Phase N-6 step 3: drain the kernel-queued initial debug event
+    // (CREATE_PROCESS_DEBUG_EVENT) on this (main broker) thread.
+    // `WaitForDebugEvent` is thread-affine to the spawning thread.
+    let mut debug_session = if debug_attach {
+        let mut s = crate::debug_attach::DebugSession::new(pi.dwProcessId);
+        if let Err(e) = s.drain_initial(pi.hProcess) {
+            log!("debug-attach: drain_initial failed ({e:#}); proceeding without");
+            None
+        } else {
+            Some(s)
+        }
+    } else { None };
 
     // Cdylib injection: full pipeline — stamp, IPC channel, BNO
     // precreate, manual-map cdylib pre-resume, patch ntdll, spawn
@@ -467,7 +511,29 @@ fn run_confined(pol: &Policy, manifest_dir: &std::path::Path) -> Result<u32> {
         }
     }
 
-    unsafe { WaitForSingleObject(pi.hProcess, INFINITE); }
+    if let Some(ref mut s) = debug_session {
+        // Phase N-6: debug-event drain replaces WaitForSingleObject.
+        // Resumes the target's main thread inside the loop and runs
+        // until EXIT_PROCESS_DEBUG_EVENT.
+        if let Err(e) = s.run_to_completion(pi.hProcess, pi.hThread) {
+            log!("debug-attach: run_to_completion ({e:#})");
+        }
+    } else if debug_attach {
+        // drain_initial failed (e.g. parent-job constraint silently
+        // suppressed the DebugObject). Target is CREATE_SUSPENDED with
+        // a half-attached debug port; resuming or waiting blocks
+        // forever. Terminate and bail without joining — the broker
+        // process exit reaps the suspended target via the job's
+        // KILL_ON_CLOSE limit. The diagnostic value is the failure
+        // signature itself (logged above) — the operator now knows
+        // debug-attach can't run from this context.
+        log!("debug-attach: terminating target + bailing (parent-job blocks DebugObject delivery)");
+        unsafe { let _ = TerminateProcess(pi.hProcess, 1); }
+        unsafe { let _ = CloseHandle(pi.hThread); let _ = CloseHandle(pi.hProcess); }
+        return Ok(0xC0000005);
+    } else {
+        unsafe { WaitForSingleObject(pi.hProcess, INFINITE); }
+    }
     if let Some(ref s) = cdylib_stop { s.store(true, Ordering::Relaxed); }
     if let Some(ctx) = cdylib_ctx.as_ref() {
         for h in ctx.threads.lock().unwrap().drain(..) { let _ = h.join(); }
@@ -1157,6 +1223,48 @@ fn try_inject_cdylib_full(
 /// `command_line` is the full Win32 command line (already shell-wrapped
 /// by the TS side).
 #[allow(clippy::too_many_arguments)]
+/// Phase N-6 step 3: spawn the target outside any AppContainer for
+/// the WINSBOX_DEBUG_ATTACH diagnostic. AC + lowbox + DEBUG_ONLY_THIS_PROCESS
+/// doesn't deliver debug events without SeDebugPrivilege; this path
+/// exists purely to capture the AV signature. The target runs under
+/// the broker's user token and IL with `CREATE_SUSPENDED |
+/// DEBUG_ONLY_THIS_PROCESS`. Caller drains the initial debug event
+/// on the same thread, then resumes via DebugSession.
+fn spawn_for_debug(
+    job: &Job,
+    desktop: Option<&AltDesktop>,
+    command_line: &str,
+    cwd: Option<&str>,
+    env: &[(String, String)],
+) -> Result<PROCESS_INFORMATION> {
+    unsafe {
+        let mut si: STARTUPINFOW = zeroed();
+        si.cb = size_of::<STARTUPINFOW>() as u32;
+        let desk_w_owned;
+        if let Some(d) = desktop {
+            desk_w_owned = wstr(&d.qualified_name());
+            si.lpDesktop = PWSTR(desk_w_owned.as_ptr() as *mut u16);
+        }
+        let mut cmd = wstr(command_line);
+        let cwd_w = cwd.map(wstr);
+        let cwd_p = cwd_w.as_ref().map(|w| pcwstr(w)).unwrap_or(PCWSTR::null());
+        let mut envb = build_env_block(env);
+        let mut pi: PROCESS_INFORMATION = zeroed();
+        CreateProcessW(
+            None, PWSTR(cmd.as_mut_ptr()), None, None, true,
+            CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED | DEBUG_ONLY_THIS_PROCESS,
+            Some(envb.as_mut_ptr() as *mut c_void), cwd_p,
+            &si, &mut pi,
+        ).with_context(|| format!("CreateProcessW(debug, {command_line})"))?;
+        // Assign to the broker's job for lifetime management. Failure
+        // is non-fatal — we still want the diagnostic data.
+        if let Err(e) = job.assign(pi.hProcess) {
+            log!("debug-attach: job.assign failed ({e:#}); continuing");
+        }
+        Ok(pi)
+    }
+}
+
 fn spawn_in_ac(
     ac: &AppContainer,
     job: &Job,
@@ -1166,6 +1274,7 @@ fn spawn_in_ac(
     cwd: Option<&str>,
     env: &[(String, String)],
     resume: bool,
+    debug_attach: bool,
 ) -> Result<PROCESS_INFORMATION> {
     unsafe {
         let mut size = 0usize;
@@ -1197,7 +1306,11 @@ fn spawn_in_ac(
         let cwd_w = cwd.map(wstr);
         let cwd_p = cwd_w.as_ref().map(|w| pcwstr(w)).unwrap_or(PCWSTR::null());
         let mut envb = build_env_block(env);
-        let flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED;
+        // N-6 step 3: DEBUG_ONLY_THIS_PROCESS makes the kernel queue
+        // debug events for the target only (not its grandchildren),
+        // which is exactly what the diagnostic needs.
+        let dbg_flag = if debug_attach { DEBUG_ONLY_THIS_PROCESS } else { Default::default() };
+        let flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED | dbg_flag;
 
         let mut pi: PROCESS_INFORMATION = zeroed();
         match tokens {
@@ -1230,7 +1343,7 @@ fn spawn_in_ac(
                 si_plain.hStdError  = GetStdHandle(STD_ERROR_HANDLE).unwrap_or_default();
                 CreateProcessAsUserW(
                     t.primary, None, PWSTR(cmd.as_mut_ptr()), None, None, true,
-                    CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
+                    CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED | dbg_flag,
                     Some(envb.as_mut_ptr() as *mut c_void), cwd_p,
                     &si_plain, &mut pi,
                 ).with_context(|| format!("CreateProcessAsUserW(broker, {command_line})"))?;
@@ -1494,7 +1607,7 @@ fn handle_broker_open(
     // STATUS_ACCESS_DENIED on EXECUTE+READ when a wider mask would
     // succeed.
     //
-    // Phase N-7: read-only kernel devices like `\??\MountPointManager`
+    // Phase N-7: read-only kernel devices like `\??\Mount\PointManager`
     // deny `GENERIC_READ` (their DACL only grants
     // `FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY` to standard users),
     // so don't widen for those. Use the caller's exact mask instead.
