@@ -95,23 +95,63 @@ jobs:
         if: matrix.os == 'windows'
         # Don't go through bun: on windows-11-arm bun runs under x64
         # emulation, so process.arch lies. RUNNER_ARCH is authoritative.
+        #
+        # N-6: also cross-build the *other* arch into vendor/winsbox/<other>/.
+        # The dual-arch staging is the foundation for per-arch broker
+        # selection (TS-layer follow-up): on an ARM64 host launching an
+        # x64 target, picking the x64 broker (run under xtajit64) gives
+        # broker-arch == target-arch and avoids the cross-arch ntdll-patch
+        # corruption documented in
+        # `C:\Users\ig\.claude\plans\winsbox-cygwin-research.md` (H7-6).
         shell: bash
         run: |
           set -euxo pipefail
+
+          # Native build for the runner's own arch.
           cargo build --release --manifest-path vendor/winsbox-src/Cargo.toml
           cargo build --release --manifest-path vendor/winsbox-src/Cargo.toml -p ac-cdylib
-          arch=$([ "$RUNNER_ARCH" = "ARM64" ] && echo arm64 || echo x64)
-          mkdir -p "vendor/winsbox/$arch"
-          cp vendor/winsbox-src/target/release/sbox-exec.exe "vendor/winsbox/$arch/"
-          cp vendor/winsbox-src/target/release/ac_cdylib.dll "vendor/winsbox/$arch/"
+          host_arch=$([ "$RUNNER_ARCH" = "ARM64" ] && echo arm64 || echo x64)
+          mkdir -p "vendor/winsbox/$host_arch"
+          cp vendor/winsbox-src/target/release/sbox-exec.exe "vendor/winsbox/$host_arch/"
+          cp vendor/winsbox-src/target/release/ac_cdylib.dll "vendor/winsbox/$host_arch/"
           # Phase L: probe_priv.exe is a tiny pure-ntdll token-priv probe
           # used by the windows.test.ts suite as a drop-in replacement for
           # `whoami /priv` (which calls into LSA and fails under our
           # lowbox). Built by the top-level `sbox-exec` package as a second
           # `[[bin]]`.
-          cp vendor/winsbox-src/target/release/probe_priv.exe "vendor/winsbox/$arch/"
+          cp vendor/winsbox-src/target/release/probe_priv.exe "vendor/winsbox/$host_arch/"
+
+          # Cross-build for the other arch. MSVC link works for both
+          # directions on either Windows host (the runners ship the
+          # x64+arm64 MSVC toolchains via VS Build Tools). The cross-built
+          # binaries land under target/<triple>/release/ rather than
+          # target/release/.
+          if [ "$host_arch" = "arm64" ]; then
+            cross_arch=x64
+            cross_triple=x86_64-pc-windows-msvc
+          else
+            cross_arch=arm64
+            cross_triple=aarch64-pc-windows-msvc
+          fi
+          rustup target add "$cross_triple"
+          cargo build --release --target "$cross_triple" \
+            --manifest-path vendor/winsbox-src/Cargo.toml
+          cargo build --release --target "$cross_triple" \
+            --manifest-path vendor/winsbox-src/Cargo.toml -p ac-cdylib
+          mkdir -p "vendor/winsbox/$cross_arch"
+          cp "vendor/winsbox-src/target/$cross_triple/release/sbox-exec.exe" \
+            "vendor/winsbox/$cross_arch/"
+          cp "vendor/winsbox-src/target/$cross_triple/release/ac_cdylib.dll" \
+            "vendor/winsbox/$cross_arch/"
+          cp "vendor/winsbox-src/target/$cross_triple/release/probe_priv.exe" \
+            "vendor/winsbox/$cross_arch/"
+
           # Native Windows path so Node's fs.existsSync can find it.
-          winpath=$(cygpath -w "$PWD/vendor/winsbox/$arch/sbox-exec.exe")
+          # SBOX_EXEC_PATH still points at the host-arch broker — the TS
+          # layer's per-arch picker (N-7 follow-up) will dispatch to the
+          # cross-built one when the target binary's PE machine field
+          # disagrees with the host.
+          winpath=$(cygpath -w "$PWD/vendor/winsbox/$host_arch/sbox-exec.exe")
           echo "SBOX_EXEC_PATH=$winpath" >> "$GITHUB_ENV"
 
       - name: Build project
