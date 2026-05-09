@@ -30,6 +30,18 @@ use windows::Win32::System::SystemServices::SE_GROUP_LOGON_ID;
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 pub const IL_UNTRUSTED: u32 = 0x0000;
+/// Low integrity level (`SECURITY_MANDATORY_LOW_RID`). Cygwin's
+/// loader-time DllMain exercises code paths (CRYPTBASE / CNG / LSA
+/// SSPI bootstrap, NtCreateSection on anonymous shared regions for
+/// `cygwin_shared`/`user_shared`) that succeed at `IL_LOW` but AV
+/// at `IL_UNTRUSTED` even with the AC SID identical. The AC's
+/// package SID alone does not clamp every access check we hit:
+/// Cygwin's DllMain has paths that compare against the *primary*
+/// token's IL specifically. 95e81ab shipped 19 pass / 2 skip / 0
+/// fail on x64 CI with `IL_LOW`; the simplification regression
+/// switched it to `IL_UNTRUSTED` (Phase E) and the bash compat
+/// tests were skipped rather than re-evaluated against this.
+pub const IL_LOW: u32 = 0x1000;
 
 /// Token shape for `make_lockdown_with`. `keep_enabled` lists the
 /// group SIDs (string form) that stay enabled; every other group

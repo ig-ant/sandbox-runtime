@@ -365,12 +365,17 @@ fn run_confined(pol: &Policy, manifest_dir: &std::path::Path) -> Result<u32> {
         None
     } else {
         match build_broker_tokens_with(
-            // Phase L cycle 2: tested IL_LOW (0x1000) — same AV. The AC's
-            // package SID already clamps the effective IL to LOW; setting
-            // it to UNTRUSTED at the token level was harmless (and equally
-            // ineffective). Reverted to UNTRUSTED for parity with prior
-            // phases. The AV is not IL-driven.
-            &ac, token::USER_LIMITED, token::IL_UNTRUSTED,
+            // Cygwin compat recovery: 95e81ab shipped 19p/2s/0f on x64
+            // CI with IL_LOW. Phase E flipped to IL_UNTRUSTED for the
+            // cdylib-mode path; Phase L cycle 2's "tested IL_LOW — same
+            // AV" diagnosis was on ARM64 host with cross-arch broker /
+            // target corruption (later confirmed in N-6 step 1 as the
+            // actual Wall 1 cause), so it didn't isolate IL impact. On
+            // arch-parity hosts (x64 CI) IL matters: Cygwin's DllMain
+            // hits CRYPTBASE/CNG/LSA SSPI bootstrap paths that key on
+            // the primary token's IL specifically (the AC's package
+            // SID doesn't suffice). Restoring IL_LOW.
+            &ac, token::USER_LIMITED, token::IL_LOW,
         ) {
             Ok(t) => Some(t),
             Err(e) => {

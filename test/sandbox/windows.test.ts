@@ -106,10 +106,16 @@ d('windows sandbox', () => {
     20_000,
   )
 
-  // MSYS2/Cygwin compat is a known-failing case in this PR; tracked as
-  // separate follow-up. See examples/smoke_bash.rs for the diagnostic
-  // trail.
-  test.skip('bash (msys2) prints hello', async () => {
+  // MSYS2/Cygwin compat. The bash chain goes
+  //   `cmd /c bash.exe` (Git\bin) → `bash.exe` (Git\usr\bin) → echo,
+  // crossing arch on ARM64 hosts (Git\bin\bash.exe is ARM64,
+  // Git\usr\bin\bash.exe is x64) — the cdylib's grandchild
+  // injection bails on cross-arch and Cygwin AVs in DllMain. On
+  // x64 hosts every link is x64 so the cdylib injects through the
+  // chain. Gate on host arch until per-arch broker shipping
+  // (N-7) lands.
+  const bashCompat = process.arch === 'arm64' ? test.skip : test
+  bashCompat('bash (msys2) prints hello', async () => {
     const bash = `${process.env.ProgramFiles}\\Git\\bin\\bash.exe`
     if (!fs.existsSync(bash)) {
       console.warn(`  [skip] ${bash} not found`)
