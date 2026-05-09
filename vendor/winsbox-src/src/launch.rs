@@ -424,20 +424,45 @@ fn run_confined(pol: &Policy, manifest_dir: &std::path::Path) -> Result<u32> {
     let mut cdylib_ctx: Option<Arc<SpawnCtx>> = None;
     let mut cdylib_stop: Option<Arc<AtomicBool>> = None;
     if cdylib_active {
-        let dll_path = cdylib_request.as_ref().unwrap();
-        match try_inject_cdylib_full(
-            &ac, dll_path, pi.hProcess, pi.hThread,
-            &job, &target_cwd, &extra_env, broker_tokens.as_ref(),
-            broker_open_policy.clone(), broker_open_enabled,
-        ) {
-            Ok((inj, ctx, stop)) => {
-                cdylib_inj = Some(inj);
-                cdylib_ctx = Some(ctx);
-                cdylib_stop = Some(stop);
-            }
-            Err(e) => {
-                log!("cdylib injection setup failed ({e:#}); resuming target without cdylib");
-                unsafe { ResumeThread(pi.hThread); }
+        // ── N-5 fix: cross-arch graceful degrade for the immediate target.
+        //
+        // `interception::ntdll_export` resolves syscall VAs from the broker's
+        // own ntdll (GetModuleHandle + GetProcAddress) and we then
+        // `WriteProcessMemory` host-arch ABS_JMP machine code into those VAs
+        // in the target. If the target is a different architecture (e.g.
+        // x86_64 bash.exe under xtajit64 emulation on an ARM64 broker), its
+        // ntdll is at different VAs with a different export layout — we'd
+        // corrupt random pages and the target AVs between ResumeThread and
+        // RtlUserThreadStart. The grandchild path already has this guard
+        // (see `inject_cdylib_into_grandchild`); the immediate-target path
+        // didn't, which is what was previously misdiagnosed as "Phase L
+        // Wall 1 (Cygwin DllMain crash)".
+        let host_machine = host_image_machine();
+        let target_machine = read_target_machine(pi.hProcess);
+        if target_machine == 0 || target_machine != host_machine {
+            log!(
+                "cdylib: primary target arch={:#x} != host arch={:#x}; \
+                 resuming un-hooked (M-1 PE-export parser + cross-arch \
+                 cdylib build needed)",
+                target_machine, host_machine,
+            );
+            unsafe { ResumeThread(pi.hThread); }
+        } else {
+            let dll_path = cdylib_request.as_ref().unwrap();
+            match try_inject_cdylib_full(
+                &ac, dll_path, pi.hProcess, pi.hThread,
+                &job, &target_cwd, &extra_env, broker_tokens.as_ref(),
+                broker_open_policy.clone(), broker_open_enabled,
+            ) {
+                Ok((inj, ctx, stop)) => {
+                    cdylib_inj = Some(inj);
+                    cdylib_ctx = Some(ctx);
+                    cdylib_stop = Some(stop);
+                }
+                Err(e) => {
+                    log!("cdylib injection setup failed ({e:#}); resuming target without cdylib");
+                    unsafe { ResumeThread(pi.hThread); }
+                }
             }
         }
     }
