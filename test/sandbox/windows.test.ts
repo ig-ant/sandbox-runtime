@@ -174,11 +174,30 @@ d('windows sandbox', () => {
   // `examples/smoke_bash.rs` Phase L header for the full diagnostic.
   // The HTTP variant below passes, which proves the AF_UNIX bridge
   // and the SRT proxy work; HTTPS specifically needs Schannel.
-  // Phase M will land broker-side TLS termination so curl can use
-  // `--proxy http://127.0.0.1:port` with cleartext upstream and
-  // bypass Schannel entirely; this skip lifts at that point.
+  //
+  // Phase N-4 retest (2026-05-09): N-2's broker-mediated NtCreateFile
+  // / NtOpenFile does NOT close this case. The trace span inside the
+  // curl grandchild between cdylib injection and the schannel error
+  // contains zero denied filesystem / registry / pipe / ALPC syscalls
+  // before `AcquireCredentialsHandle → SEC_E_NO_CREDENTIALS
+  // (0x8009030e)`. The default outbound `AcquireCredentialsHandle(
+  // UNISP/SCHANNEL, SECPKG_CRED_OUTBOUND, NULL pAuthData)` should
+  // always succeed on a sane Windows install (no client cert is
+  // needed for outbound TLS); the synthetic `NO_CREDENTIALS` reply
+  // means schannel's LSA-side package state is broken inside the
+  // per-AC LSA endpoint — there is no brokerable user-mode syscall
+  // to mediate. Plan finding E (fundamentally unbrokerable).
+  //
+  // Path forward: broker-side TLS termination (MITM proxy). Broker
+  // generates a session CA via rcgen, installs with `certutil -user
+  // -addstore Root`, and the existing `netbridge.rs` HTTP CONNECT
+  // path becomes a TLS terminator signing per-domain certs. Curl in
+  // the AC then sees plaintext upstream and never engages Schannel.
+  // Deferred to a separate phase (~300 LOC + rcgen dep) — see trace
+  // at `docs/curl_https_trace_n4.log` and the deferral note in
+  // `plans/winsbox-phase-n.md` Phase N-4 / fallback section.
   test.skip(
-    'curl allowed domain via proxy succeeds (https — needs Phase M broker-side TLS)',
+    'curl allowed domain via proxy succeeds (https — deferred, see Phase O MITM)',
     async () => {
       const r = await runSandboxed(
         'curl.exe -sSI https://example.com/',
