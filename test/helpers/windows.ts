@@ -208,19 +208,35 @@ export function isCygwinBinary(exePath: string): boolean {
 }
 
 /**
- * Convenience wrapper kept for backwards-compatibility with the prior
- * heuristic. Resolves git on PATH, finds its parent dir, and probes
- * the .exe via {@link isCygwinBinary}. Returns `false` when git
- * isn't on PATH.
+ * Wrapper-aware Cygwin-prone-git detection. Resolves git on PATH and
+ * probes the located .exe via {@link isCygwinBinary}. If the resolved
+ * exe lives in a Git-for-Windows `cmd` subdir (the standard layout's
+ * `<install>/cmd/git.exe` is a thin pure-Win32 wrapper that
+ * `CreateProcess`es `<install>/bin/git.exe`, which IS Cygwin-flavored),
+ * also probe the sibling `bin/git.exe`. Either being Cygwin classifies
+ * the resolved git as Cygwin-prone — the test would AV in `cygwin1.dll!
+ * DllMain` (Phase L Wall 1) under our lockdown token.
  *
- * @deprecated prefer {@link isCygwinBinary} with an explicit exe path.
+ * Local hosts that resolve to a non-wrapper native git (e.g.
+ * `<install>/clangarm64/bin/git.exe` on the ARM64 dev box) skip the
+ * sibling check and stay green. CI runners that resolve to the standard
+ * `cmd/git.exe` wrapper get classified Cygwin-prone via the sibling
+ * check and skip cleanly. Returns `false` when git isn't on PATH.
  */
 export function isCygwinGit(): boolean {
   const dir = findToolchainDir('git')
   if (!dir) return false
   const exe = path.join(dir, 'git.exe')
   if (!fs.existsSync(exe)) return false
-  return isCygwinBinary(exe)
+  if (isCygwinBinary(exe)) return true
+  // Wrapper-aware: when resolved to `<install>/cmd/git.exe`, the
+  // wrapper re-execs `<install>/bin/git.exe` which is the actual
+  // Cygwin binary on standard Git for Windows installs.
+  if (path.basename(dir).toLowerCase() === 'cmd') {
+    const altExe = path.join(path.dirname(dir), 'bin', 'git.exe')
+    if (fs.existsSync(altExe) && isCygwinBinary(altExe)) return true
+  }
+  return false
 }
 
 export async function makeFixture(): Promise<Fixture> {
