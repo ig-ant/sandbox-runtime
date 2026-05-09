@@ -127,8 +127,28 @@ pub const TRACE_NT_OPEN_MUTANT: u64 = 11;
 pub const TRACE_NT_MAP_VIEW_OF_SECTION: u64 = 12;
 pub const TRACE_NT_CREATE_SECTION: u64 = 13;
 pub const TRACE_NT_ALLOCATE_VIRTUAL_MEMORY: u64 = 14;
+// Phase N-5: Cygwin DllMain coverage. The 15 prior hooks left a
+// trace coverage gap during cygwin1.dll's DllMain. These 15 cover
+// section opens (H1: cygwin1S5-sect), token+process queries
+// (H4-H6: PEB walks, env probes), file-control / metadata writes,
+// directory enum, registry create, and handle close (continuity).
+pub const TRACE_NT_OPEN_SECTION: u64 = 15;
+pub const TRACE_NT_QUERY_INFORMATION_PROCESS: u64 = 16;
+pub const TRACE_NT_OPEN_PROCESS_TOKEN: u64 = 17;
+pub const TRACE_NT_OPEN_THREAD_TOKEN: u64 = 18;
+pub const TRACE_NT_QUERY_INFORMATION_TOKEN: u64 = 19;
+pub const TRACE_NT_QUERY_SYSTEM_INFORMATION: u64 = 20;
+pub const TRACE_NT_READ_VIRTUAL_MEMORY: u64 = 21;
+pub const TRACE_NT_CLOSE: u64 = 22;
+pub const TRACE_NT_CREATE_NAMED_PIPE_FILE: u64 = 23;
+pub const TRACE_NT_FS_CONTROL_FILE: u64 = 24;
+pub const TRACE_NT_SET_INFORMATION_FILE: u64 = 25;
+pub const TRACE_NT_QUERY_DIRECTORY_FILE: u64 = 26;
+pub const TRACE_NT_CREATE_KEY: u64 = 27;
+pub const TRACE_NT_CREATE_MAILSLOT_FILE: u64 = 28;
+pub const TRACE_NT_UNMAP_VIEW_OF_SECTION: u64 = 29;
 
-pub const TRACE_SYSCALL_COUNT: usize = 15;
+pub const TRACE_SYSCALL_COUNT: usize = 30;
 
 /// (id → ntdll export name) lookup for the install path *and* the
 /// log emitter. Indexed by the `TRACE_*` ids above.
@@ -148,6 +168,22 @@ pub const TRACE_SYSCALL_NAMES: [&str; TRACE_SYSCALL_COUNT] = [
     "NtMapViewOfSection",
     "NtCreateSection",
     "NtAllocateVirtualMemory",
+    // Phase N-5 additions.
+    "NtOpenSection",
+    "NtQueryInformationProcess",
+    "NtOpenProcessToken",
+    "NtOpenThreadToken",
+    "NtQueryInformationToken",
+    "NtQuerySystemInformation",
+    "NtReadVirtualMemory",
+    "NtClose",
+    "NtCreateNamedPipeFile",
+    "NtFsControlFile",
+    "NtSetInformationFile",
+    "NtQueryDirectoryFile",
+    "NtCreateKey",
+    "NtCreateMailslotFile",
+    "NtUnmapViewOfSection",
 ];
 
 /// Sentinel `r_status` the broker returns when the cdylib hook

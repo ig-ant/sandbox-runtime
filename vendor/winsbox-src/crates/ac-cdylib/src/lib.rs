@@ -96,7 +96,18 @@ extern "system" {
 /// cdylib falls through to the legacy `OP_DENIED_OPEN` log frame
 /// and returns the original ACCESS_DENIED. Disable mediation via
 /// `WINSBOX_BROKER_OPEN=0` (broker-side env); deny-logging stays on.
-pub const CDYLIB_VERSION: u32 = 6;
+///
+/// v7 (Phase N-5): TRACE_SYSCALL_COUNT bumped 15 → 30 to broaden
+/// Cygwin DllMain coverage. Added trace hooks for NtOpenSection,
+/// NtQueryInformationProcess, NtOpenProcessToken, NtOpenThreadToken,
+/// NtQueryInformationToken, NtQuerySystemInformation,
+/// NtReadVirtualMemory, NtClose, NtCreateNamedPipeFile_trace,
+/// NtFsControlFile, NtSetInformationFile, NtQueryDirectoryFile,
+/// NtCreateKey, NtCreateMailslotFile, NtUnmapViewOfSection. The
+/// `passthrough_trace` array grows from 15 to 30 slots; downstream
+/// `passthrough_nt_create_file_denylog` field offset shifts from
+/// 0xC0 to 0x138. Wire format otherwise unchanged.
+pub const CDYLIB_VERSION: u32 = 7;
 
 /// Sentinel return value for `cdylib_init`. Broker verifies on
 /// report-back. Retained as a no-op export so the broker's
@@ -117,7 +128,7 @@ pub const RESULT_SENTINEL: u32 = 0xACDC_BABE;
 /// Number of trace-mode passthrough thunks. Indexed by the
 /// `TRACE_*` syscall-id constants below; must match
 /// `TRACE_SYSCALL_COUNT` on the broker side.
-pub const TRACE_SYSCALL_COUNT: usize = 15;
+pub const TRACE_SYSCALL_COUNT: usize = 30;
 
 // Trace-mode syscall IDs. Each is the index into
 // `IpcEnv.passthrough_trace` *and* the value sent in the
@@ -139,6 +150,26 @@ pub const TRACE_NT_OPEN_MUTANT: u64 = 11;
 pub const TRACE_NT_MAP_VIEW_OF_SECTION: u64 = 12;
 pub const TRACE_NT_CREATE_SECTION: u64 = 13;
 pub const TRACE_NT_ALLOCATE_VIRTUAL_MEMORY: u64 = 14;
+// Phase N-5 additions: Cygwin DllMain coverage. The previous 15 hooks
+// emitted few or zero lines for bash before the AV; these extend
+// trace coverage to cover the syscalls Cygwin's DllMain plausibly
+// executes (section open, token queries, system info, cross-process
+// reads, handle close, FS metadata, registry create, mailslots).
+pub const TRACE_NT_OPEN_SECTION: u64 = 15;
+pub const TRACE_NT_QUERY_INFORMATION_PROCESS: u64 = 16;
+pub const TRACE_NT_OPEN_PROCESS_TOKEN: u64 = 17;
+pub const TRACE_NT_OPEN_THREAD_TOKEN: u64 = 18;
+pub const TRACE_NT_QUERY_INFORMATION_TOKEN: u64 = 19;
+pub const TRACE_NT_QUERY_SYSTEM_INFORMATION: u64 = 20;
+pub const TRACE_NT_READ_VIRTUAL_MEMORY: u64 = 21;
+pub const TRACE_NT_CLOSE: u64 = 22;
+pub const TRACE_NT_CREATE_NAMED_PIPE_FILE: u64 = 23;
+pub const TRACE_NT_FS_CONTROL_FILE: u64 = 24;
+pub const TRACE_NT_SET_INFORMATION_FILE: u64 = 25;
+pub const TRACE_NT_QUERY_DIRECTORY_FILE: u64 = 26;
+pub const TRACE_NT_CREATE_KEY: u64 = 27;
+pub const TRACE_NT_CREATE_MAILSLOT_FILE: u64 = 28;
+pub const TRACE_NT_UNMAP_VIEW_OF_SECTION: u64 = 29;
 
 /// Process-static IPC environment. The broker locates this via the
 /// `IPC` data export, writes the IPC handles directly with
@@ -211,9 +242,14 @@ pub static IPC: IpcEnv = IpcEnv {
     passthrough_nt_open_directory_object: AtomicU64::new(0),
     passthrough_nt_create_named_pipe_file: AtomicU64::new(0),
     passthrough_create_process_internal_w: AtomicU64::new(0),
-    // Repeating `AtomicU64::new(0)` 15× rather than using a `[…; N]`
+    // Repeating `AtomicU64::new(0)` 30× rather than using a `[…; N]`
     // shorthand (which requires `Copy`, and `AtomicU64` isn't).
     passthrough_trace: [
+        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
         AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
         AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
         AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
@@ -1089,6 +1125,443 @@ pub unsafe extern "system" fn hook_nt_allocate_virtual_memory_trace(
             allocation_type as u64,
             protect as u64,
         ]),
+    );
+    st
+}
+
+// ─── Phase N-5: Cygwin DllMain coverage trace hooks ────────────────
+//
+// Same passthrough+log shape as the prior 15 hooks. Each calls the
+// broker-built passthrough thunk to invoke the un-hooked syscall,
+// then ships an `OP_TRACE` frame with the syscall id + summary args
+// + returned NTSTATUS. The broker's `trace_arg_summary` decodes the
+// args; the wire format is unchanged.
+
+// 10. NtOpenSection — Cygwin's shared_info opens an existing
+//     `\BaseNamedObjects\cygwin1S5-sect`. AV hypothesis H1 fires
+//     here. Args: handle out, access, OBJECT_ATTRIBUTES* in args[2].
+#[no_mangle]
+pub unsafe extern "system" fn hook_nt_open_section_trace(
+    out_handle: *mut HANDLE,
+    desired_access: u32,
+    oa: *const c_void,
+) -> NTSTATUS {
+    let pv = IPC.passthrough_trace[TRACE_NT_OPEN_SECTION as usize]
+        .load(Ordering::Acquire);
+    if pv == 0 { return STATUS_NOT_IMPLEMENTED; }
+    type Fn3 = unsafe extern "system" fn(
+        *mut HANDLE, u32, *const c_void,
+    ) -> NTSTATUS;
+    let f: Fn3 = core::mem::transmute(pv as usize);
+    let st = f(out_handle, desired_access, oa);
+    ipc_trace_send(
+        TRACE_NT_OPEN_SECTION, st,
+        trace_args([oa as u64, desired_access as u64]),
+    );
+    st
+}
+
+// 11. NtQueryInformationProcess — process info queries; AC denies
+//     several info classes (TokenStatistics etc.). Cygwin's child
+//     setup reads its parent's basic info during fork().
+#[no_mangle]
+pub unsafe extern "system" fn hook_nt_query_information_process_trace(
+    process_handle: HANDLE,
+    info_class: u32,
+    info_buffer: *mut c_void,
+    info_length: u32,
+    return_length: *mut u32,
+) -> NTSTATUS {
+    let pv = IPC.passthrough_trace[TRACE_NT_QUERY_INFORMATION_PROCESS as usize]
+        .load(Ordering::Acquire);
+    if pv == 0 { return STATUS_NOT_IMPLEMENTED; }
+    type Fn5 = unsafe extern "system" fn(
+        HANDLE, u32, *mut c_void, u32, *mut u32,
+    ) -> NTSTATUS;
+    let f: Fn5 = core::mem::transmute(pv as usize);
+    let st = f(process_handle, info_class, info_buffer, info_length, return_length);
+    ipc_trace_send(
+        TRACE_NT_QUERY_INFORMATION_PROCESS, st,
+        trace_args([process_handle as u64, info_class as u64,
+                    info_length as u64]),
+    );
+    st
+}
+
+// 12. NtOpenProcessToken — token-handle acquire. Cygwin's
+//     uinfo_init reads the process token to derive uid/gid.
+#[no_mangle]
+pub unsafe extern "system" fn hook_nt_open_process_token_trace(
+    process_handle: HANDLE,
+    desired_access: u32,
+    out_handle: *mut HANDLE,
+) -> NTSTATUS {
+    let pv = IPC.passthrough_trace[TRACE_NT_OPEN_PROCESS_TOKEN as usize]
+        .load(Ordering::Acquire);
+    if pv == 0 { return STATUS_NOT_IMPLEMENTED; }
+    type Fn3 = unsafe extern "system" fn(
+        HANDLE, u32, *mut HANDLE,
+    ) -> NTSTATUS;
+    let f: Fn3 = core::mem::transmute(pv as usize);
+    let st = f(process_handle, desired_access, out_handle);
+    ipc_trace_send(
+        TRACE_NT_OPEN_PROCESS_TOKEN, st,
+        trace_args([process_handle as u64, desired_access as u64]),
+    );
+    st
+}
+
+// 13. NtOpenThreadToken — thread-token impersonation lookup.
+#[no_mangle]
+pub unsafe extern "system" fn hook_nt_open_thread_token_trace(
+    thread_handle: HANDLE,
+    desired_access: u32,
+    open_as_self: u8,
+    out_handle: *mut HANDLE,
+) -> NTSTATUS {
+    let pv = IPC.passthrough_trace[TRACE_NT_OPEN_THREAD_TOKEN as usize]
+        .load(Ordering::Acquire);
+    if pv == 0 { return STATUS_NOT_IMPLEMENTED; }
+    type Fn4 = unsafe extern "system" fn(
+        HANDLE, u32, u8, *mut HANDLE,
+    ) -> NTSTATUS;
+    let f: Fn4 = core::mem::transmute(pv as usize);
+    let st = f(thread_handle, desired_access, open_as_self, out_handle);
+    ipc_trace_send(
+        TRACE_NT_OPEN_THREAD_TOKEN, st,
+        trace_args([thread_handle as u64, desired_access as u64,
+                    open_as_self as u64]),
+    );
+    st
+}
+
+// 14. NtQueryInformationToken — token info readout (groups, user,
+//     statistics, sandbox-info). Hot path during Cygwin uid/gid setup.
+#[no_mangle]
+pub unsafe extern "system" fn hook_nt_query_information_token_trace(
+    token_handle: HANDLE,
+    info_class: u32,
+    info_buffer: *mut c_void,
+    info_length: u32,
+    return_length: *mut u32,
+) -> NTSTATUS {
+    let pv = IPC.passthrough_trace[TRACE_NT_QUERY_INFORMATION_TOKEN as usize]
+        .load(Ordering::Acquire);
+    if pv == 0 { return STATUS_NOT_IMPLEMENTED; }
+    type Fn5 = unsafe extern "system" fn(
+        HANDLE, u32, *mut c_void, u32, *mut u32,
+    ) -> NTSTATUS;
+    let f: Fn5 = core::mem::transmute(pv as usize);
+    let st = f(token_handle, info_class, info_buffer, info_length, return_length);
+    ipc_trace_send(
+        TRACE_NT_QUERY_INFORMATION_TOKEN, st,
+        trace_args([token_handle as u64, info_class as u64,
+                    info_length as u64]),
+    );
+    st
+}
+
+// 15. NtQuerySystemInformation — system-wide info queries; AC
+//     denies many info classes. Cygwin's getloadavg/proc_subdir uses
+//     SystemProcessInformation extensively.
+#[no_mangle]
+pub unsafe extern "system" fn hook_nt_query_system_information_trace(
+    info_class: u32,
+    info_buffer: *mut c_void,
+    info_length: u32,
+    return_length: *mut u32,
+) -> NTSTATUS {
+    let pv = IPC.passthrough_trace[TRACE_NT_QUERY_SYSTEM_INFORMATION as usize]
+        .load(Ordering::Acquire);
+    if pv == 0 { return STATUS_NOT_IMPLEMENTED; }
+    type Fn4 = unsafe extern "system" fn(
+        u32, *mut c_void, u32, *mut u32,
+    ) -> NTSTATUS;
+    let f: Fn4 = core::mem::transmute(pv as usize);
+    let st = f(info_class, info_buffer, info_length, return_length);
+    ipc_trace_send(
+        TRACE_NT_QUERY_SYSTEM_INFORMATION, st,
+        trace_args([info_class as u64, info_length as u64]),
+    );
+    st
+}
+
+// 16. NtReadVirtualMemory — cross-process reads. AC denies cross-
+//     process reads unless capability is granted. Cygwin's fork()
+//     uses this against the parent during cygheap copy.
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
+pub unsafe extern "system" fn hook_nt_read_virtual_memory_trace(
+    process_handle: HANDLE,
+    base_address: *const c_void,
+    buffer: *mut c_void,
+    buffer_size: usize,
+    bytes_read: *mut usize,
+) -> NTSTATUS {
+    let pv = IPC.passthrough_trace[TRACE_NT_READ_VIRTUAL_MEMORY as usize]
+        .load(Ordering::Acquire);
+    if pv == 0 { return STATUS_NOT_IMPLEMENTED; }
+    type Fn5 = unsafe extern "system" fn(
+        HANDLE, *const c_void, *mut c_void, usize, *mut usize,
+    ) -> NTSTATUS;
+    let f: Fn5 = core::mem::transmute(pv as usize);
+    let st = f(process_handle, base_address, buffer, buffer_size, bytes_read);
+    ipc_trace_send(
+        TRACE_NT_READ_VIRTUAL_MEMORY, st,
+        trace_args([process_handle as u64, base_address as u64,
+                    buffer_size as u64]),
+    );
+    st
+}
+
+// 17. NtClose — handle close. Very high-frequency; useful as a
+//     trace continuity marker so we can correlate handle lifetimes.
+#[no_mangle]
+pub unsafe extern "system" fn hook_nt_close_trace(
+    handle: HANDLE,
+) -> NTSTATUS {
+    let pv = IPC.passthrough_trace[TRACE_NT_CLOSE as usize]
+        .load(Ordering::Acquire);
+    if pv == 0 { return STATUS_NOT_IMPLEMENTED; }
+    type Fn1 = unsafe extern "system" fn(HANDLE) -> NTSTATUS;
+    let f: Fn1 = core::mem::transmute(pv as usize);
+    let st = f(handle);
+    ipc_trace_send(
+        TRACE_NT_CLOSE, st,
+        trace_args([handle as u64]),
+    );
+    st
+}
+
+// 18. NtCreateNamedPipeFile (trace flavour) — already brokered via
+//     `hook_nt_create_named_pipe_file`. The trace variant is for
+//     correlation with the AV: when the broker hook is in place the
+//     trace hook is unused, but we install both paths so the broker
+//     can choose at runtime which family to patch (for the N-5 run
+//     we want the trace shape, no broker mediation, since the AV
+//     research path benefits from un-modified semantics).
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
+pub unsafe extern "system" fn hook_nt_create_named_pipe_file_trace(
+    out_handle: *mut HANDLE,
+    desired_access: u32,
+    oa: *const c_void,
+    iosb: *mut [usize; 2],
+    share_access: u32,
+    create_disposition: u32,
+    create_options: u32,
+    named_pipe_type: u32,
+    read_mode: u32,
+    completion_mode: u32,
+    maximum_instances: u32,
+    inbound_quota: u32,
+    outbound_quota: u32,
+    default_timeout: *const i64,
+) -> NTSTATUS {
+    let pv = IPC.passthrough_trace[TRACE_NT_CREATE_NAMED_PIPE_FILE as usize]
+        .load(Ordering::Acquire);
+    if pv == 0 { return STATUS_NOT_IMPLEMENTED; }
+    type Fn14 = unsafe extern "system" fn(
+        *mut HANDLE, u32, *const c_void, *mut [usize; 2],
+        u32, u32, u32, u32, u32, u32, u32, u32, u32,
+        *const i64,
+    ) -> NTSTATUS;
+    let f: Fn14 = core::mem::transmute(pv as usize);
+    let st = f(
+        out_handle, desired_access, oa, iosb,
+        share_access, create_disposition, create_options,
+        named_pipe_type, read_mode, completion_mode,
+        maximum_instances, inbound_quota,
+        outbound_quota, default_timeout,
+    );
+    ipc_trace_send(
+        TRACE_NT_CREATE_NAMED_PIPE_FILE, st,
+        trace_args([oa as u64, desired_access as u64,
+                    create_disposition as u64, create_options as u64]),
+    );
+    st
+}
+
+// 19. NtFsControlFile — file control IO (FSCTL_*). Used by Cygwin
+//     for reparse-point reads, junction queries.
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
+pub unsafe extern "system" fn hook_nt_fs_control_file_trace(
+    file_handle: HANDLE,
+    event: HANDLE,
+    apc_routine: *const c_void,
+    apc_context: *const c_void,
+    iosb: *mut [usize; 2],
+    fs_control_code: u32,
+    in_buf: *const c_void,
+    in_len: u32,
+    out_buf: *mut c_void,
+    out_len: u32,
+) -> NTSTATUS {
+    let pv = IPC.passthrough_trace[TRACE_NT_FS_CONTROL_FILE as usize]
+        .load(Ordering::Acquire);
+    if pv == 0 { return STATUS_NOT_IMPLEMENTED; }
+    type Fn10 = unsafe extern "system" fn(
+        HANDLE, HANDLE, *const c_void, *const c_void, *mut [usize; 2],
+        u32, *const c_void, u32, *mut c_void, u32,
+    ) -> NTSTATUS;
+    let f: Fn10 = core::mem::transmute(pv as usize);
+    let st = f(
+        file_handle, event, apc_routine, apc_context, iosb,
+        fs_control_code, in_buf, in_len, out_buf, out_len,
+    );
+    ipc_trace_send(
+        TRACE_NT_FS_CONTROL_FILE, st,
+        trace_args([file_handle as u64, fs_control_code as u64,
+                    in_len as u64, out_len as u64]),
+    );
+    st
+}
+
+// 20. NtSetInformationFile — file metadata writes (rename, EOF,
+//     disposition). Cygwin uses for chmod / unlink.
+#[no_mangle]
+pub unsafe extern "system" fn hook_nt_set_information_file_trace(
+    file_handle: HANDLE,
+    iosb: *mut [usize; 2],
+    info_buffer: *const c_void,
+    info_length: u32,
+    info_class: u32,
+) -> NTSTATUS {
+    let pv = IPC.passthrough_trace[TRACE_NT_SET_INFORMATION_FILE as usize]
+        .load(Ordering::Acquire);
+    if pv == 0 { return STATUS_NOT_IMPLEMENTED; }
+    type Fn5 = unsafe extern "system" fn(
+        HANDLE, *mut [usize; 2], *const c_void, u32, u32,
+    ) -> NTSTATUS;
+    let f: Fn5 = core::mem::transmute(pv as usize);
+    let st = f(file_handle, iosb, info_buffer, info_length, info_class);
+    ipc_trace_send(
+        TRACE_NT_SET_INFORMATION_FILE, st,
+        trace_args([file_handle as u64, info_class as u64,
+                    info_length as u64]),
+    );
+    st
+}
+
+// 21. NtQueryDirectoryFile — directory enumeration; PATH walks.
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
+pub unsafe extern "system" fn hook_nt_query_directory_file_trace(
+    file_handle: HANDLE,
+    event: HANDLE,
+    apc_routine: *const c_void,
+    apc_context: *const c_void,
+    iosb: *mut [usize; 2],
+    info_buffer: *mut c_void,
+    info_length: u32,
+    info_class: u32,
+    return_single_entry: u8,
+    file_name: *const c_void,
+    restart_scan: u8,
+) -> NTSTATUS {
+    let pv = IPC.passthrough_trace[TRACE_NT_QUERY_DIRECTORY_FILE as usize]
+        .load(Ordering::Acquire);
+    if pv == 0 { return STATUS_NOT_IMPLEMENTED; }
+    type Fn11 = unsafe extern "system" fn(
+        HANDLE, HANDLE, *const c_void, *const c_void, *mut [usize; 2],
+        *mut c_void, u32, u32, u8, *const c_void, u8,
+    ) -> NTSTATUS;
+    let f: Fn11 = core::mem::transmute(pv as usize);
+    let st = f(
+        file_handle, event, apc_routine, apc_context, iosb,
+        info_buffer, info_length, info_class,
+        return_single_entry, file_name, restart_scan,
+    );
+    ipc_trace_send(
+        TRACE_NT_QUERY_DIRECTORY_FILE, st,
+        trace_args([file_handle as u64, info_class as u64,
+                    info_length as u64, restart_scan as u64]),
+    );
+    st
+}
+
+// 22. NtCreateKey — registry key create (vs open). Cygwin's
+//     mount-table lookup goes through a registry probe.
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
+pub unsafe extern "system" fn hook_nt_create_key_trace(
+    out_handle: *mut HANDLE,
+    desired_access: u32,
+    oa: *const c_void,
+    title_index: u32,
+    class: *const c_void,
+    create_options: u32,
+    disposition: *mut u32,
+) -> NTSTATUS {
+    let pv = IPC.passthrough_trace[TRACE_NT_CREATE_KEY as usize]
+        .load(Ordering::Acquire);
+    if pv == 0 { return STATUS_NOT_IMPLEMENTED; }
+    type Fn7 = unsafe extern "system" fn(
+        *mut HANDLE, u32, *const c_void, u32, *const c_void, u32, *mut u32,
+    ) -> NTSTATUS;
+    let f: Fn7 = core::mem::transmute(pv as usize);
+    let st = f(out_handle, desired_access, oa, title_index,
+               class, create_options, disposition);
+    ipc_trace_send(
+        TRACE_NT_CREATE_KEY, st,
+        trace_args([oa as u64, desired_access as u64,
+                    create_options as u64]),
+    );
+    st
+}
+
+// 23. NtCreateMailslotFile — Cygwin uses mailslots in some IPC paths.
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
+pub unsafe extern "system" fn hook_nt_create_mailslot_file_trace(
+    out_handle: *mut HANDLE,
+    desired_access: u32,
+    oa: *const c_void,
+    iosb: *mut [usize; 2],
+    create_options: u32,
+    mailslot_quota: u32,
+    maximum_message_size: u32,
+    read_timeout: *const i64,
+) -> NTSTATUS {
+    let pv = IPC.passthrough_trace[TRACE_NT_CREATE_MAILSLOT_FILE as usize]
+        .load(Ordering::Acquire);
+    if pv == 0 { return STATUS_NOT_IMPLEMENTED; }
+    type Fn8 = unsafe extern "system" fn(
+        *mut HANDLE, u32, *const c_void, *mut [usize; 2],
+        u32, u32, u32, *const i64,
+    ) -> NTSTATUS;
+    let f: Fn8 = core::mem::transmute(pv as usize);
+    let st = f(out_handle, desired_access, oa, iosb,
+               create_options, mailslot_quota,
+               maximum_message_size, read_timeout);
+    ipc_trace_send(
+        TRACE_NT_CREATE_MAILSLOT_FILE, st,
+        trace_args([oa as u64, desired_access as u64,
+                    create_options as u64,
+                    maximum_message_size as u64]),
+    );
+    st
+}
+
+// 24. NtUnmapViewOfSection — DllMain may unmap; useful continuity
+//     for tracking section lifetimes in DllMain.
+#[no_mangle]
+pub unsafe extern "system" fn hook_nt_unmap_view_of_section_trace(
+    process_handle: HANDLE,
+    base_address: *mut c_void,
+) -> NTSTATUS {
+    let pv = IPC.passthrough_trace[TRACE_NT_UNMAP_VIEW_OF_SECTION as usize]
+        .load(Ordering::Acquire);
+    if pv == 0 { return STATUS_NOT_IMPLEMENTED; }
+    type Fn2 = unsafe extern "system" fn(
+        HANDLE, *mut c_void,
+    ) -> NTSTATUS;
+    let f: Fn2 = core::mem::transmute(pv as usize);
+    let st = f(process_handle, base_address);
+    ipc_trace_send(
+        TRACE_NT_UNMAP_VIEW_OF_SECTION, st,
+        trace_args([process_handle as u64, base_address as u64]),
     );
     st
 }

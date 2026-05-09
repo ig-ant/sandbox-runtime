@@ -1,0 +1,82 @@
+warning: unused variable: `temp_dir`
+   --> examples\smoke_bash.rs:219:9
+    |
+219 |         temp_dir: &str, bash_smoke_dir: &PathBuf, ssh_dir: &std::path::Path,
+    |         ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_temp_dir`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `sbox-exec` (example "smoke_bash") generated 1 warning (run `cargo fix --example "smoke_bash" -p sbox-exec` to apply 1 suggestion)
+    Finished `release` profile [optimized] target(s) in 0.05s
+     Running `C:\Users\ig\AppData\Local\Temp\winsbox-target\release\examples\smoke_bash.exe`
+[smoke_bash] broker = C:\Users\ig\AppData\Local\Temp\winsbox-target\release\sbox-exec.exe
+[smoke_bash] cdylib = C:\Users\ig\AppData\Local\Temp\winsbox-target\release\ac_cdylib.dll
+[smoke_bash] bash = C:\Program Files\Git\usr\bin\bash.exe
+[smoke_bash] user_profile = C:\Users\ig
+[smoke_bash] temp_dir     = C:\Users\ig\AppData\Local\Temp
+[smoke_bash] ssh_dir      = C:\Users\ig\.ssh (exists=true)
+[smoke_bash] ─── Test 1: bash -c 'echo hello && /usr/bin/uname -a' ───
+[smoke_bash] broker exited code=Some(-1073741819) (576 ms)
+--- stdout ---
+--- stderr ---
+[sbox-exec] AppContainer sid=S-1-15-2-3090071799-2393209565-2579518561-163766185-3046441188-2033989776-1725268752 folder=C:\Users\ig\AppData\Local\Packages\srt.ac.2e2796cc034543ff\AC
+[sbox-exec] policy-stamp: hash unchanged (0x648c0c9ee819af17); skipping apply
+[sbox-exec] auto-toolchain: detected 10 tooling dirs: C:\Program Files\Git\clangarm64\bin, C:\Program Files\Git\usr\local\bin, C:\Program Files\Git\usr\bin, C:\Program Files\Parallels\Parallels Tools\Applications, C:\Program Files\Git\cmd, C:\Program Files (x86)\Windows Kits\10\Windows Performance Toolkit, C:\Program Files\nodejs, C:\Users\ig\.cargo\bin, C:\Program Files\Git\usr\bin\vendor_perl, C:\Program Files\Git\usr\bin\core_perl
+[sbox-exec] broker-open: enabled=false allow_read=3 deny_read=1 allow_write=1 deny_write=0 auto_toolchain=10
+[sbox-exec] Job created
+[sbox-exec] no proxy ports in policy; skipping bridge
+[sbox-exec] broker tokens: primary=LockdownSpec { keep_enabled: ["S-1-1-0", "S-1-5-11", "S-1-5-32-545"] }+lowbox, initial=USER_RESTRICTED_SAME_ACCESS+lowbox, IL=0x0; ac_bno=\Sessions\1\AppContainerNamedObjects\S-1-15-2-3090071799-2393209565-2579518561-163766185-3046441188-2033989776-1725268752
+[sbox-exec] launching target (cwd=C:\Users\ig\AppData\Local\Temp\bash-smoke): "C:\Program Files\Git\usr\bin\bash.exe" -c "echo hello && /usr/bin/uname -a"
+[sbox-exec] target pid=11172
+[sbox-exec] cdylib stamp on \\?\C:\Users\ig\AppData\Local\Temp\winsbox-target\release: 2 stamped, 0 skipped (idempotent), 0 skipped (AC accessible), 0 soft-failed (access denied), 0 soft-failed (other), 150 ms
+[sbox-exec] cdylib: ac_bno=\Sessions\1\AppContainerNamedObjects\S-1-15-2-3090071799-2393209565-2579518561-163766185-3046441188-2033989776-1725268752
+[sbox-exec] manual_map: cdylib mapped at 0x190000000 (0x9000 bytes), IPC @ 0x190006090, delta=0x0
+[sbox-exec] cdylib manual-mapped: base=0x190000000 size=0x9000 dll=\\?\C:\Users\ig\AppData\Local\Temp\winsbox-target\release\ac_cdylib.dll
+[sbox-exec] cdylib reported back: pid=9448 version=manual init=0xACDC0001 (manual-map)
+[sbox-exec] cdylib hook VAs: section=0x190002bc8 dirobj_create=0x190001d70 dirobj_open=0x1900027a8 pipe=0x19000216c cpw=0x1900018a8
+[sbox-exec] interception(arm64): NtCreateNamedPipeFile @ 0x7ffc0d8d1bf0 → cdylib @ 0x19000216c
+[sbox-exec] interception(arm64): NtOpenSection @ 0x7ffc0d8d13b0 → cdylib @ 0x190002bc8
+[sbox-exec] interception(arm64): NtCreateDirectoryObject @ 0x7ffc0d8d1b00 → cdylib @ 0x190001d70
+[sbox-exec] interception(arm64): NtOpenDirectoryObject @ 0x7ffc0d8d15c0 → cdylib @ 0x1900027a8
+[sbox-exec] cdylib ntdll hooks patched pre-resume; passthrough thunks: section=0x7ff535a50000 dirobj_create=0x7ff535a40000 dirobj_open=0x7ff535a30000 pipe=0x7ff535a60000 denylog_create=0x0 denylog_open=0x0 (log_denies=true trace_mode=true)
+[sbox-exec] interception(arm64): NtCreateFile @ 0x7ffc0d8d1590 → cdylib @ 0x190001f1c
+[sbox-exec] interception(arm64): NtOpenFile @ 0x7ffc0d8d1370 → cdylib @ 0x190002920
+[sbox-exec] interception(arm64): NtDeviceIoControlFile @ 0x7ffc0d8d1070 → cdylib @ 0x1900025cc
+[sbox-exec] interception(arm64): NtAlpcConnectPort @ 0x7ffc0d8d17f0 → cdylib @ 0x190001be0
+[sbox-exec] interception(arm64): NtAlpcSendWaitReceivePort @ 0x7ffc0d8d1920 → cdylib @ 0x190001c78
+[sbox-exec] interception(arm64): NtOpenKey @ 0x7ffc0d8d1130 → cdylib @ 0x190002a30
+[sbox-exec] interception(arm64): NtOpenKeyEx @ 0x7ffc0d8d22f0 → cdylib @ 0x1900029a8
+[sbox-exec] interception(arm64): NtQueryValueKey @ 0x7ffc0d8d1180 → cdylib @ 0x190002f48
+[sbox-exec] interception(arm64): NtCreateEvent @ 0x7ffc0d8d14c0 → cdylib @ 0x190001d90
+[sbox-exec] interception(arm64): NtOpenEvent @ 0x7ffc0d8d1440 → cdylib @ 0x1900027c8
+[sbox-exec] interception(arm64): NtCreateMutant @ 0x7ffc0d8d1be0 → cdylib @ 0x1900020e4
+[sbox-exec] interception(arm64): NtOpenMutant @ 0x7ffc0d8d2330 → cdylib @ 0x190002ab8
+[sbox-exec] interception(arm64): NtMapViewOfSection @ 0x7ffc0d8d12a0 → cdylib @ 0x19000271c
+[sbox-exec] interception(arm64): NtCreateSection @ 0x7ffc0d8d14e0 → cdylib @ 0x19000252c
+[sbox-exec] interception(arm64): NtAllocateVirtualMemory @ 0x7ffc0d8d1190 → cdylib @ 0x190001b58
+[sbox-exec] interception(trace,arm64): cdylib export missing for NtOpenSection; skip
+[sbox-exec] interception(arm64): NtQueryInformationProcess @ 0x7ffc0d8d11a0 → cdylib @ 0x190002dac
+[sbox-exec] interception(arm64): NtOpenProcessToken @ 0x7ffc0d8d2370 → cdylib @ 0x190002b40
+[sbox-exec] interception(arm64): NtOpenThreadToken @ 0x7ffc0d8d1260 → cdylib @ 0x190002c70
+[sbox-exec] interception(arm64): NtQueryInformationToken @ 0x7ffc0d8d1220 → cdylib @ 0x190002e34
+[sbox-exec] interception(arm64): NtQuerySystemInformation @ 0x7ffc0d8d13a0 → cdylib @ 0x190002ebc
+[sbox-exec] interception(arm64): NtReadVirtualMemory @ 0x7ffc0d8d1430 → cdylib @ 0x190002fe4
+[sbox-exec] interception(arm64): NtClose @ 0x7ffc0d8d10f0 → cdylib @ 0x190001d00
+[sbox-exec] interception(trace,arm64): cdylib export missing for NtCreateNamedPipeFile; skip
+[sbox-exec] interception(arm64): NtFsControlFile @ 0x7ffc0d8d13d0 → cdylib @ 0x190002674
+[sbox-exec] interception(arm64): NtSetInformationFile @ 0x7ffc0d8d1290 → cdylib @ 0x190003064
+[sbox-exec] interception(arm64): NtQueryDirectoryFile @ 0x7ffc0d8d1390 → cdylib @ 0x190002cf8
+[sbox-exec] interception(arm64): NtCreateKey @ 0x7ffc0d8d11e0 → cdylib @ 0x190001fbc
+[sbox-exec] interception(arm64): NtCreateMailslotFile @ 0x7ffc0d8d1bd0 → cdylib @ 0x190002044
+[sbox-exec] interception(arm64): NtUnmapViewOfSection @ 0x7ffc0d8d12d0 → cdylib @ 0x1900030ec
+[sbox-exec] cdylib trace hooks patched pre-resume (28/30 of TRACE_SYSCALL_NAMES)
+[sbox-exec] cdylib serve_ipc thread spawned (pre-resume)
+[sbox-exec] entry_trampoline: rtlstart=0x7ffc0daec3a0 → stub @ 0x7ff535860000
+[sbox-exec] cdylib injection setup failed (entry rendezvous failed: target exited before signalling (exit=0xc0000005)); resuming target without cdylib
+[sbox-exec] target exit=0xc0000005
+--- end ---
+[smoke_bash] FAIL — 3 sub-test failure(s):
+[smoke_bash]   - test1: expected exit 0, got Some(-1073741819)
+[smoke_bash]   - test1: stdout missing 'hello': ""
+[smoke_bash]   - test1: crash code 0xc0000005 on stderr
+error: process didn't exit successfully: `C:\Users\ig\AppData\Local\Temp\winsbox-target\release\examples\smoke_bash.exe` (exit code: 2)

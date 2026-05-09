@@ -239,12 +239,13 @@ pub fn manual_map_cdylib(target: HANDLE, dll_path: &Path) -> Result<ManualMapped
     let hook_create_process_internal_w =
         resolve_target_export_va(dll_path, base, "hook_create_process_internal_w")?;
 
-    // Phase K + Phase L cycle 3: resolve the 15 trace-mode hook
+    // Phase K + L cycle 3 + N-5: resolve the 30 trace-mode hook
     // export VAs. Order matches `crate::ipc::TRACE_SYSCALL_NAMES`
-    // (and the cdylib's `TRACE_*` constants). The trailing 3
-    // (NtMapViewOfSection, NtCreateSection, NtAllocateVirtualMemory)
-    // were added in Phase L cycle 3 to capture loader-time syscalls
-    // before the existing trace hooks fire.
+    // (and the cdylib's `TRACE_*` constants). Phase L cycle 3 added
+    // 3 loader-time syscalls (Map/Create/AllocateVirtualMemory);
+    // Phase N-5 added 15 more covering Cygwin DllMain (section
+    // open, token/process info, file control, directory enum,
+    // registry create, mailslot, handle close, RPM, unmap).
     let trace_export_names = [
         "hook_nt_create_file_trace",
         "hook_nt_open_file_trace",
@@ -261,6 +262,22 @@ pub fn manual_map_cdylib(target: HANDLE, dll_path: &Path) -> Result<ManualMapped
         "hook_nt_map_view_of_section_trace",
         "hook_nt_create_section_trace",
         "hook_nt_allocate_virtual_memory_trace",
+        // Phase N-5.
+        "hook_nt_open_section_trace",
+        "hook_nt_query_information_process_trace",
+        "hook_nt_open_process_token_trace",
+        "hook_nt_open_thread_token_trace",
+        "hook_nt_query_information_token_trace",
+        "hook_nt_query_system_information_trace",
+        "hook_nt_read_virtual_memory_trace",
+        "hook_nt_close_trace",
+        "hook_nt_create_named_pipe_file_trace",
+        "hook_nt_fs_control_file_trace",
+        "hook_nt_set_information_file_trace",
+        "hook_nt_query_directory_file_trace",
+        "hook_nt_create_key_trace",
+        "hook_nt_create_mailslot_file_trace",
+        "hook_nt_unmap_view_of_section_trace",
     ];
     let mut hook_trace = [0usize; crate::ipc::TRACE_SYSCALL_COUNT];
     for (i, name) in trace_export_names.iter().enumerate() {
@@ -392,8 +409,12 @@ pub fn prefill_trace_passthroughs(
 
 /// Phase N-0: write the deny-log passthrough thunk VAs into
 /// `IPC.passthrough_nt_create_file_denylog` /
-/// `IPC.passthrough_nt_open_file_denylog`. Layout: 2 u64s at
-/// offset 0xC0 (= 0x48 trace base + 15 * 8 = 0x48 + 0x78).
+/// `IPC.passthrough_nt_open_file_denylog`. Layout: 2 u64s.
+/// Offset = 0x48 (trace passthrough base) + TRACE_SYSCALL_COUNT * 8.
+/// Phase N-5 grew TRACE_SYSCALL_COUNT 15 → 30, so the denylog
+/// fields moved from 0xC0 (15 * 8 = 0x78 → 0x48 + 0x78 = 0xC0) to
+/// 0x138 (30 * 8 = 0xF0 → 0x48 + 0xF0 = 0x138). Computed at runtime
+/// from `TRACE_SYSCALL_COUNT` so a future bump won't drift.
 ///
 /// Called after `install_denylog` has built both thunks (or skipped
 /// install via `WINSBOX_LOG_DENIES=0`, in which case both thunks
@@ -405,9 +426,10 @@ pub fn prefill_denylog_passthroughs(
     target: HANDLE, ipc_va: usize, create_pt: usize, open_pt: usize,
 ) -> Result<()> {
     let payload: [u64; 2] = [create_pt as u64, open_pt as u64];
+    let denylog_off = 0x48 + crate::ipc::TRACE_SYSCALL_COUNT * 8;
     write_remote_bytes(
         target,
-        ipc_va + 0xC0,
+        ipc_va + denylog_off,
         unsafe {
             std::slice::from_raw_parts(
                 payload.as_ptr() as *const u8,

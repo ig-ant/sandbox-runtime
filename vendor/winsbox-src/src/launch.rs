@@ -844,7 +844,20 @@ fn try_inject_cdylib_full(
     );
     let mut trace_pt = interception::TracePassthroughs::default();
     if trace_mode {
-        if let Err(e) = interception::install_trace(target, &mapped.hook_trace, &mut trace_pt) {
+        // Phase N-5: avoid double-patching syscalls already owned by
+        // the proxy/namespace hooks. `install_fs` patched
+        // NtCreateNamedPipeFile (trace slot 23), `install_reg` patched
+        // NtOpenSection (trace slot 15). If we let install_trace
+        // re-patch those, the proxy hooks become unreachable. Zero
+        // those entries in `hook_trace` so install_trace skips them.
+        let mut trace_vas = mapped.hook_trace;
+        if entries.nt_open_section != 0 {
+            trace_vas[crate::ipc::TRACE_NT_OPEN_SECTION as usize] = 0;
+        }
+        if entries.nt_create_named_pipe_file != 0 {
+            trace_vas[crate::ipc::TRACE_NT_CREATE_NAMED_PIPE_FILE as usize] = 0;
+        }
+        if let Err(e) = interception::install_trace(target, &trace_vas, &mut trace_pt) {
             drop(ch);
             cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
             return Err(e.context("install_trace (manual-map)"));
@@ -1676,6 +1689,69 @@ fn trace_arg_summary(target: HANDLE, id: usize, req: &ipc::Wire) -> String {
         TRACE_NT_ALLOCATE_VIRTUAL_MEMORY => format!(
             "proc_h={:#x} type={:#x} prot={:#x}",
             req.args[1], req.args[2] as u32, req.args[3] as u32,
+        ),
+        // Phase N-5 additions.
+        TRACE_NT_OPEN_SECTION => format!(
+            "name={:?} access={:#x}",
+            oa_path(req.args[1]), req.args[2] as u32,
+        ),
+        TRACE_NT_QUERY_INFORMATION_PROCESS => format!(
+            "proc_h={:#x} class={} buf_len={}",
+            req.args[1], req.args[2] as u32, req.args[3],
+        ),
+        TRACE_NT_OPEN_PROCESS_TOKEN => format!(
+            "proc_h={:#x} access={:#x}",
+            req.args[1], req.args[2] as u32,
+        ),
+        TRACE_NT_OPEN_THREAD_TOKEN => format!(
+            "thread_h={:#x} access={:#x} as_self={}",
+            req.args[1], req.args[2] as u32, req.args[3] as u8,
+        ),
+        TRACE_NT_QUERY_INFORMATION_TOKEN => format!(
+            "tok_h={:#x} class={} buf_len={}",
+            req.args[1], req.args[2] as u32, req.args[3],
+        ),
+        TRACE_NT_QUERY_SYSTEM_INFORMATION => format!(
+            "class={} buf_len={}",
+            req.args[1] as u32, req.args[2],
+        ),
+        TRACE_NT_READ_VIRTUAL_MEMORY => format!(
+            "proc_h={:#x} addr={:#x} len={}",
+            req.args[1], req.args[2], req.args[3],
+        ),
+        TRACE_NT_CLOSE => format!(
+            "h={:#x}",
+            req.args[1],
+        ),
+        TRACE_NT_CREATE_NAMED_PIPE_FILE => format!(
+            "name={:?} access={:#x} disp={:#x} opts={:#x}",
+            oa_path(req.args[1]), req.args[2] as u32,
+            req.args[3] as u32, req.args[4] as u32,
+        ),
+        TRACE_NT_FS_CONTROL_FILE => format!(
+            "h={:#x} fsctl={:#010x} in_len={} out_len={}",
+            req.args[1], req.args[2] as u32, req.args[3], req.args[4],
+        ),
+        TRACE_NT_SET_INFORMATION_FILE => format!(
+            "h={:#x} class={} buf_len={}",
+            req.args[1], req.args[2] as u32, req.args[3],
+        ),
+        TRACE_NT_QUERY_DIRECTORY_FILE => format!(
+            "h={:#x} class={} buf_len={} restart={}",
+            req.args[1], req.args[2] as u32, req.args[3], req.args[4] as u8,
+        ),
+        TRACE_NT_CREATE_KEY => format!(
+            "key={:?} access={:#x} opts={:#x}",
+            oa_path(req.args[1]), req.args[2] as u32, req.args[3] as u32,
+        ),
+        TRACE_NT_CREATE_MAILSLOT_FILE => format!(
+            "name={:?} access={:#x} opts={:#x} max_msg={}",
+            oa_path(req.args[1]), req.args[2] as u32,
+            req.args[3] as u32, req.args[4],
+        ),
+        TRACE_NT_UNMAP_VIEW_OF_SECTION => format!(
+            "proc_h={:#x} addr={:#x}",
+            req.args[1], req.args[2],
         ),
         _ => format!("(unknown id {id})"),
     }
