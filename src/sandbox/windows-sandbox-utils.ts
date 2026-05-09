@@ -213,6 +213,13 @@ export async function wrapCommandWithSandboxWindows(
   if (p.windowsConfig?.stableSidKey) {
     policy.stableSidKey = p.windowsConfig.stableSidKey
   }
+  // Phase N-2: forward the autoToolchainAccess override only when the
+  // caller set it explicitly. Broker default is `true`; emitting only
+  // explicit values keeps the JSON envelope small and lets the broker
+  // owner the default semantics.
+  if (typeof p.windowsConfig?.autoToolchainAccess === 'boolean') {
+    policy.autoToolchainAccess = p.windowsConfig.autoToolchainAccess
+  }
 
   const policyPath = path.join(
     os.tmpdir(),

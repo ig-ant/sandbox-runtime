@@ -19,3 +19,6 @@ pub mod acl_stamper;
 
 #[cfg(windows)]
 pub mod stamp_manifest;
+
+#[cfg(windows)]
+pub mod broker_open;

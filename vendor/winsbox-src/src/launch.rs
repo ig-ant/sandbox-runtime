@@ -84,6 +84,15 @@ struct SpawnCtx {
     /// Join handles for nested service threads, so the main loop
     /// can wait for the whole tree on exit.
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    /// Phase N-2: policy lists used by the `OP_BROKER_OPEN` handler.
+    /// Built once at broker startup from the parsed policy + the
+    /// PATH walk for auto-toolchain dirs.
+    broker_open_policy: crate::broker_open::PolicyLists,
+    /// Phase N-2: master kill-switch for broker-mediated opens.
+    /// Set via `WINSBOX_BROKER_OPEN=0` for A/B testing — when off
+    /// the handler returns `STATUS_ACCESS_DENIED` immediately
+    /// without consulting policy or attempting any open.
+    broker_open_enabled: bool,
 }
 unsafe impl Send for SpawnCtx {}
 unsafe impl Sync for SpawnCtx {}
@@ -189,6 +198,47 @@ fn run_confined(pol: &Policy, manifest_dir: &std::path::Path) -> Result<u32> {
             None
         }
     };
+
+    // Phase N-2: build the broker-open policy lists. Auto-toolchain
+    // PATH walk runs once per broker session and feeds into the
+    // OP_BROKER_OPEN handler.
+    let broker_open_enabled = std::env::var("WINSBOX_BROKER_OPEN")
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true);
+    let auto_toolchain = if pol.auto_toolchain_access {
+        crate::broker_open::detect_toolchain_dirs()
+    } else {
+        Vec::new()
+    };
+    if !auto_toolchain.is_empty() {
+        log!(
+            "auto-toolchain: detected {} tooling dirs: {}",
+            auto_toolchain.len(),
+            auto_toolchain.join(", "),
+        );
+    } else if pol.auto_toolchain_access {
+        log!("auto-toolchain: no tooling dirs detected on PATH");
+    } else {
+        log!("auto-toolchain: disabled by policy");
+    }
+    let broker_open_policy = crate::broker_open::PolicyLists {
+        allow_read: pol.allow_read.clone(),
+        deny_read: pol.deny_read.clone(),
+        allow_write: pol.allow_write.clone(),
+        deny_write: pol.deny_write.clone(),
+        auto_toolchain,
+    };
+    log!(
+        "broker-open: enabled={broker_open_enabled} \
+         allow_read={} deny_read={} allow_write={} deny_write={} \
+         auto_toolchain={}",
+        broker_open_policy.allow_read.len(),
+        broker_open_policy.deny_read.len(),
+        broker_open_policy.allow_write.len(),
+        broker_open_policy.deny_write.len(),
+        broker_open_policy.auto_toolchain.len(),
+    );
+
     let job = Job::new()?;
     log!("Job created");
     let desktop = if pol.use_alternate_desktop
@@ -238,6 +288,16 @@ fn run_confined(pol: &Policy, manifest_dir: &std::path::Path) -> Result<u32> {
         .find(|p| std::path::Path::new(p).is_dir())
         .cloned()
         .unwrap_or_else(|| ac.folder.to_string_lossy().into_owned());
+    // Phase N-2 note: we deliberately do NOT honour `pol.cwd` here.
+    // Callers that supply `cwd` typically pass their own process
+    // working directory, which is rarely AC-reachable; using it as
+    // the AC cwd makes the AC fail to canonicalize its CWD on every
+    // op. The smoke_broker_open example sidesteps this with an
+    // explicit `cwd: <Windows>` policy entry which we still pick up
+    // via the allow_write fallback if the test sets one. If a future
+    // caller needs a precise cwd it should use `allowWrite` (which
+    // is AC-reachable by definition) and fall through here.
+    let _ = pol.cwd; // documented drop; kept for future use.
 
     // ── Build the USER_LIMITED + IL_UNTRUSTED lowbox token pair.
     //    Always-on in AppContainer mode (the only production mode);
@@ -332,6 +392,7 @@ fn run_confined(pol: &Policy, manifest_dir: &std::path::Path) -> Result<u32> {
         match try_inject_cdylib_full(
             &ac, dll_path, pi.hProcess, pi.hThread,
             &job, &target_cwd, &extra_env, broker_tokens.as_ref(),
+            broker_open_policy.clone(), broker_open_enabled,
         ) {
             Ok((inj, ctx, stop)) => {
                 cdylib_inj = Some(inj);
@@ -552,6 +613,7 @@ impl Drop for CdylibInjection {
 /// Returns a `CdylibInjection` (caller drops on exit to revert the
 /// stamp + close BNO handles) and a populated `SpawnCtx` whose
 /// `serve_ipc` thread is already running.
+#[allow(clippy::too_many_arguments)]
 fn try_inject_cdylib_full(
     ac: &AppContainer,
     dll_path: &std::path::Path,
@@ -561,6 +623,8 @@ fn try_inject_cdylib_full(
     target_cwd: &str,
     extra_env: &[(String, String)],
     broker_tokens: Option<&BrokerTokens>,
+    broker_open_policy: crate::broker_open::PolicyLists,
+    broker_open_enabled: bool,
 ) -> Result<(CdylibInjection, Arc<SpawnCtx>, Arc<AtomicBool>)> {
     // ── 1. Resolve + stamp the cdylib's parent dir for AC RX.
     let dll_canon = dll_path.canonicalize()
@@ -849,6 +913,8 @@ fn try_inject_cdylib_full(
         trace: std::env::var("SBOX_TRACE").is_ok(),
         broker_pipes: Mutex::new(std::collections::HashSet::new()),
         threads: Mutex::new(Vec::new()),
+        broker_open_policy,
+        broker_open_enabled,
     });
     let target_raw = target.0 as isize;
     let ctx_thread = ctx.clone();
@@ -1130,6 +1196,8 @@ fn serve_ipc(ch: ipc::Channel, target_raw: isize, ctx: Arc<SpawnCtx>) {
                 handle_trace(&ch, target, &req),
             ipc::OP_DENIED_OPEN =>
                 handle_denied_open(&ch, target, &req),
+            ipc::OP_BROKER_OPEN =>
+                handle_broker_open(&ch, target, &req, &ctx),
             op => {
                 eprintln!("[sbox-exec] ipc: unknown op {op}");
                 ch.reply_fs(0, 0, 0xC0000002u32 as i32 /* STATUS_NOT_IMPLEMENTED */);
@@ -1215,6 +1283,256 @@ fn handle_denied_open(ch: &ipc::Channel, target: HANDLE, req: &ipc::Wire) {
          share={share_access:#x} options={options:#x} status={status:#010x}",
     );
     ch.reply_denylog_ack();
+}
+
+/// Phase N-2: handle an `OP_BROKER_OPEN` proxy frame. The cdylib
+/// sends one of these whenever its proxy hook saw the saved-original
+/// passthrough return `STATUS_ACCESS_DENIED`. We:
+///
+///   1. Chase `args[0]` (OBJECT_ATTRIBUTES* VA) via `ReadProcessMemory`
+///      to recover the wide path.
+///   2. Reject if `RootDirectory` is non-NULL — relative opens not
+///      supported in this iteration (M-1+ follow-up).
+///   3. Run the policy check against the input path (allowRead /
+///      allowWrite / auto-toolchain dirs minus deny-list overrides).
+///   4. If allowed, broker-issue the open under the broker's own
+///      user-token via `NtCreateFile`. Canonicalize via
+///      `GetFinalPathNameByHandleW`. Re-run policy check against the
+///      canonical path to defend against symlink/junction escapes.
+///   5. `DuplicateHandle` the broker-side handle into the AC,
+///      `CloseHandle` the broker-local copy, reply with the duped
+///      target-side value.
+///
+/// Every call emits one of two audit log lines:
+///
+///   `[sbox-exec] broker-open: GRANTED path=… canonical=… handle=0x…`
+///   `[sbox-exec] broker-open: REJECTED path=… reason="…"`
+///
+/// Returns the underlying NTSTATUS (or `STATUS_ACCESS_DENIED` on
+/// rejection) plus the duped handle (or 0).
+fn handle_broker_open(
+    ch: &ipc::Channel, target: HANDLE, req: &ipc::Wire, ctx: &Arc<SpawnCtx>,
+) {
+    use windows::Wdk::Foundation::OBJECT_ATTRIBUTES;
+    use windows::Win32::Foundation::{NTSTATUS, UNICODE_STRING, GENERIC_READ};
+    use windows::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
+    use windows::Win32::Foundation::DuplicateHandle;
+    use windows::Win32::Foundation::DUPLICATE_SAME_ACCESS;
+    use windows::Win32::System::Threading::GetCurrentProcess;
+
+    const STATUS_ACCESS_DENIED: i32 = 0xC0000022u32 as i32;
+
+    // Master kill-switch: WINSBOX_BROKER_OPEN=0.
+    if !ctx.broker_open_enabled {
+        ch.reply_broker_open(STATUS_ACCESS_DENIED, 0);
+        return;
+    }
+
+    let oa_va = req.args[0];
+    let desired_access = req.args[1] as u32;
+    let share_access = req.args[2] as u32;
+    let options = req.args[3] as u32;
+    let syscall_id = req.args[4];
+    let syscall_name = match syscall_id {
+        ipc::BROKER_OPEN_NT_CREATE_FILE => "NtCreateFile",
+        ipc::BROKER_OPEN_NT_OPEN_FILE => "NtOpenFile",
+        _ => "?",
+    };
+
+    // 1. Read OA from target.
+    let (root, raw_name) = match read_target_oa_raw(target, oa_va as usize) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "[sbox-exec] broker-open: REJECTED ({syscall_name}) \
+                 reason=\"oa-read failed: {e:#}\"",
+            );
+            ch.reply_broker_open(STATUS_ACCESS_DENIED, 0);
+            return;
+        }
+    };
+
+    // 2. Reject relative opens (RootDirectory != NULL).
+    if root != 0 {
+        eprintln!(
+            "[sbox-exec] broker-open: REJECTED ({syscall_name}) \
+             path={raw_name:?} root={root:#x} \
+             reason=\"{}\"",
+            crate::broker_open::RejectReason::RelativeOpen.as_str(),
+        );
+        ch.reply_broker_open(STATUS_ACCESS_DENIED, 0);
+        return;
+    }
+
+    // 3. Normalise path + run policy check.
+    let Some(path) = crate::broker_open::normalize_nt_path(&raw_name) else {
+        eprintln!(
+            "[sbox-exec] broker-open: REJECTED ({syscall_name}) \
+             path={raw_name:?} reason=\"{}\"",
+            crate::broker_open::RejectReason::NonDosPath.as_str(),
+        );
+        ch.reply_broker_open(STATUS_ACCESS_DENIED, 0);
+        return;
+    };
+    let decision = crate::broker_open::is_path_allowed_for_broker_open(
+        &path, desired_access, &ctx.broker_open_policy,
+    );
+    let crate::broker_open::Decision::Allow = decision else {
+        let reason = match decision {
+            crate::broker_open::Decision::Reject(r) => r.as_str(),
+            _ => "?",
+        };
+        eprintln!(
+            "[sbox-exec] broker-open: REJECTED ({syscall_name}) \
+             path={path:?} access={desired_access:#x} reason=\"{reason}\"",
+        );
+        ch.reply_broker_open(STATUS_ACCESS_DENIED, 0);
+        return;
+    };
+
+    // 4. Broker-side `NtCreateFile`. Build a fresh OBJECT_ATTRIBUTES
+    //    in our own VA. Always request synchronous I/O — the broker
+    //    is single-threaded per call.
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtCreateFile(
+            file_handle: *mut HANDLE, desired_access: u32,
+            oa: *const OBJECT_ATTRIBUTES, iosb: *mut [usize; 2],
+            allocation_size: *const i64, file_attributes: u32,
+            share_access: u32, create_disposition: u32,
+            create_options: u32, ea_buffer: *const c_void, ea_length: u32,
+        ) -> NTSTATUS;
+    }
+
+    // Strip access bits the broker token can't honour and don't
+    // matter for read-only mediated opens. Leave WRITE_* if the
+    // caller asked AND policy allowed (we only get here if allowed).
+    // For maximum reliability use GENERIC_READ when the caller
+    // didn't explicitly ask for write access — many ACs hit
+    // STATUS_ACCESS_DENIED on EXECUTE+READ when a wider mask would
+    // succeed.
+    let want_write = crate::broker_open::is_write_access(desired_access)
+        && !crate::broker_open::is_maximum_allowed(desired_access);
+    let broker_access = if want_write {
+        desired_access
+    } else {
+        // Honour the caller's read intent but ensure GENERIC_READ
+        // is set so loader-style "execute and read" opens succeed.
+        desired_access | GENERIC_READ.0
+    };
+
+    // NtCreateFile wants the NT-namespace form. Convert from our
+    // normalised DOS form (`C:\foo`, `\\server\share\x`) back to
+    // `\??\C:\foo` / `\??\UNC\server\share\x` so the I/O manager
+    // can resolve it. Trailing backslash on bare drive roots
+    // (`C:\`) is kept — NT requires it.
+    let nt_path = if path.starts_with(r"\\") {
+        format!(r"\??\UNC\{}", &path[2..])
+    } else {
+        format!(r"\??\{}", path)
+    };
+    let mut wpath: Vec<u16> = nt_path.encode_utf16().collect();
+    let us = UNICODE_STRING {
+        Length: (wpath.len() * 2) as u16,
+        MaximumLength: (wpath.len() * 2) as u16,
+        Buffer: PWSTR(wpath.as_mut_ptr()),
+    };
+    let oa = OBJECT_ATTRIBUTES {
+        Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: HANDLE::default(),
+        ObjectName: &us as *const _ as *mut _,
+        // OBJ_CASE_INSENSITIVE.
+        Attributes: 0x40,
+        SecurityDescriptor: std::ptr::null_mut(),
+        SecurityQualityOfService: std::ptr::null_mut(),
+    };
+    let mut bh = HANDLE::default();
+    let mut iosb = [0usize; 2];
+    // FILE_OPEN (1) — caller asked NtOpenFile/NtCreateFile, but the
+    // typical mediated case is "open existing"; if the caller wants
+    // create-disposition semantics we'd need a richer wire. Keep
+    // FILE_OPEN for N-2; richer dispositions can land in N-3.
+    const FILE_OPEN: u32 = 1;
+    let st = unsafe {
+        NtCreateFile(
+            &mut bh, broker_access, &oa, &mut iosb,
+            std::ptr::null(), 0, share_access, FILE_OPEN,
+            options, std::ptr::null(), 0,
+        )
+    };
+    if st.0 < 0 {
+        // File doesn't exist / device error / etc. Surface the
+        // status to the AC; not a policy issue.
+        eprintln!(
+            "[sbox-exec] broker-open: KERNEL-FAIL ({syscall_name}) \
+             path={path:?} access={broker_access:#x} status={:#010x}",
+            st.0 as u32,
+        );
+        ch.reply_broker_open(st.0, 0);
+        return;
+    }
+
+    // 5. Canonicalise via GetFinalPathNameByHandleW + re-validate.
+    let mut fbuf = vec![0u16; 1024];
+    let n = unsafe {
+        GetFinalPathNameByHandleW(
+            bh, &mut fbuf, /*VOLUME_NAME_DOS=*/ Default::default(),
+        )
+    };
+    let canonical_raw = if n > 0 && (n as usize) < fbuf.len() {
+        String::from_utf16_lossy(&fbuf[..n as usize])
+    } else {
+        // Couldn't canonicalise (rare for files; common for
+        // pipes/console). Re-validate against the input path —
+        // good enough for the symlink-defence-in-depth check.
+        path.clone()
+    };
+    let canonical = crate::broker_open::normalize_nt_path(&canonical_raw)
+        .unwrap_or_else(|| canonical_raw.clone());
+    if canonical.to_ascii_lowercase() != path.to_ascii_lowercase() {
+        let recheck = crate::broker_open::is_path_allowed_for_broker_open(
+            &canonical, desired_access, &ctx.broker_open_policy,
+        );
+        if !matches!(recheck, crate::broker_open::Decision::Allow) {
+            let reason = match recheck {
+                crate::broker_open::Decision::Reject(r) => r.as_str(),
+                _ => "?",
+            };
+            eprintln!(
+                "[sbox-exec] broker-open: REJECTED-CANONICAL ({syscall_name}) \
+                 path={path:?} canonical={canonical:?} reason=\"{reason}\" \
+                 (symlink/junction escape)",
+            );
+            unsafe { let _ = CloseHandle(bh); }
+            ch.reply_broker_open(STATUS_ACCESS_DENIED, 0);
+            return;
+        }
+    }
+
+    // 6. Duplicate into target.
+    let mut th = HANDLE::default();
+    let dup_ok = unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(), bh, target, &mut th,
+            0, false, DUPLICATE_SAME_ACCESS,
+        ).is_ok()
+    };
+    unsafe { let _ = CloseHandle(bh); }
+    if !dup_ok {
+        eprintln!(
+            "[sbox-exec] broker-open: DUP-FAIL ({syscall_name}) \
+             path={path:?} canonical={canonical:?}",
+        );
+        ch.reply_broker_open(STATUS_ACCESS_DENIED, 0);
+        return;
+    }
+    eprintln!(
+        "[sbox-exec] broker-open: GRANTED ({syscall_name}) \
+         path={path:?} canonical={canonical:?} access={broker_access:#x} \
+         handle={:#x}",
+        th.0 as u64,
+    );
+    ch.reply_broker_open(0, th.0 as u64);
 }
 
 /// Build the per-syscall arg summary for a trace log line.

@@ -1,6 +1,6 @@
 use serde::Deserialize;
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Policy {
     pub command_line: String,
@@ -33,6 +33,45 @@ pub struct Policy {
     ///
     /// JSON name: `stableSidKey`.
     pub stable_sid_key: Option<String>,
+    /// Phase N-2: when true (default), the broker walks `process.env.PATH`
+    /// at startup and adds any entry under a recognised toolchain root
+    /// (`Program Files`, `Program Files (x86)`, `%LOCALAPPDATA%\Programs`,
+    /// `%USERPROFILE%\scoop`, `%USERPROFILE%\.cargo\bin`) to an in-memory
+    /// **read-only** allow list consulted by `OP_BROKER_OPEN`. Writes
+    /// are NEVER auto-allowed — only `allowWrite` paths can be written
+    /// to via the broker.
+    ///
+    /// When false the broker still services `OP_BROKER_OPEN` against
+    /// the explicit `allowRead`/`allowWrite` lists; the auto-discovery
+    /// just doesn't run.
+    ///
+    /// JSON name: `autoToolchainAccess`. Defaults to `true` per
+    /// `default_auto_toolchain_access`.
+    #[serde(default = "default_auto_toolchain_access")]
+    pub auto_toolchain_access: bool,
+}
+
+fn default_auto_toolchain_access() -> bool {
+    true
+}
+
+impl Default for Policy {
+    fn default() -> Self {
+        Policy {
+            command_line: String::new(),
+            cwd: None,
+            env: Vec::new(),
+            allow_read: Vec::new(),
+            deny_read: Vec::new(),
+            allow_write: Vec::new(),
+            deny_write: Vec::new(),
+            network: NetworkPolicy::default(),
+            use_alternate_desktop: false,
+            cdylib_path: None,
+            stable_sid_key: None,
+            auto_toolchain_access: default_auto_toolchain_access(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]

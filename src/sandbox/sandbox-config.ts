@@ -273,6 +273,18 @@ export const WindowsConfigSchema = z.object({
         'broker falls back to a hash of its own install path.',
     ),
   useAlternateDesktop: z.boolean().optional(),
+  autoToolchainAccess: z
+    .boolean()
+    .optional()
+    .describe(
+      'Phase N-2: when true (default), the broker scans process.env.PATH ' +
+        'at startup for entries under recognised toolchain roots ' +
+        '(Program Files, Program Files (x86), %LOCALAPPDATA%\\Programs, ' +
+        '%USERPROFILE%\\scoop, %USERPROFILE%\\.cargo\\bin) and grants ' +
+        'AC processes read access via broker-mediated NtCreateFile/NtOpenFile. ' +
+        'Writes are NEVER auto-allowed — only paths in allowWrite can be written. ' +
+        'Set false to require explicit allowRead entries for every tooling dir.',
+    ),
 })
 
 /**

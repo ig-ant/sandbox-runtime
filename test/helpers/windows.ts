@@ -97,40 +97,130 @@ export function isToolchainUsable(bin: string): boolean {
 }
 
 /**
- * Whether the resolved `git` is the MSYS2/Cygwin variant — those
- * binaries depend on `cygwin1.dll` / `msys-2.0.dll` which AVs in
- * `DllMain` under our lockdown token (Phase L). Skip the
- * `git --version` test in that case; the tracked workaround is to
- * land the cygwin compat hooks (separate follow-up).
+ * Static probe: parse the PE import directory of `exePath` and return
+ * true iff it imports `msys-2.0.dll` or `cygwin1.dll` (case-
+ * insensitive). Cygwin-runtime binaries AV in `cygwin1.dll!DllMain`
+ * under our lockdown token (Phase L); the affected tests gate on
+ * this and skip rather than fail.
+ *
+ * Reads the first ~64KB of the file — enough to cover the DOS
+ * stub, NT headers, section table, and (typically) the import
+ * directory's name strings. Returns `false` on any parse error or
+ * if the binary genuinely doesn't import a Cygwin runtime DLL.
+ *
+ * NOTE: this is **static** detection. A binary that dynamically
+ * `LoadLibrary`s msys-2.0.dll at runtime won't be classified by
+ * this probe. Runtime detection (e.g., a hooked LdrLoadDll path
+ * for Cygwin-aware behavior switching) is a future N-5/N-6 lever.
+ */
+export function isCygwinBinary(exePath: string): boolean {
+  let fd: number
+  try {
+    fd = fs.openSync(exePath, 'r')
+  } catch {
+    return false
+  }
+  try {
+    // Read just the headers first (4KB always covers DOS+NT+section
+    // table on every PE produced by linkers since 1995). Real
+    // binaries (bash, git, etc.) often have the import directory in
+    // a section past 1MB on disk, so we can't snarf the whole file
+    // up-front; we read each region we need with explicit pread.
+    const hdrBuf = Buffer.alloc(4096)
+    const hdrN = fs.readSync(fd, hdrBuf, 0, hdrBuf.length, 0)
+    if (hdrN < 0x40) return false
+
+    if (hdrBuf.readUInt16LE(0) !== 0x5a4d /* 'MZ' */) return false
+    const ntOff = hdrBuf.readUInt32LE(0x3c)
+    if (ntOff + 24 + 240 > hdrN) return false
+    if (hdrBuf.readUInt32LE(ntOff) !== 0x4550 /* 'PE\0\0' */) return false
+
+    const ohOff = ntOff + 4 + 20
+    const ohMagic = hdrBuf.readUInt16LE(ohOff)
+    const isPE32Plus = ohMagic === 0x20b
+    // DataDirectory at OptionalHeader+96 (PE32) or +112 (PE32+);
+    // entry [1] = IMAGE_DIRECTORY_ENTRY_IMPORT.
+    const ddOff = ohOff + (isPE32Plus ? 112 : 96)
+    if (ddOff + 16 > hdrN) return false
+    const importRva = hdrBuf.readUInt32LE(ddOff + 8)
+    const importSize = hdrBuf.readUInt32LE(ddOff + 12)
+    if (importRva === 0 || importSize === 0) return false
+
+    const numSections = hdrBuf.readUInt16LE(ntOff + 4 + 2)
+    const sizeOfOpt = hdrBuf.readUInt16LE(ntOff + 4 + 16)
+    const secOff = ntOff + 4 + 20 + sizeOfOpt
+    if (secOff + numSections * 40 > hdrN) return false
+    type Sec = { va: number; vsize: number; raw: number; rsize: number }
+    const secs: Sec[] = []
+    for (let i = 0; i < numSections; i++) {
+      const o = secOff + i * 40
+      const vsize = hdrBuf.readUInt32LE(o + 8)
+      const va = hdrBuf.readUInt32LE(o + 12)
+      const rsize = hdrBuf.readUInt32LE(o + 16)
+      const raw = hdrBuf.readUInt32LE(o + 20)
+      secs.push({ va, vsize, raw, rsize })
+    }
+
+    // Find the section containing the import directory and read just
+    // that section's data. Then index by RVA-relative offsets.
+    const importSec = secs.find(
+      (s) =>
+        importRva >= s.va && importRva < s.va + Math.max(s.vsize, s.rsize),
+    )
+    if (!importSec) return false
+    const secSize = Math.max(importSec.vsize, importSec.rsize)
+    const secBuf = Buffer.alloc(secSize)
+    const secN = fs.readSync(fd, secBuf, 0, secSize, importSec.raw)
+    if (secN === 0) return false
+    const data = secBuf.subarray(0, secN)
+    const rvaToSecOff = (rva: number): number | undefined => {
+      if (rva < importSec.va || rva >= importSec.va + secSize) return undefined
+      const off = rva - importSec.va
+      return off < data.length ? off : undefined
+    }
+    const importOff = rvaToSecOff(importRva)
+    if (importOff === undefined) return false
+
+    // IMAGE_IMPORT_DESCRIPTOR is 20 bytes; NULL-descriptor terminator.
+    // Field of interest: Name at +12 (RVA of NUL-terminated ASCII).
+    const cygDlls = ['msys-2.0.dll', 'cygwin1.dll']
+    for (let off = importOff; off + 20 <= data.length; off += 20) {
+      const nameRva = data.readUInt32LE(off + 12)
+      const ofth = data.readUInt32LE(off)
+      const fth = data.readUInt32LE(off + 16)
+      if (nameRva === 0 && ofth === 0 && fth === 0) break
+      if (nameRva === 0) continue
+      const nameOff = rvaToSecOff(nameRva)
+      if (nameOff === undefined) continue
+      let end = nameOff
+      while (end < data.length && data[end] !== 0) end++
+      if (end > nameOff) {
+        const dllName = data.toString('latin1', nameOff, end).toLowerCase()
+        if (cygDlls.includes(dllName)) return true
+      }
+    }
+    return false
+  } catch {
+    return false
+  } finally {
+    fs.closeSync(fd)
+  }
+}
+
+/**
+ * Convenience wrapper kept for backwards-compatibility with the prior
+ * heuristic. Resolves git on PATH, finds its parent dir, and probes
+ * the .exe via {@link isCygwinBinary}. Returns `false` when git
+ * isn't on PATH.
+ *
+ * @deprecated prefer {@link isCygwinBinary} with an explicit exe path.
  */
 export function isCygwinGit(): boolean {
   const dir = findToolchainDir('git')
   if (!dir) return false
-  // Detect a "Git for Windows" install layout: any sibling subtree
-  // containing cygwin1.dll or msys-2.0.dll means git was built on
-  // the MSYS2 runtime and re-execs through it. The Git\cmd\git.exe
-  // wrapper also defers to the same backing binary.
-  const dlls = ['cygwin1.dll', 'msys-2.0.dll']
-  const candidateRoots: string[] = [dir]
-  // Walk up to a parent that looks like a Git-for-Windows root
-  // (contains a `cmd` subdir) and probe its known bin subtrees.
-  // PATH entries are typically `<root>\<flavour>\bin` (one level
-  // deep) or `<root>\cmd` (zero deep), so try one and two levels up.
-  for (let up = 1; up <= 2; up++) {
-    const root = path.resolve(dir, ...Array(up).fill('..'))
-    for (const sibling of ['usr/bin', 'clangarm64/bin', 'mingw64/bin', 'bin']) {
-      candidateRoots.push(path.join(root, ...sibling.split('/')))
-    }
-  }
-  // The Git\cmd wrapper has no cygwin DLLs in its dir, but every
-  // Git-for-Windows install reachable from it does.
-  if (/\\Git\\cmd$/i.test(dir)) return true
-  for (const root of candidateRoots) {
-    for (const dll of dlls) {
-      if (fs.existsSync(path.join(root, dll))) return true
-    }
-  }
-  return false
+  const exe = path.join(dir, 'git.exe')
+  if (!fs.existsSync(exe)) return false
+  return isCygwinBinary(exe)
 }
 
 export async function makeFixture(): Promise<Fixture> {

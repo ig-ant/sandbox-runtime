@@ -84,7 +84,19 @@ extern "system" {
 /// `STATUS_ACCESS_DENIED` do they emit IPC. Two new passthrough VAs
 /// land in `IpcEnv` (alongside the trace passthroughs). Disable via
 /// the broker's `WINSBOX_LOG_DENIES=0` env var; default ON.
-pub const CDYLIB_VERSION: u32 = 5;
+///
+/// v6 (Phase N-2): the always-on `denylog` hooks become proxy-mode
+/// hooks. After the passthrough returns `STATUS_ACCESS_DENIED`, the
+/// hook first sends an `OP_BROKER_OPEN` frame; the broker may grant
+/// the open by re-issuing under its own user-token, canonicalizing
+/// the path, validating against `allowRead`/`allowWrite`/auto-
+/// toolchain dirs, and `DuplicateHandle`-ing the result into the AC.
+/// On a granted open the cdylib writes the duped handle into the
+/// caller's `*FileHandle` and returns SUCCESS. On rejection the
+/// cdylib falls through to the legacy `OP_DENIED_OPEN` log frame
+/// and returns the original ACCESS_DENIED. Disable mediation via
+/// `WINSBOX_BROKER_OPEN=0` (broker-side env); deny-logging stays on.
+pub const CDYLIB_VERSION: u32 = 6;
 
 /// Sentinel return value for `cdylib_init`. Broker verifies on
 /// report-back. Retained as a no-op export so the broker's
@@ -256,6 +268,28 @@ const OP_DENIED_OPEN: u64 = 101;
 /// `TRACE_*` family; broker maps these via `OP_DENIED_OPEN.args[0]`).
 const DENYLOG_NT_CREATE_FILE: u64 = 0;
 const DENYLOG_NT_OPEN_FILE: u64 = 1;
+
+/// Phase N-2: broker-mediated open opcode. Sent by the proxy-mode
+/// hooks after the passthrough returns `STATUS_ACCESS_DENIED`. Wire
+/// layout:
+///   args[0] = OBJECT_ATTRIBUTES* VA
+///   args[1] = desired_access (u32)
+///   args[2] = share_access   (u32)
+///   args[3] = options        (u32 — CreateOptions / OpenOptions)
+///   args[4] = syscall id (`BROKER_OPEN_NT_CREATE_FILE` /
+///             `BROKER_OPEN_NT_OPEN_FILE`)
+/// Reply (broker writes back into the same `Wire`):
+///   args[0] = NTSTATUS (u32)
+///   args[1] = duped target-side HANDLE on success, 0 otherwise
+const OP_BROKER_OPEN: u64 = 102;
+
+/// Phase N-2: syscall ids for `OP_BROKER_OPEN`. Same shape as the
+/// `DENYLOG_*` family — independent numbering, broker-side decode.
+const BROKER_OPEN_NT_CREATE_FILE: u64 = 0;
+const BROKER_OPEN_NT_OPEN_FILE: u64 = 1;
+
+/// Phase N-2: NTSTATUS_SUCCESS sentinel for broker-open replies.
+const STATUS_SUCCESS: i32 = 0;
 
 const FS_PASSTHROUGH: i32 = 0xE0000001u32 as i32;
 const STATUS_ACCESS_DENIED: i32 = 0xC0000022u32 as i32;
@@ -1097,6 +1131,38 @@ unsafe fn ipc_denylog_send(
     ipc_roundtrip(&mut frame);
 }
 
+/// Phase N-2: send an `OP_BROKER_OPEN` frame and return
+/// `(NTSTATUS, target-handle)`. On `STATUS_SUCCESS` the caller writes
+/// `handle` into the syscall's `*FileHandle` out-param. Any other
+/// status (including the original `STATUS_ACCESS_DENIED` if the
+/// broker rejects the policy check) is returned to the caller
+/// unchanged.
+#[inline]
+unsafe fn ipc_broker_open_send(
+    syscall_id: u64, oa_va: u64,
+    desired_access: u32, share_access: u32, options: u32,
+) -> (NTSTATUS, u64) {
+    if !ipc_loaded() {
+        return (STATUS_ACCESS_DENIED, 0);
+    }
+    let mut frame = Wire {
+        op: OP_BROKER_OPEN,
+        args: [
+            oa_va,
+            desired_access as u64,
+            share_access as u64,
+            options as u64,
+            syscall_id,
+            0, 0, 0, 0, 0, 0, 0,
+        ],
+        r0: 0, r1: 0, r2: 0, r3: 0, r_status: 0, r_error: 0,
+    };
+    ipc_roundtrip(&mut frame);
+    let status = frame.args[0] as u32 as i32;
+    let handle = frame.args[1];
+    (status, handle)
+}
+
 #[allow(clippy::too_many_arguments)]
 #[no_mangle]
 pub unsafe extern "system" fn hook_nt_create_file_denylog(
@@ -1125,6 +1191,32 @@ pub unsafe extern "system" fn hook_nt_create_file_denylog(
         create_options, ea_buffer, ea_length,
     );
     if st == STATUS_ACCESS_DENIED {
+        // Phase N-2 proxy: try to route through the broker first.
+        // The broker validates against policy (allowRead / allowWrite
+        // / auto-toolchain dirs), canonicalizes the path, and dups
+        // the resulting handle into our process. On grant we return
+        // SUCCESS with the duped handle; on rejection we fall through
+        // to the legacy deny-log frame and surface the original
+        // ACCESS_DENIED.
+        let (bs, h) = ipc_broker_open_send(
+            BROKER_OPEN_NT_CREATE_FILE, oa as u64,
+            desired_access, share_access, create_options,
+        );
+        if bs == STATUS_SUCCESS && h != 0 {
+            if !out_handle.is_null() {
+                core::ptr::write(out_handle, h as HANDLE);
+            }
+            // Touch IO_STATUS_BLOCK so the caller's check for
+            // FILE_OPENED / FILE_CREATED disposition doesn't read
+            // uninitialised memory.
+            if !iosb.is_null() {
+                (*iosb)[0] = STATUS_SUCCESS as isize as usize;
+                (*iosb)[1] = 1; // FILE_OPENED
+            }
+            return STATUS_SUCCESS;
+        }
+        // Broker either rejected or had no policy match; log and
+        // return the original deny.
         ipc_denylog_send(
             DENYLOG_NT_CREATE_FILE, oa as u64,
             desired_access, share_access, create_options, st,
@@ -1150,6 +1242,22 @@ pub unsafe extern "system" fn hook_nt_open_file_denylog(
     let f: Fn6 = core::mem::transmute(pv as usize);
     let st = f(out_handle, desired_access, oa, iosb, share_access, open_options);
     if st == STATUS_ACCESS_DENIED {
+        // Phase N-2 proxy: try broker mediation first (see twin in
+        // `hook_nt_create_file_denylog` for full rationale).
+        let (bs, h) = ipc_broker_open_send(
+            BROKER_OPEN_NT_OPEN_FILE, oa as u64,
+            desired_access, share_access, open_options,
+        );
+        if bs == STATUS_SUCCESS && h != 0 {
+            if !out_handle.is_null() {
+                core::ptr::write(out_handle, h as HANDLE);
+            }
+            if !iosb.is_null() {
+                (*iosb)[0] = STATUS_SUCCESS as isize as usize;
+                (*iosb)[1] = 1; // FILE_OPENED
+            }
+            return STATUS_SUCCESS;
+        }
         ipc_denylog_send(
             DENYLOG_NT_OPEN_FILE, oa as u64,
             desired_access, share_access, open_options, st,

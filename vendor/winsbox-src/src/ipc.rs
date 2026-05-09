@@ -75,6 +75,30 @@ pub const OP_DENIED_OPEN: u64 = 101;
 pub const DENYLOG_NT_CREATE_FILE: u64 = 0;
 pub const DENYLOG_NT_OPEN_FILE: u64 = 1;
 
+/// Phase N-2: broker-mediated open frame. Sent by the cdylib's
+/// `hook_NtCreateFile_proxy` / `hook_NtOpenFile_proxy` after the
+/// saved-original passthrough returned `STATUS_ACCESS_DENIED` — the
+/// broker re-opens under its own user-token, validates against
+/// policy (allowRead/allowWrite plus auto-detected toolchain dirs),
+/// canonicalizes via `GetFinalPathNameByHandleW` to defeat symlink/
+/// junction escapes, and `DuplicateHandle`s the result into the AC.
+///
+/// Wire layout:
+///   args[0] = OBJECT_ATTRIBUTES* VA (broker chases via RPM)
+///   args[1] = desired_access (u32)
+///   args[2] = share_access   (u32)
+///   args[3] = options        (u32 — CreateOptions / OpenOptions)
+///   args[4] = syscall id (`SYSCALL_NT_CREATE_FILE` / `_NT_OPEN_FILE`)
+/// Reply (in same `Wire` struct):
+///   args[0] = NTSTATUS (u32)
+///   args[1] = duped HANDLE on success (u64), 0 on rejection
+pub const OP_BROKER_OPEN: u64 = 102;
+
+/// Phase N-2: syscall ids for `OP_BROKER_OPEN`. Match the cdylib's
+/// `BROKER_OPEN_NT_CREATE_FILE` / `_NT_OPEN_FILE` constants.
+pub const BROKER_OPEN_NT_CREATE_FILE: u64 = 0;
+pub const BROKER_OPEN_NT_OPEN_FILE: u64 = 1;
+
 // ─── Phase K: trace-mode syscall IDs ───────────────────────────────
 //
 // Indexed into `IpcEnv.passthrough_trace` on the cdylib side and
@@ -292,6 +316,21 @@ impl Channel {
     /// without touching reply fields.
     pub fn reply_denylog_ack(&self) {
         unsafe { let _ = SetEvent(self.ev_resp); }
+    }
+
+    /// Phase N-2: reply to an `OP_BROKER_OPEN` frame. Writes the
+    /// resulting NTSTATUS into `args[0]` and the duped target-side
+    /// handle (or 0) into `args[1]`, then signals `ev_resp`. The
+    /// cdylib reads these back from its local `Wire` copy after
+    /// `ipc_roundtrip` returns and writes the handle into the
+    /// caller's `*FileHandle` if status >= 0.
+    pub fn reply_broker_open(&self, status: i32, handle: u64) {
+        unsafe {
+            (*self.view).args[0] = status as u32 as u64;
+            (*self.view).args[1] = handle;
+            (*self.view).r_status = status;
+            let _ = SetEvent(self.ev_resp);
+        }
     }
 
     /// Duplicate a broker-owned handle into the target's table and
