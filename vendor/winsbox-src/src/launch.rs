@@ -93,7 +93,43 @@ struct SpawnCtx {
     /// the handler returns `STATUS_ACCESS_DENIED` immediately
     /// without consulting policy or attempting any open.
     broker_open_enabled: bool,
+    /// Phase N-2 Part B: canonicalized path to the cdylib DLL on disk,
+    /// captured during the immediate-target injection. Re-used by
+    /// `inject_cdylib_into_grandchild` so each grandchild can manual-map
+    /// the same DLL without re-canonicalising or re-stamping (the AC
+    /// SID's RX ACE on the dll's parent dir is already in place from
+    /// step 1 of the immediate-target injection).
+    ///
+    /// `None` means cdylib mode is off — grandchildren run un-hooked.
+    cdylib_dll: Option<std::path::PathBuf>,
+    /// Phase N-2 Part B: parent-process handle. For the immediate-
+    /// target ctx this is the immediate target; for a grandchild ctx
+    /// (constructed by `inject_cdylib_into_grandchild`) this is the
+    /// grandchild itself. Retained for diagnostic / future-use.
+    #[allow(dead_code)]
+    immediate_target: HANDLE,
+    /// Phase N-2 Part B: depth from the immediate target (0 = grandchild
+    /// context belongs to the immediate target's serve_ipc; 1 = a
+    /// grandchild's own serve_ipc, recursing into great-grandchildren;
+    /// etc.). Bounded at `MAX_GC_DEPTH`.
+    gc_depth: u32,
+    /// Phase N-2 Part B: host architecture (`IMAGE_FILE_MACHINE_*`)
+    /// captured once. Grandchild PE machine fields are compared against
+    /// this — cross-arch grandchildren skip injection (M-1 follow-up).
+    host_machine: u16,
+    /// Phase N-2 Part B: AC SID string, retained so grandchildren
+    /// can re-stamp policy if needed (currently not — grandchildren
+    /// inherit the immediate target's stamps).
+    #[allow(dead_code)]
+    ac_sid_string: String,
 }
+
+/// Phase N-2 Part B: bound on grandchild injection recursion.
+/// Even pathological workloads rarely nest more than ~3 deep
+/// (cmd → cmd → echo); 10 leaves enormous headroom while bounding
+/// runaway depth (e.g., a process accidentally spawning its own
+/// command line in a loop).
+const MAX_GC_DEPTH: u32 = 10;
 unsafe impl Send for SpawnCtx {}
 unsafe impl Sync for SpawnCtx {}
 
@@ -915,6 +951,14 @@ fn try_inject_cdylib_full(
         threads: Mutex::new(Vec::new()),
         broker_open_policy,
         broker_open_enabled,
+        // Phase N-2 Part B: cache the canonical dll path + host
+        // machine so handle_cpw can call inject_cdylib_into_grandchild
+        // without recomputing them.
+        cdylib_dll: Some(dll_canon.clone()),
+        immediate_target: target,
+        gc_depth: 0,
+        host_machine: host_image_machine(),
+        ac_sid_string: ac.sid_string.clone(),
     });
     let target_raw = target.0 as isize;
     let ctx_thread = ctx.clone();
@@ -1637,6 +1681,337 @@ fn trace_arg_summary(target: HANDLE, id: usize, req: &ipc::Wire) -> String {
     }
 }
 
+/// Phase N-2 Part B: read the host process's PE machine field once.
+/// `IMAGE_FILE_MACHINE_AMD64 = 0x8664`, `IMAGE_FILE_MACHINE_ARM64 = 0xAA64`.
+/// Cached implicitly via being called once per ctx construction.
+fn host_image_machine() -> u16 {
+    // The broker process is itself a PE image; compile target maps to
+    // the running host arch. `cfg!(...)` resolves at compile time.
+    if cfg!(target_arch = "x86_64") {
+        0x8664
+    } else if cfg!(target_arch = "aarch64") {
+        0xAA64
+    } else {
+        0
+    }
+}
+
+/// Phase N-2 Part B: read a target process's PE machine field.
+/// Walks PEB → ImageBaseAddress, then DOS+NT headers, returning the
+/// `IMAGE_FILE_HEADER.Machine` field (offset NT+4+0).
+///
+/// Returns `0` on any read failure; callers compare to host machine
+/// and skip injection on mismatch.
+fn read_target_machine(target: HANDLE) -> u16 {
+    use windows::Wdk::System::Threading::{NtQueryInformationProcess, PROCESSINFOCLASS};
+    use windows::Win32::System::Threading::PROCESS_BASIC_INFORMATION;
+    let mut pbi: PROCESS_BASIC_INFORMATION = unsafe { zeroed() };
+    let mut len = 0u32;
+    let st = unsafe {
+        NtQueryInformationProcess(
+            target, PROCESSINFOCLASS(0),
+            &mut pbi as *mut _ as *mut c_void,
+            size_of::<PROCESS_BASIC_INFORMATION>() as u32, &mut len,
+        )
+    };
+    if st.0 < 0 { return 0; }
+    let peb = pbi.PebBaseAddress as usize;
+    if peb == 0 { return 0; }
+    // PEB.ImageBaseAddress: x64 PEB offset 0x10.
+    let img_base: u64 = match interception::read_remote(target, peb + 0x10) {
+        Ok(v) => v, Err(_) => return 0,
+    };
+    if img_base == 0 { return 0; }
+    // Read DOS header magic + e_lfanew.
+    let dos: [u8; 0x40] = match interception::read_remote(target, img_base as usize) {
+        Ok(b) => b, Err(_) => return 0,
+    };
+    if dos[0] != b'M' || dos[1] != b'Z' { return 0; }
+    let e_lfanew = u32::from_le_bytes([dos[0x3c], dos[0x3d], dos[0x3e], dos[0x3f]]) as usize;
+    let nt_off = img_base as usize + e_lfanew;
+    let nt: [u8; 24] = match interception::read_remote(target, nt_off) {
+        Ok(b) => b, Err(_) => return 0,
+    };
+    if nt[0] != b'P' || nt[1] != b'E' || nt[2] != 0 || nt[3] != 0 { return 0; }
+    // IMAGE_FILE_HEADER.Machine is the first u16 after the PE\0\0 magic.
+    u16::from_le_bytes([nt[4], nt[5]])
+}
+
+/// Phase N-2 Part B: inject the cdylib into a brokered grandchild.
+///
+/// Mirrors steps 3-9 of `try_inject_cdylib_full` (the per-process
+/// injection sequence), reusing the AC-level setup that `run_confined`
+/// already did for the immediate target (cdylib stamp on dll dir, BNO
+/// root). Caller (handle_cpw) holds the brokered grandchild SUSPENDED;
+/// this function:
+///
+///   1. Detects arch mismatch via PE machine field — graceful no-op
+///      with a log line if the grandchild is x64 on an ARM64 host (or
+///      vice versa). M-1 follow-up will land cross-arch cdylib build.
+///   2. Creates a fresh IPC channel for the grandchild.
+///   3. Manual-maps the cdylib at `0x190000000` (per-process VA — no
+///      conflict with the immediate target).
+///   4. Installs ntdll FS / namespace / pipe / denylog hooks pre-resume.
+///   5. Pre-fills the cdylib's IPC export with the grandchild-side
+///      handles + passthrough thunk VAs.
+///   6. Spawns a dedicated `serve_ipc` thread for the grandchild's
+///      channel (joined into `parent_ctx.threads` so the broker waits
+///      on it during shutdown).
+///   7. Installs the entry-trampoline rendezvous (x64 only — ARM64
+///      uses a settle delay, same as immediate target).
+///   8. Resumes the grandchild's main thread.
+///   9. Patches kernelbase!CreateProcessInternalW post-loader so
+///      great-grandchildren also get brokered + injected (recursion).
+///
+/// Returns `Ok(true)` on successful injection, `Ok(false)` if cross-arch
+/// or other graceful no-op (caller should resume the grandchild un-hooked
+/// and continue — fail-soft semantics matching the original D-4 default).
+/// Returns `Err` only on hard broker failures (channel create, etc.).
+///
+/// Caller-owned: the grandchild `target_proc`/`main_thread` HANDLEs are
+/// borrowed; the function does not close them on success or failure.
+fn inject_cdylib_into_grandchild(
+    target_proc: HANDLE,
+    main_thread: HANDLE,
+    parent_ctx: &Arc<SpawnCtx>,
+) -> Result<bool> {
+    // ── 0. Cross-arch graceful degrade.
+    let target_machine = read_target_machine(target_proc);
+    if target_machine == 0 || target_machine != parent_ctx.host_machine {
+        eprintln!(
+            "[sbox-exec] cdylib: grandchild pid=? arch={:#x} != host arch={:#x}; \
+             resuming un-hooked (M-1 PE-export parser + cross-arch cdylib build needed)",
+            target_machine, parent_ctx.host_machine,
+        );
+        return Ok(false);
+    }
+    // ── 0a. Depth guard. Each grandchild's own serve_ipc bumps
+    //        `gc_depth` for great-grandchildren (see the new SpawnCtx
+    //        constructed below). The immediate target ctx has depth 0;
+    //        a runaway depth chain bottoms out at MAX_GC_DEPTH.
+    if parent_ctx.gc_depth >= MAX_GC_DEPTH {
+        eprintln!(
+            "[sbox-exec] cdylib: grandchild depth {} >= MAX_GC_DEPTH ({}); \
+             resuming un-hooked",
+            parent_ctx.gc_depth, MAX_GC_DEPTH,
+        );
+        return Ok(false);
+    }
+    let dll_canon = match parent_ctx.cdylib_dll.as_ref() {
+        Some(p) => p,
+        None => return Ok(false),
+    };
+    let depth = parent_ctx.gc_depth + 1;
+
+    let t0 = std::time::Instant::now();
+
+    // ── 1. IPC channel for this grandchild.
+    let ch = ipc::Channel::create(target_proc)
+        .context("ipc::Channel::create (grandchild)")?;
+    let stub_addrs = ch.stub_env_snapshot();
+
+    // ── 2. Manual-map the cdylib.
+    let mapped = match crate::manual_map::manual_map_cdylib(target_proc, dll_canon) {
+        Ok(m) => m,
+        Err(e) => {
+            drop(ch);
+            return Err(e.context("manual_map_cdylib (grandchild)"));
+        }
+    };
+
+    // ── 3. Install hooks pre-resume.
+    let log_denies = std::env::var("WINSBOX_LOG_DENIES")
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true);
+    let entries = interception::CdylibHookEntries {
+        nt_open_section: mapped.hook_nt_open_section,
+        nt_create_directory_object: mapped.hook_nt_create_directory_object,
+        nt_open_directory_object: mapped.hook_nt_open_directory_object,
+        nt_create_named_pipe_file: mapped.hook_nt_create_named_pipe_file,
+        create_process_internal_w: mapped.hook_create_process_internal_w,
+        nt_create_file_denylog: if log_denies { mapped.hook_nt_create_file_denylog } else { 0 },
+        nt_open_file_denylog: if log_denies { mapped.hook_nt_open_file_denylog } else { 0 },
+    };
+    let mut pt = interception::PassthroughThunks::default();
+    if let Err(e) = interception::install_fs(target_proc, &stub_addrs, Some(&entries), &mut pt) {
+        drop(ch);
+        return Err(e.context("install_fs (grandchild)"));
+    }
+    if let Err(e) = interception::install_reg(target_proc, &stub_addrs, Some(&entries), &mut pt) {
+        drop(ch);
+        return Err(e.context("install_reg (grandchild)"));
+    }
+    if let Err(e) = interception::install_denylog(target_proc, Some(&entries), &mut pt) {
+        drop(ch);
+        return Err(e.context("install_denylog (grandchild)"));
+    }
+
+    // ── 4. Pre-fill IPC.
+    if let Err(e) = crate::manual_map::prefill_ipc(target_proc, mapped.ipc_va, &stub_addrs, &pt) {
+        drop(ch);
+        return Err(e.context("prefill_ipc (grandchild)"));
+    }
+    if let Err(e) = crate::manual_map::prefill_denylog_passthroughs(
+        target_proc, mapped.ipc_va, pt.nt_create_file_denylog, pt.nt_open_file_denylog,
+    ) {
+        drop(ch);
+        return Err(e.context("prefill_denylog_passthroughs (grandchild)"));
+    }
+
+    // ── 5. Build the grandchild's SpawnCtx + spawn its serve_ipc.
+    //
+    //      Stop flag SHARED with the parent: when run_confined sets
+    //      the immediate target's stop, the whole grandchild subtree's
+    //      serve_ipc loops see it on their next 250ms tick and exit
+    //      cleanly. Without sharing, run_confined's join() of the
+    //      grandchild thread hangs forever (the grandchild's serve_ipc
+    //      polls a never-set local flag).
+    //
+    //      Threads list per-grandchild so the grandchild's
+    //      great-grandchildren push *their* serve_ipc handles into
+    //      this grandchild's list (recursion). Parent only joins this
+    //      one thread; that thread joins its own children before
+    //      returning, so the join discipline cascades correctly.
+    //
+    //      Other shared fields: ac_sid, ac_bno_path, job, primary
+    //      token, broker_open_policy + broker_open_enabled, cdylib_dll.
+    //      `gc_depth = depth` so great-grandchildren can hit the depth
+    //      guard.
+    let gc_ctx = Arc::new(SpawnCtx {
+        ac_sid: parent_ctx.ac_sid,
+        ac_bno_path: parent_ctx.ac_bno_path.clone(),
+        job: parent_ctx.job,
+        primary: parent_ctx.primary,
+        cwd: parent_ctx.cwd.clone(),
+        env: parent_ctx.env.clone(),
+        stop: parent_ctx.stop.clone(),
+        trace: parent_ctx.trace,
+        broker_pipes: Mutex::new(std::collections::HashSet::new()),
+        threads: Mutex::new(Vec::new()),
+        broker_open_policy: parent_ctx.broker_open_policy.clone(),
+        broker_open_enabled: parent_ctx.broker_open_enabled,
+        cdylib_dll: parent_ctx.cdylib_dll.clone(),
+        immediate_target: target_proc,
+        gc_depth: depth,
+        host_machine: parent_ctx.host_machine,
+        ac_sid_string: parent_ctx.ac_sid_string.clone(),
+    });
+    // Phase N-2 Part B: dup the grandchild's process HANDLE so the
+    // grandchild's serve_ipc thread owns a handle that outlives the
+    // caller's. handle_cpw closes its `child.hProcess` after
+    // inject_cdylib_into_grandchild returns; without dup, the
+    // grandchild's serve_ipc would be left holding an invalid HANDLE
+    // value and read_target_oa_raw / dup_to_target / etc. would fail
+    // with ERROR_INVALID_HANDLE.
+    let owned_target = unsafe {
+        use windows::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS};
+        use windows::Win32::System::Threading::GetCurrentProcess;
+        let mut out = HANDLE::default();
+        DuplicateHandle(
+            GetCurrentProcess(), target_proc, GetCurrentProcess(), &mut out,
+            0, false, DUPLICATE_SAME_ACCESS,
+        ).context("DuplicateHandle(target_proc) for grandchild serve_ipc")?
+        ; out
+    };
+    let target_raw = owned_target.0 as isize;
+    let ctx_thread = gc_ctx.clone();
+    let h = std::thread::spawn(move || {
+        serve_ipc(ch, target_raw, ctx_thread.clone());
+        // Phase N-2 Part B: when this grandchild's serve_ipc exits,
+        // join its own subtree's threads (great-grandchildren) before
+        // returning. This way the parent only has to join *us*;
+        // we recursively wind down our subtree.
+        for jh in ctx_thread.threads.lock().unwrap().drain(..) {
+            let _ = jh.join();
+        }
+        // Drop the owned target handle now that no one needs it.
+        unsafe { let _ = CloseHandle(HANDLE(target_raw as *mut c_void)); }
+    });
+    parent_ctx.threads.lock().unwrap().push(h);
+
+    // ── 6. Entry trampoline rendezvous (x64 + ARM64) or no-op.
+    //      The `x86_64 only` no-arch fallback case is left as a
+    //      graceful settle delay; entry_trampoline_x64.rs and
+    //      entry_trampoline_arm64.rs both implement install
+    //      successfully on supported hosts.
+    let sync_opt: Option<crate::entry_trampoline::EntrySync> =
+        match crate::entry_trampoline::install(target_proc, main_thread, false) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                let msg = format!("{e:#}");
+                if msg.contains("x86_64 only") {
+                    None
+                } else {
+                    // Hard failure: serve_ipc thread is already in
+                    // parent's threads list with the shared stop flag,
+                    // so it'll wind down with the rest of the tree on
+                    // broker shutdown.
+                    return Err(e.context("entry_trampoline::install (grandchild)"));
+                }
+            }
+        };
+
+    // ── 7. Resume.
+    unsafe { ResumeThread(main_thread); }
+    if let Some(ref sync) = sync_opt {
+        let entry_timeout_ms = std::env::var("WINSBOX_ENTRY_TIMEOUT_MS")
+            .ok().and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(60_000);
+        let r = sync.wait_loaded_or_exit_detail(target_proc, entry_timeout_ms);
+        // Whatever the result, fall through — for grandchildren we
+        // don't bail the spawn. If the loader is wedged we still want
+        // CPW patched if possible; if the target exited we'll skip
+        // CPW patch silently.
+        let _ = r;
+    } else {
+        let settle = std::env::var("WINSBOX_CDYLIB_SETTLE_MS")
+            .ok().and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(150);
+        if settle > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(settle));
+        }
+    }
+
+    // ── 8. Patch CPW post-loader. Non-fatal — a grandchild that
+    //      doesn't spawn anything doesn't need it. With it, recursion
+    //      to great-grandchildren works.
+    match crate::entry_trampoline::cpw_address() {
+        Ok(cpw_va) => match interception::install_cpw(
+            target_proc, &stub_addrs, cpw_va, Some(&entries), &mut pt,
+        ) {
+            Ok(()) => {
+                if let Err(e) = crate::manual_map::prefill_cpw_passthrough(
+                    target_proc, mapped.ipc_va, pt.create_process_internal_w,
+                ) {
+                    eprintln!(
+                        "[sbox-exec] grandchild cpw passthrough write failed: {e:#}",
+                    );
+                }
+            }
+            Err(e) => eprintln!(
+                "[sbox-exec] grandchild CPW patch failed: {e:#} \
+                 (great-grandchildren will spawn un-brokered)",
+            ),
+        },
+        Err(e) => eprintln!(
+            "[sbox-exec] grandchild cpw_address resolution failed: {e:#}",
+        ),
+    }
+
+    // ── 9. Release entry stub (no-op on ARM64).
+    if let Some(s) = sync_opt.as_ref() { s.go(); }
+    drop(sync_opt);
+
+    let elapsed_ms = t0.elapsed().as_millis();
+    eprintln!(
+        "[sbox-exec] grandchild cdylib injected: pid={} depth={} elapsed_ms={} \
+         dll={} base={:#x}",
+        unsafe { windows::Win32::System::Threading::GetProcessId(target_proc) },
+        depth, elapsed_ms, dll_canon.display(), mapped.base,
+    );
+    Ok(true)
+}
+
 fn handle_cpw(ch: &ipc::Channel, target: HANDLE, req: &ipc::Wire, ctx: &Arc<SpawnCtx>) {
     use windows::Win32::System::Threading::GetProcessId;
     // CreateProcessInternalW args:
@@ -1664,25 +2039,68 @@ fn handle_cpw(ch: &ipc::Channel, target: HANDLE, req: &ipc::Wire, ctx: &Arc<Spaw
     match broker_spawn(ctx, target, app_opt, &cmdline, cwd.as_deref(),
                        caller_flags, &si, &reserved2, &mut envb) {
         Ok(child) => {
-            // D-4: grandchildren run un-hooked. The legacy
-            // `install_broker_hook` recursive cdylib install is
-            // gone — for native PE workloads grandchildren don't
-            // need compat hooks; for MSYS2/Cygwin the in-target
-            // segfault is a known follow-up (see
-            // `examples/smoke_bash.rs`). Resume the grandchild
-            // immediately so it runs.
-            unsafe { ResumeThread(child.hThread); }
             // Phase N-0 item 8: canonical grandchild-spawn lineage line.
-            // Replaces the scattered "ipc: brokered spawn:" / "broker_spawn"
-            // logs with one fixed-shape line. token=primary because Phase L
-            // wall 2 fix-up #6 (de5bd20) dropped SetThreadToken(initial)
-            // for grandchildren; the main thread runs on the parent's
-            // primary lowbox token directly.
+            // Token=primary because Phase L wall 2 fix-up #6 (de5bd20)
+            // dropped SetThreadToken(initial) for grandchildren; the
+            // main thread runs on the parent's primary lowbox token
+            // directly.
             eprintln!(
                 "[sbox-exec] grandchild spawn: ppid={ppid} new_pid={} app={app:?} \
                  cmdline={cmdline:?} cwd={final_cwd:?} token=primary flags={caller_flags:#x}",
                 child.dwProcessId,
             );
+            // Phase N-2 Part B (D-4 lift): when cdylib mode is active
+            // for this AC, manual-map the cdylib + install hooks into
+            // the SUSPENDED grandchild before resuming. This is the
+            // "test 1 (node)" / "test 3 (git)" closure: cmd brokers a
+            // node spawn, broker injects cdylib into node, node's
+            // own DLL loads + ACL-blocked devices get broker-mediation.
+            //
+            // Per-grandchild state: fresh ipc::Channel, dedicated
+            // serve_ipc thread, fresh entry-trampoline events. The
+            // manual-map base VA `0x190000000` is per-process — no
+            // conflict with the immediate target's mapping.
+            //
+            // Recursion: the great-grandchild path also flows through
+            // here (the grandchild's own CPW hook brokers via its
+            // serve_ipc → handle_cpw → inject_cdylib_into_grandchild
+            // again). Bounded at MAX_GC_DEPTH (10) via gc_depth.
+            //
+            // Cross-arch gracefully degrades to un-hooked + log line
+            // (M-1 follow-up). Hard injection failures (channel
+            // create, manual-map) log + resume un-hooked; the
+            // grandchild may then fail to load DLLs but won't crash
+            // the broker.
+            //
+            // `WINSBOX_GC_INJECT=0` is an A/B disable knob — turns
+            // off Part B injection while leaving Parts A+C+D
+            // (broker-mediated NtCreateFile) intact. Useful for
+            // bisecting test regressions that might be due to
+            // injection-side hooks vs. broker-mediation issues.
+            let gc_inject_enabled = std::env::var("WINSBOX_GC_INJECT")
+                .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+                .unwrap_or(true);
+            let injected = if gc_inject_enabled && ctx.cdylib_dll.is_some() {
+                match inject_cdylib_into_grandchild(child.hProcess, child.hThread, ctx) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!(
+                            "[sbox-exec] grandchild cdylib inject failed (resuming \
+                             un-hooked): pid={} err={:#}",
+                            child.dwProcessId, e,
+                        );
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+            if !injected {
+                // Cdylib mode off, cross-arch, depth-bounded, or
+                // injection error — resume the grandchild un-hooked
+                // (matches the original D-4 default).
+                unsafe { ResumeThread(child.hThread); }
+            }
             let p = ch.dup_to_target(child.hProcess).unwrap_or(0);
             let t = ch.dup_to_target(child.hThread).unwrap_or(0);
             ch.reply_cpw_ok(p, t, child.dwProcessId, child.dwThreadId);

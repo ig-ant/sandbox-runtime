@@ -36,30 +36,54 @@ d('windows sandbox', () => {
     20_000,
   )
 
-  // Toolchain compat tests: skip the test (rather than fail) when the
-  // host's toolchain install isn't reachable from inside the AC. The
-  // user-installed `node.msi` and `python` Microsoft-Store-alias don't
-  // grant `ALL APPLICATION PACKAGES` on their install dirs, so the AC
-  // token's PATH lookup returns "not recognized". Granting that ACE
-  // requires admin and is out of scope for the test suite — cf.
-  // `isAcAccessible` in `helpers/windows.ts`. On hosts that DID grant
-  // it (winget defaults, admin pre-stamping), these tests run.
-  const nodeUsable = isToolchainUsable('node')
+  // Phase N-2 Part B (D-4 lift): nested cmd spawn — the immediate
+  // target is `cmd /c <command>`, the immediate target's CPW hook
+  // brokers the inner `cmd /c echo hello` spawn, the broker injects
+  // cdylib into the inner cmd, the inner cmd's CPW hook brokers
+  // `echo hello` (a builtin so no further fork — but the recursion
+  // through one level is exercised). Verify no hang / deadlock under
+  // recursive injection.
+  test(
+    'recursive cmd spawn (cmd /c cmd /c echo hi)',
+    async () => {
+      const r = await runSandboxed('cmd /c echo hi', fx.config)
+      expect(r.exitCode).toBe(0)
+      expect(r.stdout.trim()).toBe('hi')
+    },
+    20_000,
+  )
+
+  // Toolchain compat tests.
+  //
+  // Phase N-2 Part B (D-4 lift) made cdylib injection extend to
+  // grandchildren: when `cmd /c node ...` runs, cmd's PATH walk reaches
+  // node via broker-mediated NtCreateFile (auto-toolchain-allowed
+  // `C:\Program Files\nodejs`), then cmd brokers the node spawn via
+  // its CPW hook → broker manual-maps the cdylib into node, hooks
+  // node's syscalls, and node's own DLL loads (out of `Program Files\
+  // nodejs`) flow through the broker too. So the host no longer
+  // strictly needs `ALL APPLICATION PACKAGES` on the toolchain dir
+  // for these tests to work — the broker mediates.
+  //
+  // Python's Windows-Store alias (under `\Microsoft\WindowsApps\`) is
+  // a UWP redirector that needs package activation our token can't
+  // reach; gate that one on a real toolchain install via PATH.
   const pythonUsable = isToolchainUsable('python')
-  // Git for Windows ships cygwin1.dll which AVs in DllMain under our
-  // lockdown token (Phase L). Even when git is on PATH and AC-readable,
-  // it can't actually start. Treat it as a known-failing compat case
-  // alongside the bash MSYS2 tests below.
+  // Git for Windows ships cygwin1.dll. Native ARM64 git binaries are
+  // not statically Cygwin-linked (verified via `isCygwinBinary`).
+  // Run the test iff git is on PATH AND not a Cygwin runtime binary.
+  // Native git on this host runs grandchild-cdylib-injected with
+  // broker-mediated `\??\nul` (= /dev/null) per Phase N-2 Part B.
   const gitUsable = isToolchainUsable('git') && !isCygwinGit()
 
-  ;(nodeUsable ? test : test.skip)(
+  test(
     'node prints hello',
     async () => {
       const r = await runSandboxed(`node -e "console.log('hello')"`, fx.config)
       expect(r.exitCode).toBe(0)
       expect(r.stdout).toContain('hello')
     },
-    20_000,
+    25_000,
   )
 
   ;(pythonUsable ? test : test.skip)(

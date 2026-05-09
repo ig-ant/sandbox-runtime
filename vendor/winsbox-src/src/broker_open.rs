@@ -223,6 +223,19 @@ pub fn is_under(path: &str, prefix: &str) -> bool {
     next == b'\\' || next == b'/'
 }
 
+/// Phase N-2 Part B: Windows reserved device names. Opening these
+/// always succeeds in any user context; they're equivalent to
+/// /dev/null + std streams on POSIX. Cygwin/MSYS2 binaries (git,
+/// bash) translate `/dev/null` → `\??\nul` for `NtCreateFile`, which
+/// the kernel maps to `\Device\Null` regardless of token. Allowing
+/// these doesn't expose any FS state — the broker just opens the
+/// device and dups the handle.
+///
+/// Reference: Win32 reserved DOS names. Case-insensitive.
+const RESERVED_DOS_DEVICES: &[&str] = &[
+    "nul", "con", "prn", "aux",
+];
+
 /// Run the policy check against a normalised DOS path. The caller is
 /// responsible for stripping the NT-namespace prefix first via
 /// [`normalize_nt_path`].
@@ -235,6 +248,16 @@ pub fn is_path_allowed_for_broker_open(
         return Decision::Reject(RejectReason::EmptyPath);
     }
     let want_write = is_write_access(desired_access) && !is_maximum_allowed(desired_access);
+
+    // Phase N-2 Part B: reserved DOS device names always allowed.
+    // `nul` (with optional `.txt`-style extension or `:streamname`
+    // suffix — Windows ignores anything after the device name).
+    let path_lc = path.to_ascii_lowercase();
+    let leaf = path_lc.rsplit(['\\', '/']).next().unwrap_or(&path_lc);
+    let leaf_base = leaf.split(['.', ':']).next().unwrap_or(leaf);
+    if RESERVED_DOS_DEVICES.contains(&leaf_base) {
+        return Decision::Allow;
+    }
 
     // 1. Deny lists first — they override every allow.
     for d in &pol.deny_read {
@@ -550,5 +573,34 @@ mod tests {
         assert!(is_write_access(DELETE));
         assert!(!is_write_access(0x0001 /* FILE_READ_DATA */));
         assert!(!is_write_access(0x80000000 /* GENERIC_READ */));
+    }
+
+    /// Phase N-2 Part B: Cygwin/MSYS2 binaries (git, bash) translate
+    /// `/dev/null` → `\??\nul` for `NtCreateFile`. The reserved DOS
+    /// device names allow-list short-circuits the policy check so
+    /// these always succeed regardless of the user's allow lists.
+    #[test]
+    fn reserved_dos_devices_allowed() {
+        let pl = lists();
+        // `\??\nul` normalises to `nul`.
+        let d = is_path_allowed_for_broker_open("nul", FILE_WRITE_DATA, &pl);
+        assert_eq!(d, Decision::Allow);
+        // Case-insensitive.
+        let d = is_path_allowed_for_broker_open("NUL", FILE_WRITE_DATA, &pl);
+        assert_eq!(d, Decision::Allow);
+        // Other reserved names also covered.
+        let d = is_path_allowed_for_broker_open("con", 0x0001, &pl);
+        assert_eq!(d, Decision::Allow);
+        // `nul.txt` and similar — Win32 ignores everything after the
+        // device name in the leaf, treating the file as the device.
+        let d = is_path_allowed_for_broker_open("nul.txt", 0x0001, &pl);
+        assert_eq!(d, Decision::Allow);
+        // Path containing `nul` as a non-leaf component is NOT a
+        // device open (it's a real-FS path); should fall through to
+        // the normal policy check.
+        let d = is_path_allowed_for_broker_open(
+            r"C:\nul\actually-a-file", 0x0001, &pl,
+        );
+        assert_eq!(d, Decision::Reject(RejectReason::NotInAllowList));
     }
 }
