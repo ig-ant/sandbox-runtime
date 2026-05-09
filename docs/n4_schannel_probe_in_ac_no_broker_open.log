@@ -1,0 +1,79 @@
+# variant=no-broker-open
+# wrapped command: "\\mac\sandbox-runtime\vendor\winsbox\arm64\sbox-exec.exe" --policy "C:\Users\ig\AppData\Local\Temp\srt-policy-1708-946a3e18.json"
+[sbox-exec] AppContainer sid=S-1-15-2-1688550812-1073541563-536746364-4148313479-2838363056-1569160564-4053239594 folder=C:\Users\ig\AppData\Local\Packages\srt.ac.db5d56a888128822\AC
+[sbox-exec] policy-stamp: hash 0x3cadf8c530b336e7 → 0xc780d057cabc0dc5 (re-applying)
+[acl_stamper] WARN TreeSetNamedSecurityInfoW("Y:\\vendor\\winsbox\\arm64") returned ERROR_ACCESS_DENIED — admin-protected dir, skipping (path may already be AC-readable via inherited ALL APPLICATION PACKAGES; verify with `icacls`)
+[acl_stamper] WARN TreeSetNamedSecurityInfoW("Y:\\vendor\\winsbox\\arm64") returned ERROR_ACCESS_DENIED — admin-protected dir, skipping (path may already be AC-readable via inherited ALL APPLICATION PACKAGES; verify with `icacls`)
+[acl_stamper] WARN apply_one(allow_write, sid=ac, "C:\\Users\\ig\\.claude\\debug") failed: GetNamedSecurityInfoW failed: WIN32_ERROR(2); continuing
+[acl_stamper] WARN apply_one(allow_write, sid=restricted, "C:\\Users\\ig\\.claude\\debug") failed: GetNamedSecurityInfoW failed: WIN32_ERROR(2); continuing
+[acl_stamper] WARN apply_one(allow_write, sid=ac, "C:\\Users\\ig\\.npm\\_logs") failed: GetNamedSecurityInfoW failed: WIN32_ERROR(3); continuing
+[acl_stamper] WARN apply_one(allow_write, sid=restricted, "C:\\Users\\ig\\.npm\\_logs") failed: GetNamedSecurityInfoW failed: WIN32_ERROR(3); continuing
+[acl_stamper] WARN TreeSetNamedSecurityInfoW("Y:\\NUL") returned ERROR_ACCESS_DENIED — admin-protected dir, skipping (path may already be AC-readable via inherited ALL APPLICATION PACKAGES; verify with `icacls`)
+[acl_stamper] WARN TreeSetNamedSecurityInfoW("Y:\\NUL") returned ERROR_ACCESS_DENIED — admin-protected dir, skipping (path may already be AC-readable via inherited ALL APPLICATION PACKAGES; verify with `icacls`)
+[acl_stamper] WARN apply_one(allow_write, sid=ac, "Y:\\CON") failed: GetNamedSecurityInfoW failed: WIN32_ERROR(2); continuing
+[acl_stamper] WARN apply_one(allow_write, sid=restricted, "Y:\\CON") failed: GetNamedSecurityInfoW failed: WIN32_ERROR(2); continuing
+[sbox-exec] policy-stamp: 3 stamped, 3 skipped (idempotent), 0 skipped (AC already accessible), 4 soft-failed (access denied), 6 soft-failed (other), 0 denies emitted, 0 denies omitted, 6 ms
+[sbox-exec] auto-toolchain: detected 10 tooling dirs: C:\Program Files\Git\clangarm64\bin, C:\Program Files\Git\usr\local\bin, C:\Program Files\Git\usr\bin, C:\Program Files\Parallels\Parallels Tools\Applications, C:\Program Files\Git\cmd, C:\Program Files (x86)\Windows Kits\10\Windows Performance Toolkit, C:\Program Files\nodejs, C:\Users\ig\.cargo\bin, C:\Program Files\Git\usr\bin\vendor_perl, C:\Program Files\Git\usr\bin\core_perl
+[sbox-exec] broker-open: enabled=false allow_read=2 deny_read=0 allow_write=6 deny_write=0 auto_toolchain=10
+[sbox-exec] Job created
+[sbox-exec] bridge: outside relay http=C:\Users\ig\AppData\Local\Packages\srt.ac.db5d56a888128822\AC\h.sock → 65108
+[sbox-exec] bridge: outside relay socks=C:\Users\ig\AppData\Local\Packages\srt.ac.db5d56a888128822\AC\s.sock → 65109
+[sbox-exec] bridge: spawning inside relay
+[sbox-exec] bridge: inside relay pid=7780, reading ports
+[sbox-exec] bridge up: ports=[65110, 65111]
+[sbox-exec] broker tokens: primary=LockdownSpec { keep_enabled: ["S-1-1-0", "S-1-5-11", "S-1-5-32-545"] }+lowbox, initial=USER_RESTRICTED_SAME_ACCESS+lowbox, IL=0x0; ac_bno=\Sessions\1\AppContainerNamedObjects\S-1-15-2-1688550812-1073541563-536746364-4148313479-2838363056-1569160564-4053239594
+[sbox-exec] launching target (cwd=C:\Users\ig\AppData\Local\Temp\claude): cmd /d /s /c ""Y:\vendor\winsbox\arm64\probe_schannel.exe""
+[sbox-exec] target pid=7484
+[acl_stamper] WARN TreeSetNamedSecurityInfoW("\\\\?\\UNC\\Mac\\sandbox-runtime\\vendor\\winsbox\\arm64") returned ERROR_ACCESS_DENIED — admin-protected dir, skipping (path may already be AC-readable via inherited ALL APPLICATION PACKAGES; verify with `icacls`)
+[acl_stamper] WARN TreeSetNamedSecurityInfoW("\\\\?\\UNC\\Mac\\sandbox-runtime\\vendor\\winsbox\\arm64") returned ERROR_ACCESS_DENIED — admin-protected dir, skipping (path may already be AC-readable via inherited ALL APPLICATION PACKAGES; verify with `icacls`)
+[sbox-exec] cdylib stamp on \\?\UNC\Mac\sandbox-runtime\vendor\winsbox\arm64: 0 stamped, 0 skipped (idempotent), 0 skipped (AC accessible), 2 soft-failed (access denied), 0 soft-failed (other), 2 ms
+[sbox-exec] cdylib: ac_bno=\Sessions\1\AppContainerNamedObjects\S-1-15-2-1688550812-1073541563-536746364-4148313479-2838363056-1569160564-4053239594
+[sbox-exec] manual_map: cdylib mapped at 0x190000000 (0x8000 bytes), IPC @ 0x190005090, delta=0x0
+[sbox-exec] cdylib manual-mapped: base=0x190000000 size=0x8000 dll=\\?\UNC\Mac\sandbox-runtime\vendor\winsbox\arm64\ac_cdylib.dll
+[sbox-exec] cdylib reported back: pid=10828 version=manual init=0xACDC0001 (manual-map)
+[sbox-exec] cdylib hook VAs: section=0x190002830 dirobj_create=0x190001d00 dirobj_open=0x190002498 pipe=0x190001fd4 cpw=0x1900018a8
+[sbox-exec] interception(arm64): NtCreateNamedPipeFile @ 0x7ffc0d8d1bf0 → cdylib @ 0x190001fd4
+[sbox-exec] interception(arm64): NtOpenSection @ 0x7ffc0d8d13b0 → cdylib @ 0x190002830
+[sbox-exec] interception(arm64): NtCreateDirectoryObject @ 0x7ffc0d8d1b00 → cdylib @ 0x190001d00
+[sbox-exec] interception(arm64): NtOpenDirectoryObject @ 0x7ffc0d8d15c0 → cdylib @ 0x190002498
+[sbox-exec] interception(arm64): NtCreateFile @ 0x7ffc0d8d1590 → cdylib @ 0x190001dc0
+[sbox-exec] interception(arm64): NtOpenFile @ 0x7ffc0d8d1370 → cdylib @ 0x190002540
+[sbox-exec] cdylib ntdll hooks patched pre-resume; passthrough thunks: section=0x7df55b430000 dirobj_create=0x7df55b420000 dirobj_open=0x7df55b410000 pipe=0x7df55b440000 denylog_create=0x7df55b400000 denylog_open=0x7df55b3f0000 (log_denies=true trace_mode=false)
+[sbox-exec] cdylib serve_ipc thread spawned (pre-resume)
+[sbox-exec] entry_trampoline: rtlstart=0x7ffc0d9a46d0 → stub @ 0x7df55b3e0000
+[sbox-exec] interception(arm64): CreateProcessInternalW @ 0x7ffc07c5e190 → cdylib @ 0x1900018a8
+[sbox-exec] cdylib CPW hook patched post-loader; cpw passthrough=0x7df4592a0000
+[sbox-exec] denied-open: NtOpenFile path="\\??\\C:\\" access=0x100001 share=0x7 options=0x4021 status=0xc0000022
+[sbox-exec] denied-open: NtOpenFile path="\\??\\C:\\Users\\" access=0x100001 share=0x7 options=0x4021 status=0xc0000022
+[sbox-exec] denied-open: NtOpenFile path="\\??\\C:\\Users\\ig\\" access=0x100001 share=0x7 options=0x4021 status=0xc0000022
+[sbox-exec] denied-open: NtOpenFile path="\\??\\C:\\Users\\ig\\AppData\\" access=0x100001 share=0x7 options=0x4021 status=0xc0000022
+[sbox-exec] denied-open: NtOpenFile path="\\??\\C:\\Users\\ig\\AppData\\Local\\" access=0x100001 share=0x7 options=0x4021 status=0xc0000022
+[sbox-exec] denied-open: NtOpenFile path="\\??\\C:\\Users\\ig\\AppData\\Local\\Temp\\" access=0x100001 share=0x7 options=0x4021 status=0xc0000022
+[sbox-exec] denied-open: NtOpenFile path="\\??\\Y:\\vendor\\winsbox\\arm64\\" access=0x100001 share=0x7 options=0x4021 status=0xc0000022
+[sbox-exec] grandchild spawn: ppid=7484 new_pid=11056 app="Y:\\vendor\\winsbox\\arm64\\probe_schannel.exe" cmdline="\"Y:\\vendor\\winsbox\\arm64\\probe_schannel.exe\"" cwd="C:\\Users\\ig\\AppData\\Local\\Temp\\claude" token=primary flags=0x80000
+[sbox-exec] manual_map: cdylib mapped at 0x190000000 (0x8000 bytes), IPC @ 0x190005090, delta=0x0
+[sbox-exec] interception(arm64): NtCreateNamedPipeFile @ 0x7ffc0d8d1bf0 → cdylib @ 0x190001fd4
+[sbox-exec] interception(arm64): NtOpenSection @ 0x7ffc0d8d13b0 → cdylib @ 0x190002830
+[sbox-exec] interception(arm64): NtCreateDirectoryObject @ 0x7ffc0d8d1b00 → cdylib @ 0x190001d00
+[sbox-exec] interception(arm64): NtOpenDirectoryObject @ 0x7ffc0d8d15c0 → cdylib @ 0x190002498
+[sbox-exec] interception(arm64): NtCreateFile @ 0x7ffc0d8d1590 → cdylib @ 0x190001dc0
+[sbox-exec] interception(arm64): NtOpenFile @ 0x7ffc0d8d1370 → cdylib @ 0x190002540
+[sbox-exec] entry_trampoline: rtlstart=0x7ffc0d9a46d0 → stub @ 0x7ff58b820000
+[sbox-exec] interception(arm64): CreateProcessInternalW @ 0x7ffc07c5e190 → cdylib @ 0x1900018a8
+[sbox-exec] grandchild cdylib injected: pid=11056 depth=1 elapsed_ms=6 dll=\\?\UNC\Mac\sandbox-runtime\vendor\winsbox\arm64\ac_cdylib.dll base=0x190000000
+STEP 1: QuerySecurityPackageInfoW("Schannel") -> OK cbMaxToken=24576 wRPCID=14
+STEP 2: AcquireCredentialsHandleW(NULL, "Schannel", OUTBOUND, NULL pAuthData) -> ERR 0x8009030e: SEC_E_NO_CREDENTIALS
+STEP 3: AcquireCredentialsHandleW(NULL, "Schannel", OUTBOUND, &empty SCHANNEL_CRED) -> ERR 0x8009030e: SEC_E_NO_CREDENTIALS
+STEP 4: SKIPPED (no credential)
+SUMMARY: schannel_registered=true cred_acquired=false cred_via_explicit=false ctx_initialized=false
+RESULT: FAIL
+[sbox-exec] target exit=0x1
+# exit=1 duration=405ms stdout_bytes=466 stderr_bytes=8205
+Internal error: directory mismatch for directory "Y:\package.json", fd 580[handle]. You don't need to do anything, but this indicates a bug.
+Internal error: directory mismatch for directory "Y:\tsconfig.json", fd 580[handle]. You don't need to do anything, but this indicates a bug.
+Internal error: directory mismatch for directory "Y:\package.json", fd 588[handle]. You don't need to do anything, but this indicates a bug.
+Internal error: directory mismatch for directory "Y:\tsconfig.json", fd 588[handle]. You don't need to do anything, but this indicates a bug.
+Internal error: directory mismatch for directory "\\Mac\sandbox-runtime\package.json", fd 672[handle]. You don't need to do anything, but this indicates a bug.
+Internal error: directory mismatch for directory "\\Mac\sandbox-runtime\tsconfig.json", fd 672[handle]. You don't need to do anything, but this indicates a bug.
+Internal error: directory mismatch for directory "\\mac\sandbox-runtime\package.json", fd 672[handle]. You don't need to do anything, but this indicates a bug.
+Internal error: directory mismatch for directory "\\mac\sandbox-runtime\tsconfig.json", fd 672[handle]. You don't need to do anything, but this indicates a bug.

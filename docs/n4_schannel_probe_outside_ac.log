@@ -1,0 +1,12 @@
+STEP 1: QuerySecurityPackageInfoW("Schannel") -> OK cbMaxToken=24576 wRPCID=14
+STEP 2: AcquireCredentialsHandleW(NULL, "Schannel", OUTBOUND, NULL pAuthData) -> OK cred=0x1a7de12bd00:0x428a0
+STEP 3: SKIPPED (step 2 succeeded)
+STEP 4: InitializeSecurityContextW(first call, target="127.0.0.1") -> OK SEC_I_CONTINUE_NEEDED token_bytes=147
+SUMMARY: schannel_registered=true cred_acquired=true cred_via_explicit=false ctx_initialized=true
+RESULT: PASS
+Internal error: directory mismatch for directory "Y:\package.json", fd 100[handle]. You don't need to do anything, but this indicates a bug.
+Internal error: directory mismatch for directory "Y:\tsconfig.json", fd 100[handle]. You don't need to do anything, but this indicates a bug.
+Internal error: directory mismatch for directory "Y:\package.json", fd 588[handle]. You don't need to do anything, but this indicates a bug.
+Internal error: directory mismatch for directory "Y:\tsconfig.json", fd 588[handle]. You don't need to do anything, but this indicates a bug.
+Internal error: directory mismatch for directory "\\Mac\sandbox-runtime\package.json", fd 676[handle]. You don't need to do anything, but this indicates a bug.
+Internal error: directory mismatch for directory "\\Mac\sandbox-runtime\tsconfig.json", fd 676[handle]. You don't need to do anything, but this indicates a bug.

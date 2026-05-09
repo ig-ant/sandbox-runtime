@@ -27,6 +27,16 @@ path = "src/main.rs"
 name = "probe_priv"
 path = "src/bin/probe_priv.rs"
 
+# Phase N-4 follow-up: minimal SSPI/Schannel diagnostic probe to settle
+# whether `AcquireCredentialsHandle(OUTBOUND, Schannel)` is structurally
+# broken inside the AppContainer, or whether curl was failing for a
+# curl-specific reason. Calls `QuerySecurityPackageInfoW` +
+# `AcquireCredentialsHandleW` + `InitializeSecurityContextW` directly
+# with no curl in the loop. See `docs/n4_schannel_probe_findings.md`.
+[[bin]]
+name = "probe_schannel"
+path = "src/bin/probe_schannel.rs"
+
 # Phase D-4: probe binaries (`p10`/`p11`/`p12`/`p13`/`spike-inject`)
 # were diagnostic tools that depended on the legacy `acl.rs` module.
 # Their findings are recorded in commit messages + `cheeky-jingling-stream.md`;
