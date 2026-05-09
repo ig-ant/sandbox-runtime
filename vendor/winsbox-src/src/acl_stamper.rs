@@ -17,6 +17,7 @@ use anyhow::{anyhow, bail, Result};
 use std::collections::HashSet;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use windows::core::PCWSTR;
@@ -41,6 +42,29 @@ use crate::util::{from_pwstr, pcwstr, wstr};
 // as constants — they're documented as part of the ACE wire format.
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0x00;
 const ACCESS_DENIED_ACE_TYPE: u8 = 0x01;
+
+/// Phase N-0: `WINSBOX_STAMP_VERBOSE=1` opt-in to per-path stamp
+/// outcome logging. Cached after first read so the env-var lookup
+/// doesn't repeat for every path/SID pair.
+fn stamp_verbose() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("WINSBOX_STAMP_VERBOSE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+/// Phase N-0: emit one `[acl_stamper] verbose:` line per (path, SID,
+/// outcome) tuple when `WINSBOX_STAMP_VERBOSE=1`. No-op otherwise.
+/// Outcome strings are stable so log scrapers can grep them.
+fn log_stamp_verbose(path: &Path, sid_label: &str, outcome: &str) {
+    if !stamp_verbose() { return; }
+    eprintln!(
+        "[acl_stamper] verbose: path={:?} sid={sid_label} outcome={outcome}",
+        path,
+    );
+}
 
 /// `(OI)(CI)` — children inherit the ACE; both files (OI) and subdirs (CI).
 fn oici() -> ACE_FLAGS {
@@ -219,10 +243,17 @@ impl PolicyStamp {
             let mut do_stamp = |sid: PSID, sid_label: &str| {
                 let op = StampOp { path: p.to_path_buf(), kind, mask, mode: GRANT_ACCESS };
                 match apply_one(&op, sid) {
-                    Ok(ApplyOutcome::Stamped) => stats.roots_stamped += 1,
-                    Ok(ApplyOutcome::SkippedIdempotent) => stats.roots_skipped_idempotent += 1,
+                    Ok(ApplyOutcome::Stamped) => {
+                        stats.roots_stamped += 1;
+                        log_stamp_verbose(p, sid_label, "stamped");
+                    }
+                    Ok(ApplyOutcome::SkippedIdempotent) => {
+                        stats.roots_skipped_idempotent += 1;
+                        log_stamp_verbose(p, sid_label, "idempotent");
+                    }
                     Ok(ApplyOutcome::SoftFailedAccessDenied) => {
                         stats.roots_soft_failed_access_denied += 1;
+                        log_stamp_verbose(p, sid_label, "soft-failed-access-denied");
                     }
                     Err(e) => {
                         eprintln!(
@@ -231,12 +262,16 @@ impl PolicyStamp {
                             p,
                         );
                         stats.roots_soft_failed_other += 1;
+                        log_stamp_verbose(
+                            p, sid_label,
+                            &format!("soft-failed-other err={:?}", format!("{e:#}")),
+                        );
                     }
                 }
             };
             do_stamp(ac_sid, "ac");
             if !restricted_sid.0.is_null() {
-                do_stamp(restricted_sid, "RESTRICTED");
+                do_stamp(restricted_sid, "restricted");
             }
         };
 
@@ -250,6 +285,7 @@ impl PolicyStamp {
                     p,
                 );
                 stats.roots_skipped_already_accessible += 1;
+                log_stamp_verbose(p, "ac", "ac-accessible");
                 continue;
             }
             apply_allow(p, "allow_read", read_mask(), &mut stats);
@@ -264,6 +300,7 @@ impl PolicyStamp {
                     p,
                 );
                 stats.roots_skipped_already_accessible += 1;
+                log_stamp_verbose(p, "ac", "ac-accessible");
                 continue;
             }
             apply_allow(p, "allow_write", write_mask(), &mut stats);
@@ -323,9 +360,11 @@ impl PolicyStamp {
                     Ok(ApplyOutcome::Stamped) => {
                         stats.roots_stamped += 1;
                         stats.denies_emitted += 1;
+                        log_stamp_verbose(p, "ac", "stamped");
                     }
                     Ok(ApplyOutcome::SkippedIdempotent) => {
                         stats.roots_skipped_idempotent += 1;
+                        log_stamp_verbose(p, "ac", "idempotent");
                     }
                     Ok(ApplyOutcome::SoftFailedAccessDenied) => {
                         stats.roots_soft_failed_access_denied += 1;
@@ -337,6 +376,7 @@ impl PolicyStamp {
                              admin-protected roots.",
                             p,
                         );
+                        log_stamp_verbose(p, "ac", "soft-failed-access-denied");
                     }
                     Err(e) => {
                         eprintln!(
@@ -346,6 +386,10 @@ impl PolicyStamp {
                             p,
                         );
                         stats.roots_soft_failed_other += 1;
+                        log_stamp_verbose(
+                            p, "ac",
+                            &format!("soft-failed-other err={:?}", format!("{e:#}")),
+                        );
                     }
                 }
                 // Phase E-3: also DENY for the well-known inherited

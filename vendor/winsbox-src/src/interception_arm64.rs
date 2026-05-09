@@ -145,6 +145,28 @@ pub fn install_trace(
     Ok(())
 }
 
+/// Phase N-0: ARM64 mirror of x64's `install_denylog`. Patches in
+/// the always-on `NtCreateFile` / `NtOpenFile` deny-log hooks via
+/// the same passthrough+ABS_JMP shape used by `install_trace`.
+pub fn install_denylog(
+    target: HANDLE,
+    cdylib: Option<&CdylibHookEntries>,
+    pt: &mut PassthroughThunks,
+) -> Result<()> {
+    let Some(c) = cdylib else { return Ok(()); };
+    if c.nt_create_file_denylog != 0 {
+        let va = ntdll_export("NtCreateFile")?;
+        pt.nt_create_file_denylog = build_passthrough_thunk(target, va)?;
+        patch_with_abs_jmp(target, "NtCreateFile", va, c.nt_create_file_denylog)?;
+    }
+    if c.nt_open_file_denylog != 0 {
+        let va = ntdll_export("NtOpenFile")?;
+        pt.nt_open_file_denylog = build_passthrough_thunk(target, va)?;
+        patch_with_abs_jmp(target, "NtOpenFile", va, c.nt_open_file_denylog)?;
+    }
+    Ok(())
+}
+
 // ─── Patch primitive + ABS_JMP template (Phase I) ─────────────────
 //
 // Phase I rationale (mirrors interception_x64.rs): the patched-in

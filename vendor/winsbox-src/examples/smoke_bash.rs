@@ -85,6 +85,11 @@
 //!     emulation initialises — only Cygwin's DllMain dies.
 //!   * To skip: env var `WINSBOX_SKIP_BASH_SMOKE=1` (caller-side
 //!     opt-out for CI / known-failing branches).
+//!
+//! New env vars (Phase N-0):
+//!   WINSBOX_LOG_DENIES=0     — disable always-on denied-open logging
+//!   WINSBOX_STAMP_VERBOSE=1  — per-path acl_stamper outcomes
+//!   WINSBOX_DEBUG=1          — TS-side resolved-policy snapshot
 
 #[cfg(not(windows))]
 fn main() {

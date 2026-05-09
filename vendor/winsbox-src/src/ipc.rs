@@ -53,6 +53,28 @@ pub const OP_NTCREATENAMEDPIPE: u64 = 10;
 /// below); the remaining `args` slots are op-specific arg pointers.
 pub const OP_TRACE: u64 = 100;
 
+/// Phase N-0: always-on denied-open frame. Sent by the cdylib's
+/// `hook_NtCreateFile_denylog` / `hook_NtOpenFile_denylog` after the
+/// saved-original passthrough returned `STATUS_ACCESS_DENIED`. Broker
+/// chases `args[1]` (OBJECT_ATTRIBUTES* VA) via `ReadProcessMemory`,
+/// renders the wide path truncated to 256 bytes, and emits one
+/// `[sbox-exec] denied-open: …` line on stderr. Reply is a no-op ACK.
+///
+/// Wire layout (see cdylib `OP_DENIED_OPEN` doc):
+///   args[0] = syscall id (0=NtCreateFile, 1=NtOpenFile)
+///   args[1] = OBJECT_ATTRIBUTES* VA
+///   args[2] = desired_access (u32)
+///   args[3] = share_access   (u32)
+///   args[4] = options        (u32 — CreateOptions / OpenOptions)
+///   args[5] = status         (u32 — always 0xC0000022 today)
+pub const OP_DENIED_OPEN: u64 = 101;
+
+/// Phase N-0: deny-log syscall ids. Independent numbering from the
+/// `TRACE_*` family — the broker's deny-log handler maps these
+/// directly to ntdll syscall names.
+pub const DENYLOG_NT_CREATE_FILE: u64 = 0;
+pub const DENYLOG_NT_OPEN_FILE: u64 = 1;
+
 // ─── Phase K: trace-mode syscall IDs ───────────────────────────────
 //
 // Indexed into `IpcEnv.passthrough_trace` on the cdylib side and
@@ -262,6 +284,13 @@ impl Channel {
     /// broker's read of the previous one. So we set `ev_resp` here
     /// without touching any reply fields.
     pub fn reply_trace_ack(&self) {
+        unsafe { let _ = SetEvent(self.ev_resp); }
+    }
+
+    /// Phase N-0: ACK an `OP_DENIED_OPEN` request. Same one-way
+    /// semantics as `reply_trace_ack` — broker logs and signals back
+    /// without touching reply fields.
+    pub fn reply_denylog_ack(&self) {
         unsafe { let _ = SetEvent(self.ev_resp); }
     }
 

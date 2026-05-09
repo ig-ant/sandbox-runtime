@@ -660,12 +660,20 @@ fn try_inject_cdylib_full(
         std::process::id(),
     );
 
+    // Phase N-0: deny-log hooks default ON. Set `WINSBOX_LOG_DENIES=0`
+    // to disable (zeroing the entries makes `install_denylog` skip the
+    // patch; the cdylib bodies stay present but unreachable).
+    let log_denies = std::env::var("WINSBOX_LOG_DENIES")
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true);
     let entries = interception::CdylibHookEntries {
         nt_open_section: mapped.hook_nt_open_section,
         nt_create_directory_object: mapped.hook_nt_create_directory_object,
         nt_open_directory_object: mapped.hook_nt_open_directory_object,
         nt_create_named_pipe_file: mapped.hook_nt_create_named_pipe_file,
         create_process_internal_w: mapped.hook_create_process_internal_w,
+        nt_create_file_denylog: if log_denies { mapped.hook_nt_create_file_denylog } else { 0 },
+        nt_open_file_denylog: if log_denies { mapped.hook_nt_open_file_denylog } else { 0 },
     };
     log!(
         "cdylib hook VAs: section={:#x} dirobj_create={:#x} dirobj_open={:#x} \
@@ -698,13 +706,6 @@ fn try_inject_cdylib_full(
         cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
         return Err(e.context("install_reg (manual-map)"));
     }
-    log!(
-        "cdylib ntdll hooks patched pre-resume; passthrough thunks: \
-         section={:#x} dirobj_create={:#x} dirobj_open={:#x} pipe={:#x}",
-        pt.nt_open_section, pt.nt_create_directory_object,
-        pt.nt_open_directory_object, pt.nt_create_named_pipe_file,
-    );
-
     // Phase K: opt-in trace-mode hook install. When
     // `WINSBOX_TRACE_SYSCALLS=1`, patch in 12 additional `Nt*`
     // syscalls that bash bootstrap plausibly hits (FS opens, IOCTL,
@@ -714,6 +715,33 @@ fn try_inject_cdylib_full(
     // no trace bytecode in the target, zero cost.
     let trace_mode = std::env::var("WINSBOX_TRACE_SYSCALLS")
         .ok().is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    // Phase N-0: always-on deny-log hooks for NtCreateFile / NtOpenFile.
+    // Default ON; `WINSBOX_LOG_DENIES=0` zeroes the entries so this
+    // becomes a no-op walk. Trace mode also patches NtCreateFile /
+    // NtOpenFile (indices 0/1 in TRACE_SYSCALL_NAMES); to avoid two
+    // ABS_JMPs landing on the same syscall, the trace hooks (which
+    // already get the `[DENY]` prefix from item 4 on ACCESS_DENIED)
+    // own those two syscalls when trace is on. Zero out the deny-log
+    // entries in that case so install_denylog's walk skips both.
+    let mut entries_with_denylog = entries;
+    if trace_mode {
+        entries_with_denylog.nt_create_file_denylog = 0;
+        entries_with_denylog.nt_open_file_denylog = 0;
+    }
+    if let Err(e) = interception::install_denylog(target, Some(&entries_with_denylog), &mut pt) {
+        drop(ch);
+        cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
+        return Err(e.context("install_denylog (manual-map)"));
+    }
+    log!(
+        "cdylib ntdll hooks patched pre-resume; passthrough thunks: \
+         section={:#x} dirobj_create={:#x} dirobj_open={:#x} pipe={:#x} \
+         denylog_create={:#x} denylog_open={:#x} (log_denies={} trace_mode={})",
+        pt.nt_open_section, pt.nt_create_directory_object,
+        pt.nt_open_directory_object, pt.nt_create_named_pipe_file,
+        pt.nt_create_file_denylog, pt.nt_open_file_denylog,
+        log_denies, trace_mode,
+    );
     let mut trace_pt = interception::TracePassthroughs::default();
     if trace_mode {
         if let Err(e) = interception::install_trace(target, &mapped.hook_trace, &mut trace_pt) {
@@ -736,6 +764,17 @@ fn try_inject_cdylib_full(
         drop(ch);
         cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
         return Err(e.context("manual_map::prefill_ipc"));
+    }
+    // Phase N-0: write the deny-log passthrough VAs. When
+    // `WINSBOX_LOG_DENIES=0` the patches were skipped above, so both
+    // thunk slots are zero — write zeros so the cdylib's deny-log
+    // bodies short-circuit if they're somehow reached.
+    if let Err(e) = crate::manual_map::prefill_denylog_passthroughs(
+        target, mapped.ipc_va, pt.nt_create_file_denylog, pt.nt_open_file_denylog,
+    ) {
+        drop(ch);
+        cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
+        return Err(e.context("manual_map::prefill_denylog_passthroughs"));
     }
     if trace_mode {
         // Phase K: write the trace passthrough VAs into IPC.passthrough_trace.
@@ -1089,6 +1128,8 @@ fn serve_ipc(ch: ipc::Channel, target_raw: isize, ctx: Arc<SpawnCtx>) {
                 handle_named_pipe(&ch, target, &req, &ctx),
             ipc::OP_TRACE =>
                 handle_trace(&ch, target, &req),
+            ipc::OP_DENIED_OPEN =>
+                handle_denied_open(&ch, target, &req),
             op => {
                 eprintln!("[sbox-exec] ipc: unknown op {op}");
                 ch.reply_fs(0, 0, 0xC0000002u32 as i32 /* STATUS_NOT_IMPLEMENTED */);
@@ -1121,11 +1162,59 @@ fn handle_trace(ch: &ipc::Channel, target: HANDLE, req: &ipc::Wire) {
     let name = ipc::TRACE_SYSCALL_NAMES.get(id).copied().unwrap_or("?");
     let status = req.r_status as u32;
     let summary = trace_arg_summary(target, id, req);
+    // Phase N-0 item 4: prefix `[DENY] ` when the syscall returned
+    // STATUS_ACCESS_DENIED so deny-traces grep cleanly out of the
+    // mixed trace stream. Pure formatting; no semantic effect.
+    let deny_prefix = if status == 0xC0000022 { "[DENY] " } else { "" };
     eprintln!(
-        "[sbox-trace] tid=0 {name} {summary} -> {:#010x}",
+        "[sbox-trace] {deny_prefix}tid=0 {name} {summary} -> {:#010x}",
         status,
     );
     ch.reply_trace_ack();
+}
+
+/// Phase N-0: handle an `OP_DENIED_OPEN` deny-log frame. The cdylib
+/// sends one of these whenever its always-on `NtCreateFile` /
+/// `NtOpenFile` deny-log hooks see the saved-original passthrough
+/// return `STATUS_ACCESS_DENIED`. We chase the OBJECT_ATTRIBUTES VA
+/// to render the wide path (truncated to 256 bytes), log to stderr,
+/// then ACK so the cdylib can release its IPC mutex.
+///
+/// Wire layout (mirror of cdylib `OP_DENIED_OPEN`):
+///   args[0] = syscall id (DENYLOG_NT_CREATE_FILE / NT_OPEN_FILE)
+///   args[1] = OBJECT_ATTRIBUTES* VA
+///   args[2..6] = desired_access / share_access / options / status
+fn handle_denied_open(ch: &ipc::Channel, target: HANDLE, req: &ipc::Wire) {
+    let id = req.args[0];
+    let name = match id {
+        ipc::DENYLOG_NT_CREATE_FILE => "NtCreateFile",
+        ipc::DENYLOG_NT_OPEN_FILE => "NtOpenFile",
+        _ => "?",
+    };
+    let oa_va = req.args[1];
+    let path = if oa_va == 0 {
+        "(null)".to_string()
+    } else {
+        match read_target_oa_raw(target, oa_va as usize) {
+            Ok((_root, mut name)) => {
+                // Wide path truncation: 256 bytes = 128 chars cap.
+                if name.chars().count() > 128 {
+                    name = name.chars().take(128).collect::<String>() + "…";
+                }
+                name
+            }
+            Err(_) => "?".to_string(),
+        }
+    };
+    let desired_access = req.args[2] as u32;
+    let share_access = req.args[3] as u32;
+    let options = req.args[4] as u32;
+    let status = req.args[5] as u32;
+    eprintln!(
+        "[sbox-exec] denied-open: {name} path={path:?} access={desired_access:#x} \
+         share={share_access:#x} options={options:#x} status={status:#010x}",
+    );
+    ch.reply_denylog_ack();
 }
 
 /// Build the per-syscall arg summary for a trace log line.
@@ -1231,6 +1320,7 @@ fn trace_arg_summary(target: HANDLE, id: usize, req: &ipc::Wire) -> String {
 }
 
 fn handle_cpw(ch: &ipc::Channel, target: HANDLE, req: &ipc::Wire, ctx: &Arc<SpawnCtx>) {
+    use windows::Win32::System::Threading::GetProcessId;
     // CreateProcessInternalW args:
     //   [1]=lpApplicationName, [2]=lpCommandLine, [6]=dwCreationFlags,
     //   [8]=lpCurrentDirectory, [9]=lpStartupInfo, [10]=lpProcessInformation.
@@ -1249,12 +1339,10 @@ fn handle_cpw(ch: &ipc::Channel, target: HANDLE, req: &ipc::Wire, ctx: &Arc<Spaw
         ch.reply_cpw_err(87 /* ERROR_INVALID_PARAMETER */);
         return;
     }
-    eprintln!(
-        "[sbox-exec] ipc: brokered spawn: {cmdline}  (flags={caller_flags:#x} si.flags={:#x} cbReserved2={} app={app:?})",
-        si.dwFlags.0, reserved2.len(),
-    );
+    let ppid = unsafe { GetProcessId(target) };
     let app_opt = (!app.is_empty()).then_some(app.as_str());
     let mut envb = read_target_env(target, req.args[7] as usize, caller_flags, ctx);
+    let final_cwd = cwd.as_deref().unwrap_or(ctx.cwd.as_str());
     match broker_spawn(ctx, target, app_opt, &cmdline, cwd.as_deref(),
                        caller_flags, &si, &reserved2, &mut envb) {
         Ok(child) => {
@@ -1266,6 +1354,17 @@ fn handle_cpw(ch: &ipc::Channel, target: HANDLE, req: &ipc::Wire, ctx: &Arc<Spaw
             // `examples/smoke_bash.rs`). Resume the grandchild
             // immediately so it runs.
             unsafe { ResumeThread(child.hThread); }
+            // Phase N-0 item 8: canonical grandchild-spawn lineage line.
+            // Replaces the scattered "ipc: brokered spawn:" / "broker_spawn"
+            // logs with one fixed-shape line. token=primary because Phase L
+            // wall 2 fix-up #6 (de5bd20) dropped SetThreadToken(initial)
+            // for grandchildren; the main thread runs on the parent's
+            // primary lowbox token directly.
+            eprintln!(
+                "[sbox-exec] grandchild spawn: ppid={ppid} new_pid={} app={app:?} \
+                 cmdline={cmdline:?} cwd={final_cwd:?} token=primary flags={caller_flags:#x}",
+                child.dwProcessId,
+            );
             let p = ch.dup_to_target(child.hProcess).unwrap_or(0);
             let t = ch.dup_to_target(child.hThread).unwrap_or(0);
             ch.reply_cpw_ok(p, t, child.dwProcessId, child.dwThreadId);
@@ -1278,7 +1377,13 @@ fn handle_cpw(ch: &ipc::Channel, target: HANDLE, req: &ipc::Wire, ctx: &Arc<Spaw
             let gle = unsafe {
                 windows::Win32::Foundation::GetLastError().0
             };
-            eprintln!("[sbox-exec] ipc: brokered spawn failed: {e:#} (gle={gle})");
+            // Phase N-0 item 8: canonical failure line, same shape as
+            // success but with err= and no new_pid.
+            eprintln!(
+                "[sbox-exec] grandchild spawn FAILED: ppid={ppid} app={app:?} \
+                 cmdline={cmdline:?} err={:?} gle={gle}",
+                format!("{e:#}"),
+            );
             ch.reply_cpw_err(if gle != 0 { gle } else { 5 });
         }
     }

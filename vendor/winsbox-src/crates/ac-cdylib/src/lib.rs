@@ -76,7 +76,15 @@ extern "system" {
 /// NtAllocateVirtualMemory — the syscalls the loader exercises
 /// before reaching the original 12 trace family. Wire format
 /// otherwise unchanged.
-pub const CDYLIB_VERSION: u32 = 4;
+///
+/// v5 (Phase N-0): added always-on `hook_NtCreateFile_denylog` and
+/// `hook_NtOpenFile_denylog`. New `OP_DENIED_OPEN` opcode carries a
+/// truncated wide-path snapshot + access/share/options/status. Both
+/// hooks tail-call the saved-original passthrough first; only on
+/// `STATUS_ACCESS_DENIED` do they emit IPC. Two new passthrough VAs
+/// land in `IpcEnv` (alongside the trace passthroughs). Disable via
+/// the broker's `WINSBOX_LOG_DENIES=0` env var; default ON.
+pub const CDYLIB_VERSION: u32 = 5;
 
 /// Sentinel return value for `cdylib_init`. Broker verifies on
 /// report-back. Retained as a no-op export so the broker's
@@ -161,6 +169,14 @@ pub struct IpcEnv {
     /// zero in default runs (the trace hooks aren't installed in that
     /// case, so the thunks aren't read either).
     pub passthrough_trace: [AtomicU64; TRACE_SYSCALL_COUNT],
+    /// Phase N-0: passthrough thunks for the always-on
+    /// `hook_NtCreateFile_denylog` / `hook_NtOpenFile_denylog`
+    /// hooks. Always written when the deny-log hooks install
+    /// (default on, off via `WINSBOX_LOG_DENIES=0`). Both hooks
+    /// tail-call into these to invoke the un-hooked syscall, then
+    /// only emit `OP_DENIED_OPEN` on `STATUS_ACCESS_DENIED`.
+    pub passthrough_nt_create_file_denylog: AtomicU64,
+    pub passthrough_nt_open_file_denylog: AtomicU64,
 }
 
 /// Exported as a no-mangle data symbol so the broker's
@@ -192,6 +208,8 @@ pub static IPC: IpcEnv = IpcEnv {
         AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
         AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
     ],
+    passthrough_nt_create_file_denylog: AtomicU64::new(0),
+    passthrough_nt_open_file_denylog: AtomicU64::new(0),
 };
 
 #[inline]
@@ -212,6 +230,32 @@ const OP_NTCREATENAMEDPIPE: u64 = 10;
 /// mutex. `args[0]` holds the trace-syscall-id; the remaining `args`
 /// are op-specific (see `hook_*_trace` builders).
 const OP_TRACE: u64 = 100;
+
+/// Phase N-0: always-on denied-open log frame. Sent by the cdylib's
+/// `hook_NtCreateFile_denylog` / `hook_NtOpenFile_denylog` after the
+/// passthrough thunk returned `STATUS_ACCESS_DENIED`. The wire layout:
+///
+///   args[0] = syscall id (0=NtCreateFile, 1=NtOpenFile)
+///   args[1] = OBJECT_ATTRIBUTES* VA (broker chases via RPM and
+///             truncates the resulting wide path to 256 bytes)
+///   args[2] = desired_access (u32, low half)
+///   args[3] = share_access   (u32, low half)
+///   args[4] = options        (u32, low half) — CreateOptions for
+///             NtCreateFile / OpenOptions for NtOpenFile
+///   args[5] = status         (u32, low half — always 0xC0000022 in
+///             current impl, included for forward compat)
+///
+/// Cheaper than packing the path into the wire: it keeps the cdylib
+/// no_std (no allocator, no UTF-16 conversion) and reuses the
+/// broker-side `read_target_oa_raw` helper the trace path already
+/// has. Broker logs to stderr; no semantic effect on the caller (the
+/// kernel already returned ACCESS_DENIED).
+const OP_DENIED_OPEN: u64 = 101;
+
+/// Syscall IDs for the deny-log path (independent numbering from the
+/// `TRACE_*` family; broker maps these via `OP_DENIED_OPEN.args[0]`).
+const DENYLOG_NT_CREATE_FILE: u64 = 0;
+const DENYLOG_NT_OPEN_FILE: u64 = 1;
 
 const FS_PASSTHROUGH: i32 = 0xE0000001u32 as i32;
 const STATUS_ACCESS_DENIED: i32 = 0xC0000022u32 as i32;
@@ -1012,6 +1056,105 @@ pub unsafe extern "system" fn hook_nt_allocate_virtual_memory_trace(
             protect as u64,
         ]),
     );
+    st
+}
+
+// ─── Phase N-0: always-on denied-open hooks ────────────────────────
+//
+// These hooks tail-call the saved-original passthrough thunk first
+// (so the kernel handles the syscall normally), then on
+// `STATUS_ACCESS_DENIED` send an `OP_DENIED_OPEN` frame to the broker
+// for stderr logging. Pays dividends in N-2 (broker-mediated open),
+// N-4 (Schannel investigation), and N-5 (Cygwin debugger).
+//
+// Default ON. Disable via the broker's `WINSBOX_LOG_DENIES=0` env
+// var, which makes the broker skip the install (the cdylib body
+// stays present but unreachable).
+//
+// Wire format: see `OP_DENIED_OPEN` doc-comment above. Reuses the
+// existing `ipc_roundtrip` (mutex-protected, one-at-a-time) so the
+// deny-log channel can't corrupt the wire while a real hook is
+// mid-flight.
+
+#[inline]
+unsafe fn ipc_denylog_send(
+    syscall_id: u64, oa_va: u64,
+    desired_access: u32, share_access: u32, options: u32, status: NTSTATUS,
+) {
+    if !ipc_loaded() { return; }
+    let mut frame = Wire {
+        op: OP_DENIED_OPEN,
+        args: [
+            syscall_id, oa_va,
+            desired_access as u64,
+            share_access as u64,
+            options as u64,
+            status as u32 as u64,
+            0, 0, 0, 0, 0, 0,
+        ],
+        r0: 0, r1: 0, r2: 0, r3: 0, r_status: 0, r_error: 0,
+    };
+    ipc_roundtrip(&mut frame);
+}
+
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
+pub unsafe extern "system" fn hook_nt_create_file_denylog(
+    out_handle: *mut HANDLE,
+    desired_access: u32,
+    oa: *const c_void,
+    iosb: *mut [usize; 2],
+    alloc_size: *const i64,
+    file_attrs: u32,
+    share_access: u32,
+    create_disposition: u32,
+    create_options: u32,
+    ea_buffer: *const c_void,
+    ea_length: u32,
+) -> NTSTATUS {
+    let pv = IPC.passthrough_nt_create_file_denylog.load(Ordering::Acquire);
+    if pv == 0 { return STATUS_NOT_IMPLEMENTED; }
+    type Fn11 = unsafe extern "system" fn(
+        *mut HANDLE, u32, *const c_void, *mut [usize; 2], *const i64,
+        u32, u32, u32, u32, *const c_void, u32,
+    ) -> NTSTATUS;
+    let f: Fn11 = core::mem::transmute(pv as usize);
+    let st = f(
+        out_handle, desired_access, oa, iosb, alloc_size,
+        file_attrs, share_access, create_disposition,
+        create_options, ea_buffer, ea_length,
+    );
+    if st == STATUS_ACCESS_DENIED {
+        ipc_denylog_send(
+            DENYLOG_NT_CREATE_FILE, oa as u64,
+            desired_access, share_access, create_options, st,
+        );
+    }
+    st
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn hook_nt_open_file_denylog(
+    out_handle: *mut HANDLE,
+    desired_access: u32,
+    oa: *const c_void,
+    iosb: *mut [usize; 2],
+    share_access: u32,
+    open_options: u32,
+) -> NTSTATUS {
+    let pv = IPC.passthrough_nt_open_file_denylog.load(Ordering::Acquire);
+    if pv == 0 { return STATUS_NOT_IMPLEMENTED; }
+    type Fn6 = unsafe extern "system" fn(
+        *mut HANDLE, u32, *const c_void, *mut [usize; 2], u32, u32,
+    ) -> NTSTATUS;
+    let f: Fn6 = core::mem::transmute(pv as usize);
+    let st = f(out_handle, desired_access, oa, iosb, share_access, open_options);
+    if st == STATUS_ACCESS_DENIED {
+        ipc_denylog_send(
+            DENYLOG_NT_OPEN_FILE, oa as u64,
+            desired_access, share_access, open_options, st,
+        );
+    }
     st
 }
 

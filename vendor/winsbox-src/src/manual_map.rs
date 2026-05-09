@@ -116,6 +116,12 @@ pub struct ManualMapped {
     /// by `crate::ipc::TRACE_*` syscall ids; only consulted when
     /// `WINSBOX_TRACE_SYSCALLS=1`.
     pub hook_trace: [usize; crate::ipc::TRACE_SYSCALL_COUNT],
+    /// Phase N-0: in-target VAs of the always-on deny-log hooks
+    /// (`hook_nt_create_file_denylog`, `hook_nt_open_file_denylog`).
+    /// Resolved at every install; broker zeroes downstream when
+    /// `WINSBOX_LOG_DENIES=0`.
+    pub hook_nt_create_file_denylog: usize,
+    pub hook_nt_open_file_denylog: usize,
 }
 
 /// Read `dll_path`, parse PE headers, allocate at preferred base in
@@ -261,6 +267,12 @@ pub fn manual_map_cdylib(target: HANDLE, dll_path: &Path) -> Result<ManualMapped
         hook_trace[i] = resolve_target_export_va(dll_path, base, name)?;
     }
 
+    // Phase N-0: always-on deny-log hook exports.
+    let hook_nt_create_file_denylog =
+        resolve_target_export_va(dll_path, base, "hook_nt_create_file_denylog")?;
+    let hook_nt_open_file_denylog =
+        resolve_target_export_va(dll_path, base, "hook_nt_open_file_denylog")?;
+
     eprintln!(
         "[sbox-exec] manual_map: cdylib mapped at {base:#x} ({alloc_size:#x} bytes), \
          IPC @ {ipc_va:#x}, delta={delta:#x}",
@@ -276,6 +288,8 @@ pub fn manual_map_cdylib(target: HANDLE, dll_path: &Path) -> Result<ManualMapped
         hook_nt_create_named_pipe_file,
         hook_create_process_internal_w,
         hook_trace,
+        hook_nt_create_file_denylog,
+        hook_nt_open_file_denylog,
     })
 }
 
@@ -374,6 +388,34 @@ pub fn prefill_trace_passthroughs(
         },
     )
     .context("WriteProcessMemory(IPC trace passthroughs)")
+}
+
+/// Phase N-0: write the deny-log passthrough thunk VAs into
+/// `IPC.passthrough_nt_create_file_denylog` /
+/// `IPC.passthrough_nt_open_file_denylog`. Layout: 2 u64s at
+/// offset 0xC0 (= 0x48 trace base + 15 * 8 = 0x48 + 0x78).
+///
+/// Called after `install_denylog` has built both thunks (or skipped
+/// install via `WINSBOX_LOG_DENIES=0`, in which case both thunks
+/// are zero and the cdylib's deny-log bodies — which check the
+/// passthrough VA before invoking it — early-return STATUS_NOT_
+/// IMPLEMENTED. Since the broker also skips the ABS_JMP patch on
+/// the disabled path, the cdylib body is never reached.
+pub fn prefill_denylog_passthroughs(
+    target: HANDLE, ipc_va: usize, create_pt: usize, open_pt: usize,
+) -> Result<()> {
+    let payload: [u64; 2] = [create_pt as u64, open_pt as u64];
+    write_remote_bytes(
+        target,
+        ipc_va + 0xC0,
+        unsafe {
+            std::slice::from_raw_parts(
+                payload.as_ptr() as *const u8,
+                size_of::<[u64; 2]>(),
+            )
+        },
+    )
+    .context("WriteProcessMemory(IPC denylog passthroughs)")
 }
 
 // ─── PE header parsing ─────────────────────────────────────────────

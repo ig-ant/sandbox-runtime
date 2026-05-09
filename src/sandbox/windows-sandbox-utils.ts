@@ -207,6 +207,13 @@ export async function wrapCommandWithSandboxWindows(
   fs.writeFileSync(policyPath, JSON.stringify(policy))
   logForDebugging(`[Sandbox Windows] policy → ${policyPath}`)
 
+  // Phase N-0: WINSBOX_DEBUG=1 dumps the resolved policy to stderr
+  // before spawn so the per-test log shows exactly what the broker
+  // got. Off by default — JSON snapshots clutter normal runs.
+  if (process.env.WINSBOX_DEBUG === '1') {
+    console.error('[srt-ts] resolved policy:', JSON.stringify(policy, null, 2))
+  }
+
   // cmd.exe-safe: only double-quoted absolute paths, no shell metachars.
   return `"${exe}" --policy "${policyPath}"`
 }

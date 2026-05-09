@@ -151,6 +151,31 @@ pub fn install_trace(
     Ok(())
 }
 
+/// Phase N-0: install the always-on deny-log hooks for
+/// `NtCreateFile` / `NtOpenFile`. Each builds a passthrough thunk
+/// (so the hook body can invoke the un-hooked syscall) and patches
+/// in an ABS_JMP to the cdylib's `hook_*_denylog` export. Skips
+/// each individually when the cdylib entry is zero (broker honoured
+/// `WINSBOX_LOG_DENIES=0`).
+pub fn install_denylog(
+    target: HANDLE,
+    cdylib: Option<&CdylibHookEntries>,
+    pt: &mut PassthroughThunks,
+) -> Result<()> {
+    let Some(c) = cdylib else { return Ok(()); };
+    if c.nt_create_file_denylog != 0 {
+        let va = ntdll_export("NtCreateFile")?;
+        pt.nt_create_file_denylog = build_passthrough_thunk(target, va)?;
+        patch_with_abs_jmp(target, "NtCreateFile", va, c.nt_create_file_denylog)?;
+    }
+    if c.nt_open_file_denylog != 0 {
+        let va = ntdll_export("NtOpenFile")?;
+        pt.nt_open_file_denylog = build_passthrough_thunk(target, va)?;
+        patch_with_abs_jmp(target, "NtOpenFile", va, c.nt_open_file_denylog)?;
+    }
+    Ok(())
+}
+
 // ─── Patch primitive ───────────────────────────────────────────────
 
 /// Slim dispatcher path: write a 12-byte ABS_JMP directly to the

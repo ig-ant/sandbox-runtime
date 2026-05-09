@@ -46,6 +46,12 @@ pub struct CdylibHookEntries {
     pub nt_open_directory_object: usize,
     pub nt_create_named_pipe_file: usize,
     pub create_process_internal_w: usize,
+    /// Phase N-0: always-on `hook_NtCreateFile_denylog` and
+    /// `hook_NtOpenFile_denylog`. Default-on; broker zeroes these
+    /// when `WINSBOX_LOG_DENIES=0` so the install path skips the
+    /// patch (the cdylib bodies are still present but unreachable).
+    pub nt_create_file_denylog: usize,
+    pub nt_open_file_denylog: usize,
 }
 
 impl CdylibHookEntries {
@@ -77,6 +83,12 @@ pub struct PassthroughThunks {
     pub nt_open_directory_object: usize,
     pub nt_create_named_pipe_file: usize,
     pub create_process_internal_w: usize,
+    /// Phase N-0: passthrough thunks for the always-on deny-log
+    /// hooks. The hooks call into these to invoke the un-hooked
+    /// syscall, then check the return status before optionally
+    /// emitting an `OP_DENIED_OPEN` IPC frame.
+    pub nt_create_file_denylog: usize,
+    pub nt_open_file_denylog: usize,
 }
 
 /// Phase K: target-VAs of the 12 trace-mode passthrough thunks. Same
@@ -154,6 +166,26 @@ pub fn install_trace(
     out_pt: &mut TracePassthroughs,
 ) -> Result<()> {
     arch::install_trace(target, trace_hook_vas, out_pt)
+}
+
+/// Phase N-0: install the always-on `NtCreateFile` / `NtOpenFile`
+/// deny-log hooks. Each tail-calls the saved-original passthrough
+/// first, then on `STATUS_ACCESS_DENIED` sends an `OP_DENIED_OPEN`
+/// IPC frame for stderr logging. Default ON; the broker passes
+/// zeroed entries when `WINSBOX_LOG_DENIES=0` so the install short-
+/// circuits without patching ntdll.
+///
+/// Builds passthrough thunks (saved-original + JMP back) alongside
+/// the patches so the hook bodies can invoke the un-hooked syscall.
+/// Failures are surfaced (unlike trace install) since the hooks are
+/// always-on — a partial install would leave `NtCreateFile` patched
+/// but `NtOpenFile` not, which is a confusing diagnostic.
+pub fn install_denylog(
+    target: HANDLE,
+    cdylib: Option<&CdylibHookEntries>,
+    pt: &mut PassthroughThunks,
+) -> Result<()> {
+    arch::install_denylog(target, cdylib, pt)
 }
 
 // ─── shared helpers ────────────────────────────────────────────────
