@@ -107,7 +107,23 @@ extern "system" {
 /// `passthrough_trace` array grows from 15 to 30 slots; downstream
 /// `passthrough_nt_create_file_denylog` field offset shifts from
 /// 0xC0 to 0x138. Wire format otherwise unchanged.
-pub const CDYLIB_VERSION: u32 = 7;
+///
+/// v8 (N-7 retry): broker mediation for `NtQueryAttributesFile` /
+/// `NtQueryFullAttributesFile` restored. Cygwin's `path_conv` calls
+/// these for every `/etc/*`, `/dev/null`, and symlink-resolution
+/// step *before* the heavier `NtCreateFile`; under USER_LIMITED+AC
+/// the original returns `STATUS_ACCESS_DENIED` because the
+/// **parent** dir often denies `FILE_READ_ATTRIBUTES` even when
+/// ACL stamping has granted access to the leaf. Two new always-on
+/// hooks (`hook_nt_query_attributes_file`,
+/// `hook_nt_query_full_attributes_file`) tail-call the saved
+/// original; on deny they IPC `OP_NTQUERYATTR{,FULL}` to the
+/// broker, which re-issues under its own user-token after a
+/// `broker_open`-style policy check, copies the result struct back
+/// via `ATTR_RESULT_OFF`, and replies. The two new
+/// `passthrough_nt_query_*_attributes_file` fields land at the end
+/// of `IpcEnv`; existing field offsets unchanged.
+pub const CDYLIB_VERSION: u32 = 8;
 
 /// Sentinel return value for `cdylib_init`. Broker verifies on
 /// report-back. Retained as a no-op export so the broker's
@@ -220,6 +236,17 @@ pub struct IpcEnv {
     /// only emit `OP_DENIED_OPEN` on `STATUS_ACCESS_DENIED`.
     pub passthrough_nt_create_file_denylog: AtomicU64,
     pub passthrough_nt_open_file_denylog: AtomicU64,
+    /// N-7 retry: passthrough thunks for the always-on
+    /// `hook_nt_query_attributes_file` /
+    /// `hook_nt_query_full_attributes_file` hooks. Same shape as
+    /// the deny-log pair: hook tail-calls into the thunk, observes
+    /// `STATUS_ACCESS_DENIED`, IPC's `OP_NTQUERYATTR{,FULL}` to the
+    /// broker. Default ON; broker zeroes both when
+    /// `WINSBOX_LOG_DENIES=0` (same kill switch — the attr broker
+    /// is part of the same deny-recovery surface as the open
+    /// broker) and `install_attr_query` skips the patch.
+    pub passthrough_nt_query_attributes_file: AtomicU64,
+    pub passthrough_nt_query_full_attributes_file: AtomicU64,
 }
 
 /// Exported as a no-mangle data symbol so the broker's
@@ -258,6 +285,8 @@ pub static IPC: IpcEnv = IpcEnv {
     ],
     passthrough_nt_create_file_denylog: AtomicU64::new(0),
     passthrough_nt_open_file_denylog: AtomicU64::new(0),
+    passthrough_nt_query_attributes_file: AtomicU64::new(0),
+    passthrough_nt_query_full_attributes_file: AtomicU64::new(0),
 };
 
 #[inline]
@@ -269,9 +298,21 @@ fn ipc_loaded() -> bool {
 
 const OP_CPW: u64 = 0;
 const OP_NTOPENSECTION: u64 = 5;
+/// N-7 retry: see broker `crate::ipc::OP_NTQUERYATTR` doc.
+const OP_NTQUERYATTR: u64 = 6;
+const OP_NTQUERYFULLATTR: u64 = 7;
 const OP_NTCREATEDIROBJ: u64 = 8;
 const OP_NTOPENDIROBJ: u64 = 9;
 const OP_NTCREATENAMEDPIPE: u64 = 10;
+
+/// N-7 retry: section offset where the broker writes the
+/// `NtQuery{,Full}AttributesFile` result struct. Mirrors
+/// `crate::ipc::ATTR_RESULT_OFF`. Past `Wire` (0x88) so it doesn't
+/// alias the request frame.
+const ATTR_RESULT_OFF: usize = 0x90;
+/// `FILE_NETWORK_OPEN_INFORMATION` is the larger of the two; covers
+/// `FILE_BASIC_INFORMATION` (40 bytes) too.
+const ATTR_RESULT_LEN: usize = 56;
 /// Phase K: passthrough+log trace frame. The broker logs the syscall
 /// + key arg + return status to stderr (or a sink the broker chooses)
 /// and replies with a no-op ACK so the cdylib can release the IPC
@@ -1735,6 +1776,123 @@ pub unsafe extern "system" fn hook_nt_open_file_denylog(
             DENYLOG_NT_OPEN_FILE, oa as u64,
             desired_access, share_access, open_options, st,
         );
+    }
+    st
+}
+
+// ─── N-7 retry: NtQuery{,Full}AttributesFile broker bridge ─────────
+//
+// Cygwin's `path_conv::check` calls `NtQueryAttributesFile` (and the
+// `Full` variant for symlink resolution) for every `/etc/*`,
+// `/dev/null`, and Cygwin-mount lookup *before* the heavier
+// `NtCreateFile`. Under USER_LIMITED+AC the saved-original returns
+// `STATUS_ACCESS_DENIED` because the parent dir typically denies
+// `FILE_READ_ATTRIBUTES` to AC even when the leaf was ACL-stamped
+// for AC read. Without this bridge bash exits 66 (EX_NOINPUT) on
+// `bash -c "echo hello"` because Cygwin can't resolve `/etc/passwd`
+// or its mount table.
+//
+// Pattern mirrors `hook_nt_create_file_denylog`: tail-call the
+// passthrough thunk; on `STATUS_ACCESS_DENIED` IPC the broker.
+// Broker writes the result struct into the IPC section at
+// `ATTR_RESULT_OFF`; on success we copy it into the caller's
+// output buffer and return SUCCESS, otherwise we return the
+// original deny status.
+
+/// Send an `OP_NTQUERYATTR` / `OP_NTQUERYFULLATTR` frame and return
+/// `(NTSTATUS, result-bytes)`. Result is read out of the IPC
+/// section at `ATTR_RESULT_OFF` post-roundtrip, NOT from the Wire
+/// fields — the Wire's args slots are too small for the 56-byte
+/// `FILE_NETWORK_OPEN_INFORMATION` struct.
+#[inline]
+unsafe fn ipc_attr_query_send(
+    op: u64, oa_va: u64,
+) -> (NTSTATUS, [u8; ATTR_RESULT_LEN]) {
+    let mut out = [0u8; ATTR_RESULT_LEN];
+    if !ipc_loaded() {
+        return (STATUS_ACCESS_DENIED, out);
+    }
+    let section = IPC.section.load(Ordering::Acquire) as *mut Wire;
+    let ev_req = IPC.ev_req.load(Ordering::Acquire) as HANDLE;
+    let ev_resp = IPC.ev_resp.load(Ordering::Acquire) as HANDLE;
+    let mutex = IPC.mutex.load(Ordering::Acquire) as HANDLE;
+
+    let _ = NtWaitForSingleObject(mutex, 0, core::ptr::null());
+    let frame = Wire {
+        op,
+        args: [oa_va, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        r0: 0, r1: 0, r2: 0, r3: 0, r_status: 0, r_error: 0,
+    };
+    core::ptr::write_volatile(section, frame);
+    let _ = NtSetEvent(ev_req, core::ptr::null_mut());
+    let _ = NtWaitForSingleObject(ev_resp, 0, core::ptr::null());
+    let reply = core::ptr::read_volatile(section);
+    // Result struct lives past the Wire footer, written by
+    // `Channel::reply_attr_query`.
+    let result_ptr = (section as *const u8).add(ATTR_RESULT_OFF);
+    core::ptr::copy_nonoverlapping(result_ptr, out.as_mut_ptr(), ATTR_RESULT_LEN);
+    let _ = NtReleaseMutant(mutex, core::ptr::null_mut());
+    (reply.r_status, out)
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn hook_nt_query_attributes_file(
+    oa: *const c_void,
+    out_info: *mut c_void, // PFILE_BASIC_INFORMATION (40 bytes)
+) -> NTSTATUS {
+    let pv = IPC.passthrough_nt_query_attributes_file.load(Ordering::Acquire);
+    if pv == 0 { return STATUS_NOT_IMPLEMENTED; }
+    type Fn2 = unsafe extern "system" fn(
+        *const c_void, *mut c_void,
+    ) -> NTSTATUS;
+    let f: Fn2 = core::mem::transmute(pv as usize);
+    let st = f(oa, out_info);
+    if st == STATUS_ACCESS_DENIED {
+        let (bs, bytes) = ipc_attr_query_send(OP_NTQUERYATTR, oa as u64);
+        if bs >= 0 && !out_info.is_null() {
+            // FILE_BASIC_INFORMATION is 40 bytes; that's the
+            // smaller of the two result shapes. Copy that much
+            // into the caller's buffer.
+            core::ptr::copy_nonoverlapping(
+                bytes.as_ptr(), out_info as *mut u8, 40,
+            );
+            return bs;
+        }
+        // Broker rejected (policy / oa-read failed) or returned
+        // an NT-status the kernel could itself produce
+        // (STATUS_OBJECT_NAME_NOT_FOUND etc.). Surface the broker
+        // status — it's more accurate than the original deny.
+        if bs != STATUS_ACCESS_DENIED {
+            return bs;
+        }
+    }
+    st
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn hook_nt_query_full_attributes_file(
+    oa: *const c_void,
+    out_info: *mut c_void, // PFILE_NETWORK_OPEN_INFORMATION (56 bytes)
+) -> NTSTATUS {
+    let pv = IPC.passthrough_nt_query_full_attributes_file.load(Ordering::Acquire);
+    if pv == 0 { return STATUS_NOT_IMPLEMENTED; }
+    type Fn2 = unsafe extern "system" fn(
+        *const c_void, *mut c_void,
+    ) -> NTSTATUS;
+    let f: Fn2 = core::mem::transmute(pv as usize);
+    let st = f(oa, out_info);
+    if st == STATUS_ACCESS_DENIED {
+        let (bs, bytes) = ipc_attr_query_send(OP_NTQUERYFULLATTR, oa as u64);
+        if bs >= 0 && !out_info.is_null() {
+            // FILE_NETWORK_OPEN_INFORMATION is 56 bytes.
+            core::ptr::copy_nonoverlapping(
+                bytes.as_ptr(), out_info as *mut u8, 56,
+            );
+            return bs;
+        }
+        if bs != STATUS_ACCESS_DENIED {
+            return bs;
+        }
     }
     st
 }

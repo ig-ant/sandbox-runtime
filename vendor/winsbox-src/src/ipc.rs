@@ -42,6 +42,20 @@ use windows::Win32::System::Threading::{
 // `OP_NTOPENSECTION`).
 pub const OP_CPW: u64 = 0;
 pub const OP_NTOPENSECTION: u64 = 5;
+/// N-7 retry: Cygwin's path_conv calls NtQueryAttributesFile /
+/// NtQueryFullAttributesFile to stat-style probe files (every
+/// /etc/passwd, /etc/profile, /dev/null translation) before the
+/// heavier NtCreateFile open. Under USER_LIMITED+AC the saved
+/// original returns STATUS_ACCESS_DENIED (path_conv requires
+/// FILE_READ_ATTRIBUTES on the *parent* directory, which our
+/// per-AC ACL stamps don't always grant). The cdylib's
+/// `hook_NtQueryAttributesFile` / `hook_NtQueryFullAttributesFile`
+/// observe the deny and IPC the broker; the broker re-issues
+/// under its own user-token after a `broker_open`-style policy
+/// check, then writes the result struct back via
+/// `attr_result_offset()` and replies with `reply_attr_query`.
+pub const OP_NTQUERYATTR: u64 = 6;
+pub const OP_NTQUERYFULLATTR: u64 = 7;
 pub const OP_NTCREATEDIROBJ: u64 = 8;
 pub const OP_NTOPENDIROBJ: u64 = 9;
 pub const OP_NTCREATENAMEDPIPE: u64 = 10;
@@ -191,6 +205,14 @@ pub const TRACE_SYSCALL_NAMES: [&str; TRACE_SYSCALL_COUNT] = [
 /// the open natively) instead of returning the broker's reply.
 /// Used for `\Device\*` and any path the broker doesn't redirect.
 pub const FS_PASSTHROUGH: i32 = 0xE0000001u32 as i32;
+
+/// N-7 retry: section offset for the
+/// `NtQuery{,Full}AttributesFile` result struct. Sized for the
+/// larger of `FILE_BASIC_INFORMATION` (40 bytes) and
+/// `FILE_NETWORK_OPEN_INFORMATION` (56 bytes). Past the `Wire`
+/// trailer (0x88) — guaranteed not to overlap the request frame.
+pub const ATTR_RESULT_OFF: usize = 0x90;
+pub const ATTR_RESULT_LEN: usize = 56;
 
 /// Section layout shared by every hook stub. The stub writes `op`
 /// + `args`; the broker writes the `r*` fields. Field meaning is
@@ -352,6 +374,24 @@ impl Channel {
     /// without touching reply fields.
     pub fn reply_denylog_ack(&self) {
         unsafe { let _ = SetEvent(self.ev_resp); }
+    }
+
+    /// N-7 retry: reply to an `OP_NTQUERYATTR` / `OP_NTQUERYFULLATTR`
+    /// frame. Writes the broker-issued result struct (≤56 bytes —
+    /// `FILE_BASIC_INFORMATION` for the short variant,
+    /// `FILE_NETWORK_OPEN_INFORMATION` for the full one) into the
+    /// shared section past the `Wire` trailer at `ATTR_RESULT_OFF`,
+    /// then signals `ev_resp`. The cdylib reads `r_status` plus the
+    /// result bytes and copies them into the caller's output buffer
+    /// before returning to ntdll.
+    pub fn reply_attr_query(&self, status: i32, attrs: &[u8]) {
+        unsafe {
+            let len = attrs.len().min(ATTR_RESULT_LEN);
+            let dst = (self.view as *mut u8).add(ATTR_RESULT_OFF);
+            std::ptr::copy_nonoverlapping(attrs.as_ptr(), dst, len);
+            (*self.view).r_status = status;
+            let _ = SetEvent(self.ev_resp);
+        }
     }
 
     /// Phase N-2: reply to an `OP_BROKER_OPEN` frame. Writes the

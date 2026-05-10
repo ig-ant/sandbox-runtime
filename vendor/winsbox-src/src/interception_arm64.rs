@@ -167,6 +167,32 @@ pub fn install_denylog(
     Ok(())
 }
 
+/// N-7 retry: ARM64 mirror of x64's `install_attr_query`. Patches in
+/// `NtQueryAttributesFile` / `NtQueryFullAttributesFile` proxy hooks.
+pub fn install_attr_query(
+    target: HANDLE,
+    cdylib: Option<&CdylibHookEntries>,
+    pt: &mut PassthroughThunks,
+) -> Result<()> {
+    let Some(c) = cdylib else { return Ok(()); };
+    if c.nt_query_attributes_file != 0 {
+        let va = ntdll_export("NtQueryAttributesFile")?;
+        pt.nt_query_attributes_file = build_passthrough_thunk(target, va)?;
+        patch_with_abs_jmp(
+            target, "NtQueryAttributesFile", va, c.nt_query_attributes_file,
+        )?;
+    }
+    if c.nt_query_full_attributes_file != 0 {
+        let va = ntdll_export("NtQueryFullAttributesFile")?;
+        pt.nt_query_full_attributes_file = build_passthrough_thunk(target, va)?;
+        patch_with_abs_jmp(
+            target, "NtQueryFullAttributesFile", va,
+            c.nt_query_full_attributes_file,
+        )?;
+    }
+    Ok(())
+}
+
 // ─── Patch primitive + ABS_JMP template (Phase I) ─────────────────
 //
 // Phase I rationale (mirrors interception_x64.rs): the patched-in

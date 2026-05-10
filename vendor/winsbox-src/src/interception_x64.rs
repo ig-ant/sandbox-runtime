@@ -176,6 +176,35 @@ pub fn install_denylog(
     Ok(())
 }
 
+/// N-7 retry: install the attr-query proxy hooks. Same shape as
+/// `install_denylog`. The two ntdll exports
+/// `NtQueryAttributesFile` and `NtQueryFullAttributesFile` are
+/// stable across every Win10/11 build the broker targets (they
+/// date back to NT 4.0).
+pub fn install_attr_query(
+    target: HANDLE,
+    cdylib: Option<&CdylibHookEntries>,
+    pt: &mut PassthroughThunks,
+) -> Result<()> {
+    let Some(c) = cdylib else { return Ok(()); };
+    if c.nt_query_attributes_file != 0 {
+        let va = ntdll_export("NtQueryAttributesFile")?;
+        pt.nt_query_attributes_file = build_passthrough_thunk(target, va)?;
+        patch_with_abs_jmp(
+            target, "NtQueryAttributesFile", va, c.nt_query_attributes_file,
+        )?;
+    }
+    if c.nt_query_full_attributes_file != 0 {
+        let va = ntdll_export("NtQueryFullAttributesFile")?;
+        pt.nt_query_full_attributes_file = build_passthrough_thunk(target, va)?;
+        patch_with_abs_jmp(
+            target, "NtQueryFullAttributesFile", va,
+            c.nt_query_full_attributes_file,
+        )?;
+    }
+    Ok(())
+}
+
 // ─── Patch primitive ───────────────────────────────────────────────
 
 /// Slim dispatcher path: write a 12-byte ABS_JMP directly to the

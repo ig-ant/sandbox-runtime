@@ -52,6 +52,13 @@ pub struct CdylibHookEntries {
     /// patch (the cdylib bodies are still present but unreachable).
     pub nt_create_file_denylog: usize,
     pub nt_open_file_denylog: usize,
+    /// N-7 retry: always-on `hook_nt_query_attributes_file` /
+    /// `hook_nt_query_full_attributes_file`. Same default-on
+    /// shape as the deny-log pair; broker zeroes when
+    /// `WINSBOX_LOG_DENIES=0`. Cygwin path_conv depends on these
+    /// for `/etc/passwd`-style stat reads.
+    pub nt_query_attributes_file: usize,
+    pub nt_query_full_attributes_file: usize,
 }
 
 impl CdylibHookEntries {
@@ -89,6 +96,9 @@ pub struct PassthroughThunks {
     /// emitting an `OP_DENIED_OPEN` IPC frame.
     pub nt_create_file_denylog: usize,
     pub nt_open_file_denylog: usize,
+    /// N-7 retry: passthrough thunks for the attr-query bridges.
+    pub nt_query_attributes_file: usize,
+    pub nt_query_full_attributes_file: usize,
 }
 
 /// Phase K: target-VAs of the 12 trace-mode passthrough thunks. Same
@@ -186,6 +196,27 @@ pub fn install_denylog(
     pt: &mut PassthroughThunks,
 ) -> Result<()> {
     arch::install_denylog(target, cdylib, pt)
+}
+
+/// N-7 retry: install the always-on `NtQueryAttributesFile` /
+/// `NtQueryFullAttributesFile` proxy hooks. Same shape as
+/// [`install_denylog`]: build a passthrough thunk so the hook
+/// body can invoke the un-hooked syscall, then patch in an
+/// ABS_JMP to `hook_nt_query_*_attributes_file`. On
+/// `STATUS_ACCESS_DENIED` the hook IPC's `OP_NTQUERYATTR{,FULL}`
+/// to the broker; on success the broker writes the result struct
+/// into the IPC section and the hook copies it into the caller's
+/// output buffer.
+///
+/// Skips each individually when the cdylib entry is zero
+/// (`WINSBOX_LOG_DENIES=0` zeroes both alongside the deny-log
+/// pair).
+pub fn install_attr_query(
+    target: HANDLE,
+    cdylib: Option<&CdylibHookEntries>,
+    pt: &mut PassthroughThunks,
+) -> Result<()> {
+    arch::install_attr_query(target, cdylib, pt)
 }
 
 // ─── shared helpers ────────────────────────────────────────────────
@@ -305,6 +336,11 @@ mod arch {
         _t: HANDLE,
         _vas: &[usize; crate::ipc::TRACE_SYSCALL_COUNT],
         _p: &mut TracePassthroughs,
+    ) -> Result<()> {
+        bail!("interception: only x86_64 and aarch64 supported")
+    }
+    pub fn install_attr_query(
+        _t: HANDLE, _c: Option<&CdylibHookEntries>, _p: &mut PassthroughThunks,
     ) -> Result<()> {
         bail!("interception: only x86_64 and aarch64 supported")
     }

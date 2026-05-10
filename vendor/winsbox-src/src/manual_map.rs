@@ -122,6 +122,12 @@ pub struct ManualMapped {
     /// `WINSBOX_LOG_DENIES=0`.
     pub hook_nt_create_file_denylog: usize,
     pub hook_nt_open_file_denylog: usize,
+    /// N-7 retry: in-target VAs of the attr-query proxy hooks
+    /// (`hook_nt_query_attributes_file`,
+    /// `hook_nt_query_full_attributes_file`). Same default-on shape
+    /// as the deny-log pair.
+    pub hook_nt_query_attributes_file: usize,
+    pub hook_nt_query_full_attributes_file: usize,
 }
 
 /// Read `dll_path`, parse PE headers, allocate at preferred base in
@@ -290,6 +296,13 @@ pub fn manual_map_cdylib(target: HANDLE, dll_path: &Path) -> Result<ManualMapped
     let hook_nt_open_file_denylog =
         resolve_target_export_va(dll_path, base, "hook_nt_open_file_denylog")?;
 
+    // N-7 retry: attr-query proxy hook exports.
+    let hook_nt_query_attributes_file =
+        resolve_target_export_va(dll_path, base, "hook_nt_query_attributes_file")?;
+    let hook_nt_query_full_attributes_file = resolve_target_export_va(
+        dll_path, base, "hook_nt_query_full_attributes_file",
+    )?;
+
     eprintln!(
         "[sbox-exec] manual_map: cdylib mapped at {base:#x} ({alloc_size:#x} bytes), \
          IPC @ {ipc_va:#x}, delta={delta:#x}",
@@ -307,6 +320,8 @@ pub fn manual_map_cdylib(target: HANDLE, dll_path: &Path) -> Result<ManualMapped
         hook_trace,
         hook_nt_create_file_denylog,
         hook_nt_open_file_denylog,
+        hook_nt_query_attributes_file,
+        hook_nt_query_full_attributes_file,
     })
 }
 
@@ -438,6 +453,29 @@ pub fn prefill_denylog_passthroughs(
         },
     )
     .context("WriteProcessMemory(IPC denylog passthroughs)")
+}
+
+/// N-7 retry: write the attr-query passthrough thunk VAs into
+/// `IPC.passthrough_nt_query_attributes_file` /
+/// `IPC.passthrough_nt_query_full_attributes_file`. These two
+/// fields land immediately after the denylog pair in the
+/// `IpcEnv` struct (cdylib `lib.rs`). Offset = denylog offset + 16.
+pub fn prefill_attr_query_passthroughs(
+    target: HANDLE, ipc_va: usize, attr_pt: usize, full_attr_pt: usize,
+) -> Result<()> {
+    let payload: [u64; 2] = [attr_pt as u64, full_attr_pt as u64];
+    let attr_off = 0x48 + crate::ipc::TRACE_SYSCALL_COUNT * 8 + 16;
+    write_remote_bytes(
+        target,
+        ipc_va + attr_off,
+        unsafe {
+            std::slice::from_raw_parts(
+                payload.as_ptr() as *const u8,
+                size_of::<[u64; 2]>(),
+            )
+        },
+    )
+    .context("WriteProcessMemory(IPC attr-query passthroughs)")
 }
 
 // ─── PE header parsing ─────────────────────────────────────────────

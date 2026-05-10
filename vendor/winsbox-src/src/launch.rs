@@ -870,13 +870,21 @@ fn try_inject_cdylib_full(
         create_process_internal_w: mapped.hook_create_process_internal_w,
         nt_create_file_denylog: if log_denies { mapped.hook_nt_create_file_denylog } else { 0 },
         nt_open_file_denylog: if log_denies { mapped.hook_nt_open_file_denylog } else { 0 },
+        // N-7 retry: attr-query proxies share the deny-log kill switch.
+        nt_query_attributes_file: if log_denies {
+            mapped.hook_nt_query_attributes_file
+        } else { 0 },
+        nt_query_full_attributes_file: if log_denies {
+            mapped.hook_nt_query_full_attributes_file
+        } else { 0 },
     };
     log!(
         "cdylib hook VAs: section={:#x} dirobj_create={:#x} dirobj_open={:#x} \
-         pipe={:#x} cpw={:#x}",
+         pipe={:#x} cpw={:#x} attr={:#x} fullattr={:#x}",
         entries.nt_open_section, entries.nt_create_directory_object,
         entries.nt_open_directory_object, entries.nt_create_named_pipe_file,
         entries.create_process_internal_w,
+        entries.nt_query_attributes_file, entries.nt_query_full_attributes_file,
     );
 
     // ── 5. Patch ntdll syscalls PRE-RESUME. With the cdylib
@@ -929,13 +937,29 @@ fn try_inject_cdylib_full(
         cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
         return Err(e.context("install_denylog (manual-map)"));
     }
+    // N-7 retry: install the always-on `NtQueryAttributesFile` /
+    // `NtQueryFullAttributesFile` proxy hooks. Cygwin's path_conv
+    // calls these for every `/etc/passwd`-style stat probe before
+    // any NtCreateFile lands; under USER_LIMITED+AC the original
+    // returns ACCESS_DENIED on parent-dir reads even when the leaf
+    // is ACL-stamped for AC. Without this bridge bash exits 66
+    // (EX_NOINPUT) after Cygwin DllMain succeeds. Same kill switch
+    // (`WINSBOX_LOG_DENIES=0`) as the deny-log pair — they share
+    // the broker-mediated deny-recovery surface.
+    if let Err(e) = interception::install_attr_query(target, Some(&entries_with_denylog), &mut pt) {
+        drop(ch);
+        cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
+        return Err(e.context("install_attr_query (manual-map)"));
+    }
     log!(
         "cdylib ntdll hooks patched pre-resume; passthrough thunks: \
          section={:#x} dirobj_create={:#x} dirobj_open={:#x} pipe={:#x} \
-         denylog_create={:#x} denylog_open={:#x} (log_denies={} trace_mode={})",
+         denylog_create={:#x} denylog_open={:#x} attr={:#x} fullattr={:#x} \
+         (log_denies={} trace_mode={})",
         pt.nt_open_section, pt.nt_create_directory_object,
         pt.nt_open_directory_object, pt.nt_create_named_pipe_file,
         pt.nt_create_file_denylog, pt.nt_open_file_denylog,
+        pt.nt_query_attributes_file, pt.nt_query_full_attributes_file,
         log_denies, trace_mode,
     );
     let mut trace_pt = interception::TracePassthroughs::default();
@@ -984,6 +1008,16 @@ fn try_inject_cdylib_full(
         drop(ch);
         cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
         return Err(e.context("manual_map::prefill_denylog_passthroughs"));
+    }
+    // N-7 retry: attr-query passthrough VAs land right after the
+    // deny-log pair in IpcEnv.
+    if let Err(e) = crate::manual_map::prefill_attr_query_passthroughs(
+        target, mapped.ipc_va,
+        pt.nt_query_attributes_file, pt.nt_query_full_attributes_file,
+    ) {
+        drop(ch);
+        cleanup_on_err(sid_owned, &stamp, &mut bno_handles);
+        return Err(e.context("manual_map::prefill_attr_query_passthroughs"));
     }
     if trace_mode {
         // Phase K: write the trace passthrough VAs into IPC.passthrough_trace.
@@ -1398,6 +1432,8 @@ fn serve_ipc(ch: ipc::Channel, target_raw: isize, ctx: Arc<SpawnCtx>) {
                 handle_denied_open(&ch, target, &req),
             ipc::OP_BROKER_OPEN =>
                 handle_broker_open(&ch, target, &req, &ctx),
+            ipc::OP_NTQUERYATTR | ipc::OP_NTQUERYFULLATTR =>
+                handle_attr(&ch, target, &req, &ctx),
             op => {
                 eprintln!("[sbox-exec] ipc: unknown op {op}");
                 ch.reply_fs(0, 0, 0xC0000002u32 as i32 /* STATUS_NOT_IMPLEMENTED */);
@@ -1562,6 +1598,103 @@ fn handle_broker_open(
         );
         ch.reply_broker_open(STATUS_ACCESS_DENIED, 0);
         return;
+    }
+
+    // N-7 retry: Cygwin's `fhandler_pipe::nt_create` opens the
+    // *client* end of its sigwait/pty pipes via NtCreateFile —
+    // path is `\??\pipe\<leaf>` or `\Device\NamedPipe\<leaf>`. The
+    // pipe's DACL is the broker's default (no AC ACE), so the
+    // saved-original deny-then-broker-open path lands here. Allow
+    // it iff the leaf matches a pipe the broker created in
+    // `handle_named_pipe`. Restricted to that recorded set so the
+    // sandbox cannot reach a *host* MSYS2 process's signal pipe.
+    let raw_lower = raw_name.to_ascii_lowercase();
+    let pipe_leaf = raw_lower
+        .strip_prefix(r"\??\pipe\")
+        .or_else(|| raw_lower.strip_prefix(r"\device\namedpipe\"));
+    if let Some(leaf) = pipe_leaf {
+        let is_known = ctx.broker_pipes.lock().unwrap().contains(leaf);
+        if is_known {
+            // Re-issue NtCreateFile with the absolute pipe path
+            // under the broker's user-token, dup the handle into
+            // the AC. Same shape as the post-normalise broker
+            // re-issue below but with the pipe-namespace path
+            // form preserved (NtCreateFile accepts both `\??\pipe\…`
+            // and `\Device\NamedPipe\…`).
+            let absolute = format!(r"\??\pipe\{}", &raw_name[raw_name.len() - leaf.len()..]);
+            #[link(name = "ntdll")]
+            extern "system" {
+                fn NtCreateFile(
+                    file_handle: *mut HANDLE, desired_access: u32,
+                    oa: *const windows::Wdk::Foundation::OBJECT_ATTRIBUTES,
+                    iosb: *mut [usize; 2],
+                    allocation_size: *const i64, file_attributes: u32,
+                    share_access: u32, create_disposition: u32,
+                    create_options: u32, ea_buffer: *const c_void,
+                    ea_length: u32,
+                ) -> NTSTATUS;
+            }
+            let mut wpath: Vec<u16> = absolute.encode_utf16().collect();
+            let us = UNICODE_STRING {
+                Length: (wpath.len() * 2) as u16,
+                MaximumLength: (wpath.len() * 2) as u16,
+                Buffer: PWSTR(wpath.as_mut_ptr()),
+            };
+            let oa = OBJECT_ATTRIBUTES {
+                Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+                RootDirectory: HANDLE::default(),
+                ObjectName: &us as *const _ as *mut _,
+                Attributes: 0x40, // OBJ_CASE_INSENSITIVE
+                SecurityDescriptor: std::ptr::null_mut(),
+                SecurityQualityOfService: std::ptr::null_mut(),
+            };
+            let mut bh = HANDLE::default();
+            let mut iosb = [0usize; 2];
+            const FILE_OPEN: u32 = 1;
+            let st = unsafe {
+                NtCreateFile(
+                    &mut bh, desired_access, &oa, &mut iosb,
+                    std::ptr::null(), 0, share_access, FILE_OPEN,
+                    options, std::ptr::null(), 0,
+                )
+            };
+            if st.0 < 0 {
+                eprintln!(
+                    "[sbox-exec] broker-open: KERNEL-FAIL (pipe-client {syscall_name}) \
+                     leaf={leaf} status={:#010x}",
+                    st.0 as u32,
+                );
+                ch.reply_broker_open(st.0, 0);
+                return;
+            }
+            // Dup into AC.
+            let mut th = HANDLE::default();
+            let dup_ok = unsafe {
+                DuplicateHandle(
+                    GetCurrentProcess(), bh, target, &mut th,
+                    0, false, DUPLICATE_SAME_ACCESS,
+                ).is_ok()
+            };
+            unsafe { let _ = CloseHandle(bh); }
+            if !dup_ok {
+                eprintln!(
+                    "[sbox-exec] broker-open: DUP-FAIL (pipe-client {syscall_name}) leaf={leaf}",
+                );
+                ch.reply_broker_open(STATUS_ACCESS_DENIED, 0);
+                return;
+            }
+            eprintln!(
+                "[sbox-exec] broker-open: GRANTED (pipe-client {syscall_name}) \
+                 leaf={leaf} handle={:#x}",
+                th.0 as u64,
+            );
+            ch.reply_broker_open(0, th.0 as u64);
+            return;
+        }
+        // Pipe path but leaf isn't in the broker's recorded set —
+        // fall through to the standard reject path below (no
+        // normalize_nt_path match for the pipe namespace, so the
+        // NonDosPath reject fires).
     }
 
     // 3. Normalise path + run policy check.
@@ -1740,6 +1873,165 @@ fn handle_broker_open(
         th.0 as u64,
     );
     ch.reply_broker_open(0, th.0 as u64);
+}
+
+/// N-7 retry: handle an `OP_NTQUERYATTR` / `OP_NTQUERYFULLATTR`
+/// frame. The cdylib's `hook_nt_query_*_attributes_file` body sends
+/// one of these whenever the saved-original passthrough returned
+/// `STATUS_ACCESS_DENIED` — Cygwin's `path_conv::check` is the
+/// dominant caller (`/etc/passwd`, `/etc/profile`, mount lookup).
+///
+/// The handler:
+///   1. Reads the OBJECT_ATTRIBUTES from the AC via
+///      `read_target_oa_raw` (relative-OA rejected — Cygwin doesn't
+///      pass RootDirectory for path_conv).
+///   2. Validates the path against [`broker_open::PolicyLists`] —
+///      same allowRead / denyRead / auto-toolchain logic
+///      `handle_broker_open` uses for the heavier
+///      `NtCreateFile` proxy. Reads-only — no write bits to
+///      consider.
+///   3. Calls `NtQueryAttributesFile` /
+///      `NtQueryFullAttributesFile` under the broker's user
+///      token. Writes the result struct into the IPC section at
+///      `ATTR_RESULT_OFF` and replies with the NTSTATUS via
+///      `Channel::reply_attr_query`.
+///
+/// Audit log lines (one per call):
+///   `[sbox-exec] attr: GRANTED path=… status=0x…`
+///   `[sbox-exec] attr: REJECTED path=… reason="…"`
+fn handle_attr(
+    ch: &ipc::Channel, target: HANDLE, req: &ipc::Wire, ctx: &Arc<SpawnCtx>,
+) {
+    use windows::Wdk::Foundation::OBJECT_ATTRIBUTES;
+    use windows::Win32::Foundation::{NTSTATUS, UNICODE_STRING};
+
+    const STATUS_ACCESS_DENIED: i32 = 0xC0000022u32 as i32;
+    let empty_result = [0u8; ipc::ATTR_RESULT_LEN];
+
+    // Master kill-switch: the attr broker shares the broker-open
+    // kill switch. If broker-open is off, attr is too — a request
+    // with broker-open off probably came from a misconfigured
+    // diagnostic run, and we don't want to leak attr metadata
+    // through a side channel.
+    if !ctx.broker_open_enabled {
+        ch.reply_attr_query(STATUS_ACCESS_DENIED, &empty_result);
+        return;
+    }
+
+    let oa_va = req.args[0];
+    let is_full = req.op == ipc::OP_NTQUERYFULLATTR;
+    let syscall_name = if is_full {
+        "NtQueryFullAttributesFile"
+    } else {
+        "NtQueryAttributesFile"
+    };
+
+    // 1. Read OA from target.
+    let (root, raw_name) = match read_target_oa_raw(target, oa_va as usize) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "[sbox-exec] attr: REJECTED ({syscall_name}) \
+                 reason=\"oa-read failed: {e:#}\""
+            );
+            ch.reply_attr_query(STATUS_ACCESS_DENIED, &empty_result);
+            return;
+        }
+    };
+
+    // 2. Reject relative opens (RootDirectory != NULL) — Cygwin
+    //    path_conv passes absolute paths.
+    if root != 0 {
+        eprintln!(
+            "[sbox-exec] attr: REJECTED ({syscall_name}) \
+             path={raw_name:?} root={root:#x} reason=\"{}\"",
+            crate::broker_open::RejectReason::RelativeOpen.as_str(),
+        );
+        ch.reply_attr_query(STATUS_ACCESS_DENIED, &empty_result);
+        return;
+    }
+
+    // 3. Normalise + run policy check (read-only).
+    let Some(path) = crate::broker_open::normalize_nt_path(&raw_name) else {
+        eprintln!(
+            "[sbox-exec] attr: REJECTED ({syscall_name}) \
+             path={raw_name:?} reason=\"{}\"",
+            crate::broker_open::RejectReason::NonDosPath.as_str(),
+        );
+        ch.reply_attr_query(STATUS_ACCESS_DENIED, &empty_result);
+        return;
+    };
+    // FILE_READ_ATTRIBUTES (0x80) — read-only, no write bits set.
+    let decision = crate::broker_open::is_path_allowed_for_broker_open(
+        &path, 0x0080, &ctx.broker_open_policy,
+    );
+    let crate::broker_open::Decision::Allow = decision else {
+        let reason = match decision {
+            crate::broker_open::Decision::Reject(r) => r.as_str(),
+            _ => "?",
+        };
+        eprintln!(
+            "[sbox-exec] attr: REJECTED ({syscall_name}) \
+             path={path:?} reason=\"{reason}\""
+        );
+        ch.reply_attr_query(STATUS_ACCESS_DENIED, &empty_result);
+        return;
+    };
+
+    // 4. Re-issue under the broker's token. The attr syscalls
+    //    require an absolute OBJECT_ATTRIBUTES with no
+    //    RootDirectory, which we have above.
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtQueryAttributesFile(
+            oa: *const OBJECT_ATTRIBUTES, out: *mut [u8; 40],
+        ) -> NTSTATUS;
+        fn NtQueryFullAttributesFile(
+            oa: *const OBJECT_ATTRIBUTES, out: *mut [u8; 56],
+        ) -> NTSTATUS;
+    }
+    let nt_path = if path.starts_with(r"\\") {
+        format!(r"\??\UNC\{}", &path[2..])
+    } else {
+        format!(r"\??\{}", path)
+    };
+    let mut wpath: Vec<u16> = nt_path.encode_utf16().collect();
+    let us = UNICODE_STRING {
+        Length: (wpath.len() * 2) as u16,
+        MaximumLength: (wpath.len() * 2) as u16,
+        Buffer: PWSTR(wpath.as_mut_ptr()),
+    };
+    let oa = OBJECT_ATTRIBUTES {
+        Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: HANDLE::default(),
+        ObjectName: &us as *const _ as *mut _,
+        Attributes: 0x40, // OBJ_CASE_INSENSITIVE
+        SecurityDescriptor: std::ptr::null_mut(),
+        SecurityQualityOfService: std::ptr::null_mut(),
+    };
+    let mut out = [0u8; ipc::ATTR_RESULT_LEN];
+    let st = unsafe {
+        if is_full {
+            let mut buf = [0u8; 56];
+            let s = NtQueryFullAttributesFile(&oa, &mut buf);
+            out[..56].copy_from_slice(&buf);
+            s
+        } else {
+            let mut buf = [0u8; 40];
+            let s = NtQueryAttributesFile(&oa, &mut buf);
+            out[..40].copy_from_slice(&buf);
+            s
+        }
+    };
+    if ctx.trace || st.0 < 0 {
+        let result_word = if st.0 < 0 { "FAIL" } else { "GRANTED" };
+        eprintln!(
+            "[sbox-exec] attr: {result_word} ({syscall_name}) \
+             path={path:?} status={:#010x}",
+            st.0 as u32,
+        );
+    }
+    ch.reply_attr_query(st.0, &out);
 }
 
 /// Build the per-syscall arg summary for a trace log line.
@@ -2106,6 +2398,12 @@ fn inject_cdylib_into_grandchild(
         create_process_internal_w: mapped.hook_create_process_internal_w,
         nt_create_file_denylog: if log_denies { mapped.hook_nt_create_file_denylog } else { 0 },
         nt_open_file_denylog: if log_denies { mapped.hook_nt_open_file_denylog } else { 0 },
+        nt_query_attributes_file: if log_denies {
+            mapped.hook_nt_query_attributes_file
+        } else { 0 },
+        nt_query_full_attributes_file: if log_denies {
+            mapped.hook_nt_query_full_attributes_file
+        } else { 0 },
     };
     let mut pt = interception::PassthroughThunks::default();
     if let Err(e) = interception::install_fs(target_proc, &stub_addrs, Some(&entries), &mut pt) {
@@ -2120,6 +2418,11 @@ fn inject_cdylib_into_grandchild(
         bail_close(ch);
         return Err(e.context("install_denylog (grandchild)"));
     }
+    // N-7 retry: attr-query proxy hooks for grandchildren too.
+    if let Err(e) = interception::install_attr_query(target_proc, Some(&entries), &mut pt) {
+        bail_close(ch);
+        return Err(e.context("install_attr_query (grandchild)"));
+    }
 
     // ── 4. Pre-fill IPC.
     if let Err(e) = crate::manual_map::prefill_ipc(target_proc, mapped.ipc_va, &stub_addrs, &pt) {
@@ -2131,6 +2434,13 @@ fn inject_cdylib_into_grandchild(
     ) {
         bail_close(ch);
         return Err(e.context("prefill_denylog_passthroughs (grandchild)"));
+    }
+    if let Err(e) = crate::manual_map::prefill_attr_query_passthroughs(
+        target_proc, mapped.ipc_va,
+        pt.nt_query_attributes_file, pt.nt_query_full_attributes_file,
+    ) {
+        bail_close(ch);
+        return Err(e.context("prefill_attr_query_passthroughs (grandchild)"));
     }
 
     // ── 5. Build the grandchild's SpawnCtx + spawn its serve_ipc.
