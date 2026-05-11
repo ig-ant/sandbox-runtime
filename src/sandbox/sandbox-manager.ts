@@ -26,6 +26,10 @@ import {
   startMacOSSandboxLogMonitor,
 } from './macos-sandbox-utils.js'
 import {
+  wrapCommandWithSandboxWindows,
+  checkWindowsDependencies,
+} from './windows-sandbox-utils.js'
+import {
   getDefaultWritePaths,
   containsGlobChars,
   removeTrailingGlobSuffix,
@@ -377,7 +381,7 @@ function isSupportedPlatform(): boolean {
     // WSL1 doesn't support bubblewrap
     return getWslVersion() !== '1'
   }
-  return platform === 'macos'
+  return platform === 'macos' || platform === 'windows'
 }
 
 function isSandboxingEnabled(): boolean {
@@ -418,6 +422,10 @@ function checkDependencies(ripgrepConfig?: {
     })
     errors.push(...linuxDeps.errors)
     warnings.push(...linuxDeps.warnings)
+  } else if (platform === 'windows') {
+    const winDeps = checkWindowsDependencies()
+    errors.push(...winDeps.errors)
+    warnings.push(...winDeps.warnings)
   }
 
   return { errors, warnings }
@@ -709,6 +717,20 @@ async function wrapWithSandbox(
         allowPty,
         allowGitConfig: getAllowGitConfig(),
         enableWeakerNetworkIsolation: getEnableWeakerNetworkIsolation(),
+        binShell,
+      })
+
+    case 'windows':
+      // v1 WFP+SID Windows backend: no FS sandbox, no proxy ports in
+      // the wrapped command (the broker reads its own proxy port from
+      // %ProgramData%\winsbox\installed.json at spawn time).
+      return wrapCommandWithSandboxWindows({
+        command,
+        needsNetworkRestriction,
+        httpProxyPort: needsNetworkProxy ? getProxyPort() : undefined,
+        socksProxyPort: needsNetworkProxy ? getSocksProxyPort() : undefined,
+        readConfig,
+        writeConfig,
         binShell,
       })
 
