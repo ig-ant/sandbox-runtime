@@ -225,6 +225,38 @@ pub fn ntdll_export(name: &str) -> Result<usize> {
     unsafe {
         let m = GetModuleHandleW(PCWSTR(crate::util::wstr("ntdll.dll").as_ptr()))
             .context("GetModuleHandleW(ntdll)")?;
+        // Task 1 diagnostic: on first call, log which ntdll module
+        // GetModuleHandle resolved to (handle, machine field, full
+        // path). On x64-under-xtajit64se hosts an x64 process has
+        // BOTH x64 and ARM64 ntdll mapped; we need to know which
+        // one our patches actually land in.
+        static LOGGED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !LOGGED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
+            let mut buf = [0u16; 260];
+            let len = GetModuleFileNameW(m, &mut buf);
+            let path = String::from_utf16_lossy(&buf[..len as usize]);
+            // Read DOS header at base, then NT header.
+            let base = m.0 as usize;
+            let dos = std::slice::from_raw_parts(base as *const u8, 0x40);
+            let mut machine: u16 = 0;
+            if dos[0] == b'M' && dos[1] == b'Z' {
+                let e_lfanew = u32::from_le_bytes([
+                    dos[0x3c], dos[0x3d], dos[0x3e], dos[0x3f],
+                ]) as usize;
+                let nt_addr = base + e_lfanew;
+                let nt = std::slice::from_raw_parts(nt_addr as *const u8, 24);
+                if nt[0] == b'P' && nt[1] == b'E' && nt[2] == 0 && nt[3] == 0 {
+                    machine = u16::from_le_bytes([nt[4], nt[5]]);
+                }
+            }
+            eprintln!(
+                "[sbox-exec] interception: GetModuleHandle(ntdll.dll) \
+                 handle={:#x} machine={:#x} path={}",
+                base, machine, path,
+            );
+        }
         let cname = std::ffi::CString::new(name).unwrap();
         let p = GetProcAddress(m, PCSTR(cname.as_ptr() as *const u8))
             .ok_or_else(|| anyhow!("GetProcAddress(ntdll!{name})"))?;

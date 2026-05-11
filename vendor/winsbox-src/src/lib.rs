@@ -22,3 +22,13 @@ pub mod stamp_manifest;
 
 #[cfg(windows)]
 pub mod broker_open;
+
+// Task 2 (probe_vanilla_ac) exposure: re-export AC + token primitives
+// so the bare-AC bash probe can reuse them without copying. Pure
+// re-export of binary-side modules — no API surface change for the
+// shipped library consumers.
+#[cfg(windows)]
+pub mod appcontainer;
+
+#[cfg(windows)]
+pub mod token;

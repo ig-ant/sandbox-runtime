@@ -16,6 +16,7 @@ use windows::Win32::System::Threading::{
     LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
     PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTUPINFOEXW, STARTUPINFOW,
 };
+use windows::Win32::System::Diagnostics::Debug::CheckRemoteDebuggerPresent;
 
 use crate::acl_stamper::{psid_from_string, free_psid, PolicyStamp};
 use crate::appcontainer::AppContainer;
@@ -422,6 +423,50 @@ fn run_confined(pol: &Policy, manifest_dir: &std::path::Path) -> Result<u32> {
         extra_env.push(cdylib_inject::placeholder_env_pair());
     }
 
+    // N-7p+: opt-in pre-create of Cygwin's `shared.5` named section in
+    // the per-AC namespace. Trace `docs/n6_bash_il_low_trace.log:256`
+    // shows bash hitting `STATUS_ACCESS_DENIED` on `NtCreateSection
+    // name="shared.5"` in the full sandbox configuration (USER_LIMITED
+    // + IL_LOW + lowbox + cdylib + hooks). Pre-creating the section
+    // from the broker (which has full access to the AC namespace) with
+    // a NULL DACL plants a section Cygwin can open with `OBJ_OPENIF`.
+    //
+    // Default OFF (opt-in): set `WINSBOX_PRECREATE_CYGSHARED=1` to
+    // enable. Handle ownership stays in this stack frame so the
+    // section persists until `WaitForSingleObject(target)` returns
+    // and `_shared5_owner` drops at scope exit.
+    let precreate_enabled = std::env::var("WINSBOX_PRECREATE_CYGSHARED")
+        .ok().is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let _shared5_owner = if precreate_enabled {
+        match crate::cygwin_compat::precreate_cygwin_shared5(
+            &ac.sid_string, &pol.command_line,
+        ) {
+            Ok(Some(owner)) => {
+                log!(
+                    "WINSBOX_PRECREATE_CYGSHARED=1: shared.5 pre-created at {}",
+                    owner.section_path,
+                );
+                Some(owner)
+            }
+            Ok(None) => {
+                log!(
+                    "WINSBOX_PRECREATE_CYGSHARED=1: no Cygwin/MSYS DLL next to \
+                     target exe; skipping pre-create"
+                );
+                None
+            }
+            Err(e) => {
+                log!(
+                    "WINSBOX_PRECREATE_CYGSHARED=1: pre-create FAILED ({e:#}); \
+                     continuing without pre-create"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     log!("launching target (cwd={}): {}", target_cwd, pol.command_line);
     // The cdylib path needs manual resume (the entry-trampoline
     // rendezvous + CPW patching happen post-spawn before the
@@ -449,6 +494,27 @@ fn run_confined(pol: &Policy, manifest_dir: &std::path::Path) -> Result<u32> {
                     /*debug_attach=*/ false)?
     };
     log!("target pid={}", pi.dwProcessId);
+
+    // N-7+: pause-for-debugger mode. WINSBOX_PAUSE_FOR_DEBUGGER=1 blocks
+    // here until a debugger attaches to the target. Avoids all the
+    // timing races + Job-containment + DEBUG_ONLY_THIS_PROCESS issues
+    // we hit with WINSBOX_DEBUG_ATTACH (debug_attach.rs framework). The
+    // operator runs lldb / windbg / cdb / etc. and attaches to the
+    // printed PID; broker polls CheckRemoteDebuggerPresent and resumes
+    // automatically once the attach is detected.
+    if std::env::var("WINSBOX_PAUSE_FOR_DEBUGGER").as_deref() == Ok("1") {
+        log!("WINSBOX_PAUSE_FOR_DEBUGGER=1: blocking until debugger attached to PID {}", pi.dwProcessId);
+        log!("  attach with: lldb -p {0}    OR    cdb -p {0}    OR    windbg -p {0}", pi.dwProcessId);
+        loop {
+            let mut is_debugged = windows::Win32::Foundation::BOOL(0);
+            let _ = unsafe { CheckRemoteDebuggerPresent(pi.hProcess, &mut is_debugged) };
+            if is_debugged.as_bool() {
+                log!("WINSBOX_PAUSE_FOR_DEBUGGER: debugger attached to PID {}; continuing", pi.dwProcessId);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    }
 
     // Phase N-6 step 3: drain the kernel-queued initial debug event
     // (CREATE_PROCESS_DEBUG_EVENT) on this (main broker) thread.

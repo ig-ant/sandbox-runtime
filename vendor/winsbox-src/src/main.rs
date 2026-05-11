@@ -18,6 +18,7 @@ mod policy;
 #[cfg(windows)] mod stamp_manifest;
 #[cfg(windows)] mod broker_open;
 #[cfg(windows)] mod debug_attach;
+#[cfg(windows)] mod cygwin_compat;
 #[cfg(windows)] mod launch;
 
 use anyhow::{Context, Result};
