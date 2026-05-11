@@ -45,7 +45,44 @@ enum Cmd {
 
 #[cfg(windows)]
 fn main() -> anyhow::Result<()> {
-    todo!("phase 2: dispatch to install/run")
+    use anyhow::{anyhow, Context};
+    let cli = Cli::parse();
+    match cli.cmd {
+        Some(Cmd::Install { remove: true, .. }) => install::remove(),
+        Some(Cmd::Install { check: true, .. }) => install::check(),
+        Some(Cmd::Install { port, .. }) => install::install(port),
+        None => {
+            // Build a policy.
+            let mut pol: policy::Policy = if cli.policy_stdin {
+                let mut buf = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+                    .context("read policy from stdin")?;
+                serde_json::from_str(&buf).context("parse stdin policy")?
+            } else if let Some(p) = &cli.policy {
+                let s = std::fs::read_to_string(p)
+                    .with_context(|| format!("read {}", p.display()))?;
+                serde_json::from_str(&s)
+                    .with_context(|| format!("parse {}", p.display()))?
+            } else if !cli.target.is_empty() {
+                policy::Policy::default()
+            } else {
+                return Err(anyhow!(
+                    "no policy and no target: pass --policy <file> or -- <target> [args...]"
+                ));
+            };
+
+            if !cli.target.is_empty() {
+                pol.target_exe = std::path::PathBuf::from(&cli.target[0]);
+                pol.target_args = cli.target[1..].to_vec();
+            }
+            if pol.target_exe.as_os_str().is_empty() {
+                return Err(anyhow!("policy.target_exe is empty"));
+            }
+
+            let code = launch::run(&pol)?;
+            std::process::exit(code as i32);
+        }
+    }
 }
 
 #[cfg(not(windows))]
