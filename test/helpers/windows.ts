@@ -300,11 +300,24 @@ export function cleanupFixture(f: Fixture): void {
 export async function runSandboxed(
   command: string,
   config: SandboxRuntimeConfig,
-  opts: { timeoutMs?: number } = {},
+  opts: { timeoutMs?: number; directTargetExe?: string } = {},
 ): Promise<RunResult> {
   await SandboxManager.reset()
   await SandboxManager.initialize(config)
-  const wrapped = await SandboxManager.wrapWithSandbox(command)
+  // When `directTargetExe` is set, the Windows wrapper bypasses the
+  // cmd.exe shim and the per-arch broker picker uses the PE Machine
+  // field of `directTargetExe` to choose `vendor/winsbox/<arch>/
+  // sbox-exec.exe`. This is the path bash-on-ARM64 takes: msys2 bash
+  // is x64, so the picker selects the x64 broker that runs under
+  // xtajit64 — both broker and target then live in the same emulated
+  // x64 address space and the standard ntdll-patch pattern works.
+  const wrapped = await SandboxManager.wrapWithSandbox(
+    command,
+    undefined,
+    undefined,
+    undefined,
+    opts.directTargetExe,
+  )
   const start = Date.now()
   return new Promise(resolve => {
     const child = spawn(wrapped, { shell: true })

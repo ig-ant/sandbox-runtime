@@ -106,22 +106,48 @@ d('windows sandbox', () => {
     20_000,
   )
 
-  // MSYS2/Cygwin compat. The bash chain goes
-  //   `cmd /c bash.exe` (Git\bin) → `bash.exe` (Git\usr\bin) → echo,
-  // crossing arch on ARM64 hosts (Git\bin\bash.exe is ARM64,
-  // Git\usr\bin\bash.exe is x64) — the cdylib's grandchild
-  // injection bails on cross-arch and Cygwin AVs in DllMain. On
-  // x64 hosts every link is x64 so the cdylib injects through the
-  // chain. Gate on host arch until per-arch broker shipping
-  // (N-7) lands.
-  const bashCompat = process.arch === 'arm64' ? test.skip : test
-  bashCompat('bash (msys2) prints hello', async () => {
-    const bash = `${process.env.ProgramFiles}\\Git\\bin\\bash.exe`
-    if (!fs.existsSync(bash)) {
-      console.warn(`  [skip] ${bash} not found`)
-      return
-    }
-    const r = await runSandboxed(`"${bash}" -c "echo hello"`, fx.config)
+  // MSYS2/Cygwin compat.
+  //
+  // x64 hosts: standard cmd-wrap works. The chain
+  // `cmd /c bash.exe (Git\bin) → bash.exe (Git\usr\bin) → echo`
+  // injects the cdylib through every link (all same-arch).
+  //
+  // ARM64 hosts: bash AVs at `0xc0000005` regardless of launch
+  // shape. Reproduced 2026-05-10 on Win11 25H2 / Prism with two
+  // shapes of this test:
+  //   1. cmd-wrap (host-arch ARM64 cmd → x64 bash grandchild,
+  //      cdylib bails cross-arch and resumes bash un-hooked):
+  //      `target exit=0xc0000005`.
+  //   2. direct-launch with per-arch picker (x64 broker via
+  //      `directTargetExe: bashExe`, x64 bash, cdylib hooks
+  //      installed pre-resume): bash exits 0xc0000005 BEFORE the
+  //      cdylib's entry-rendezvous signal arrives — broker logs
+  //      `target exited before signalling`.
+  // Shape 2 is conclusive: the AV happens during bash's own
+  // ntdll/cygwin DllMain init, before any hook code runs and
+  // independent of namespace priming. Per
+  // `docs/bash_av_root_cause.md` the visible faulting RIP is a
+  // secondary AV in `dll_list::cleanup_forkables` (NULL deref of
+  // `cygwin_shared`), cascading from a primary
+  // `CreateFileMappingW("shared.5", ...)` returning NULL. The
+  // primary failure on ARM64 is NOT fixed by cmd-wrap (which the
+  // diagnosis hypothesised), so this test stays gated on ARM64
+  // until the AC + Cygwin DllMain interaction is understood.
+  const usrBinBash = `${process.env.ProgramFiles}\\Git\\usr\\bin\\bash.exe`
+  const binBash = `${process.env.ProgramFiles}\\Git\\bin\\bash.exe`
+  const bashExe = fs.existsSync(usrBinBash)
+    ? usrBinBash
+    : fs.existsSync(binBash)
+      ? binBash
+      : undefined
+  const bashGate =
+    bashExe && process.arch !== 'arm64' ? test : test.skip
+  bashGate('bash (msys2) prints hello', async () => {
+    if (!bashExe) return
+    const r = await runSandboxed(
+      `"${bashExe}" -c "echo hello"`,
+      fx.config,
+    )
     expect(r.exitCode).toBe(0)
     expect(r.stdout).toContain('hello')
   })

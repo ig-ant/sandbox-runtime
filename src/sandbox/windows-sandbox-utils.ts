@@ -24,6 +24,19 @@ export interface WindowsSandboxParams {
   writeConfig?: FsWriteRestrictionConfig
   binShell?: string
   windowsConfig?: WindowsConfig
+  /**
+   * When set, `command` is launched directly (no cmd.exe wrapper),
+   * and the per-arch broker picker uses this binary's PE Machine
+   * field to choose the broker arch. Required for ARM64-host
+   * launches where the immediate target is x64 (e.g. msys2 bash):
+   * cmd-wrapping would make the immediate target host-arch cmd.exe
+   * and the cdylib would refuse to inject across arch boundaries.
+   *
+   * `command` MUST be a single argv-list-style command line; the
+   * caller is responsible for any quoting (the broker passes it to
+   * CreateProcessW unchanged).
+   */
+  directTargetExe?: string
 }
 
 function pkgRoot(): string {
@@ -32,12 +45,88 @@ function pkgRoot(): string {
   return path.resolve(here, '..', '..')
 }
 
-export function getSboxExecPath(cfg?: WindowsConfig): string {
-  if (cfg?.sboxExecPath) return cfg.sboxExecPath
-  if (process.env.SBOX_EXEC_PATH) return process.env.SBOX_EXEC_PATH
-  const arch = process.arch === 'arm64' ? 'arm64' : 'x64'
-  // Resolution mirrors getApplySeccompBinaryPath: vendor dir lives next to
-  // dist/ in the published package, or at repo root in dev.
+// IMAGE_FILE_MACHINE values (winnt.h).
+const IMAGE_FILE_MACHINE_AMD64 = 0x8664
+const IMAGE_FILE_MACHINE_ARM64 = 0xaa64
+const IMAGE_FILE_MACHINE_ARM64EC = 0xa641
+
+/**
+ * Read the PE FileHeader.Machine field for `exePath`. Returns
+ * `undefined` if `exePath` is missing or the file isn't a parseable PE.
+ *
+ * The machine word lives at `IMAGE_NT_HEADERS.FileHeader.Machine`,
+ * i.e. `ntOff + 4`. We only need the first 4KB of the file to read
+ * it; the section/import directory parse in `isCygwinBinary` is
+ * intentionally NOT shared because we don't need it here and a tighter
+ * read is cheaper for every spawn.
+ */
+function readPeMachine(exePath: string): number | undefined {
+  let fd: number
+  try {
+    fd = fs.openSync(exePath, 'r')
+  } catch {
+    return undefined
+  }
+  try {
+    const buf = Buffer.alloc(4096)
+    const n = fs.readSync(fd, buf, 0, buf.length, 0)
+    if (n < 0x40) return undefined
+    if (buf.readUInt16LE(0) !== 0x5a4d /* 'MZ' */) return undefined
+    const ntOff = buf.readUInt32LE(0x3c)
+    if (ntOff + 6 > n) return undefined
+    if (buf.readUInt32LE(ntOff) !== 0x4550 /* 'PE\0\0' */) return undefined
+    return buf.readUInt16LE(ntOff + 4)
+  } catch {
+    return undefined
+  } finally {
+    fs.closeSync(fd)
+  }
+}
+
+/**
+ * Map a target binary's PE Machine word → broker arch directory
+ * (`'arm64'` or `'x64'`) under `vendor/winsbox/`. ARM64EC binaries
+ * use the ARM64 ABI so dispatch to the ARM64 broker.
+ */
+function brokerArchForMachine(machine: number | undefined): 'arm64' | 'x64' {
+  if (machine === IMAGE_FILE_MACHINE_AMD64) return 'x64'
+  if (
+    machine === IMAGE_FILE_MACHINE_ARM64 ||
+    machine === IMAGE_FILE_MACHINE_ARM64EC
+  ) {
+    return 'arm64'
+  }
+  // Unknown / unparseable — fall back to host arch (handled by caller).
+  return process.arch === 'arm64' ? 'arm64' : 'x64'
+}
+
+/**
+ * Pick the per-arch broker directory for a given target binary.
+ *
+ * - On x64 hosts: always `'x64'` (the only broker that exists).
+ * - On ARM64 hosts: parse the PE Machine field of `targetExe` and
+ *   pick the matching broker. When `targetExe` is undefined (no
+ *   direct-target hint, e.g. cmd-shell-wrapped commands), fall back
+ *   to the host arch (cmd is host-arch on every Windows install).
+ *
+ * Per `docs/xtajit64_chrome_research.md`, an x64 broker running under
+ * xtajit64 emulating an x64 grandchild observes a coherent x64 address
+ * space; the standard `WriteProcessMemory` + `VirtualProtectEx` ntdll
+ * patch pattern works (Chromium shipped this exact pattern from ~2021
+ * to Mar 2024). M-1 cross-arch hooking is the riskier alternative —
+ * stay with per-arch.
+ */
+export function pickBrokerArch(targetExe?: string): 'arm64' | 'x64' {
+  if (process.arch !== 'arm64') return 'x64'
+  if (!targetExe) return 'arm64'
+  return brokerArchForMachine(readPeMachine(targetExe))
+}
+
+/**
+ * Resolve the broker (`sbox-exec.exe`) path for the given arch.
+ * Mirrors the resolution order in {@link getSboxExecPath}.
+ */
+function brokerPathForArch(arch: 'arm64' | 'x64'): string {
   const candidates = [
     path.join(pkgRoot(), 'vendor', 'winsbox', arch, 'sbox-exec.exe'),
     path.join(pkgRoot(), 'dist', 'vendor', 'winsbox', arch, 'sbox-exec.exe'),
@@ -48,12 +137,24 @@ export function getSboxExecPath(cfg?: WindowsConfig): string {
   return candidates[0]
 }
 
+export function getSboxExecPath(
+  cfg?: WindowsConfig,
+  targetExe?: string,
+): string {
+  if (cfg?.sboxExecPath) return cfg.sboxExecPath
+  if (process.env.SBOX_EXEC_PATH) return process.env.SBOX_EXEC_PATH
+  return brokerPathForArch(pickBrokerArch(targetExe))
+}
+
 /**
  * Resolve `ac_cdylib.dll`. Mirrors `getSboxExecPath`, but returns
  * `undefined` when the cdylib is not present so the broker treats it
  * as no-cdylib (native-PE-only workloads do not require it).
  */
-export function getAcCdylibPath(cfg?: WindowsConfig): string | undefined {
+export function getAcCdylibPath(
+  cfg?: WindowsConfig,
+  targetExe?: string,
+): string | undefined {
   if (cfg?.cdylibPath) {
     return fs.existsSync(cfg.cdylibPath) ? cfg.cdylibPath : undefined
   }
@@ -62,7 +163,7 @@ export function getAcCdylibPath(cfg?: WindowsConfig): string | undefined {
       ? process.env.WINSBOX_CDYLIB
       : undefined
   }
-  const arch = process.arch === 'arm64' ? 'arm64' : 'x64'
+  const arch = pickBrokerArch(targetExe)
   const candidates = [
     path.join(pkgRoot(), 'vendor', 'winsbox', arch, 'ac_cdylib.dll'),
     path.join(pkgRoot(), 'dist', 'vendor', 'winsbox', arch, 'ac_cdylib.dll'),
@@ -164,16 +265,24 @@ export async function wrapCommandWithSandboxWindows(
   p: WindowsSandboxParams,
 ): Promise<string> {
   warnIfPhaseEnvSet()
-  const exe = getSboxExecPath(p.windowsConfig)
+  // Per-arch broker picker: when caller passes `directTargetExe`
+  // (no cmd.exe wrapping), use that binary's PE Machine to select the
+  // broker arch; otherwise fall back to host-arch cmd.exe.
+  const exe = getSboxExecPath(p.windowsConfig, p.directTargetExe)
   const shell = p.binShell || 'cmd'
   // Build the inner command line. cmd.exe /d /s /c "<cmd>" with /s makes
   // the outer quotes literal, so the user's command passes through.
-  const inner =
-    shell.toLowerCase().includes('powershell') || shell.toLowerCase() === 'pwsh'
+  // When `directTargetExe` is set, skip the cmd wrapper entirely so
+  // the immediate target is the user's binary (matching the arch of
+  // the picked broker).
+  const inner = p.directTargetExe
+    ? p.command
+    : shell.toLowerCase().includes('powershell') ||
+        shell.toLowerCase() === 'pwsh'
       ? `${shell} -NoProfile -Command ${p.command}`
       : `${shell} /d /s /c "${p.command}"`
 
-  const cdylibPath = getAcCdylibPath(p.windowsConfig)
+  const cdylibPath = getAcCdylibPath(p.windowsConfig, p.directTargetExe)
   const manifestDir =
     p.windowsConfig?.manifestDir ?? process.env.WINSBOX_STAMP_DIR
 

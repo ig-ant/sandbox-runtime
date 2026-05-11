@@ -587,6 +587,12 @@ async function wrapWithSandbox(
   binShell?: string,
   customConfig?: Partial<SandboxRuntimeConfig>,
   abortSignal?: AbortSignal,
+  // Windows-only: when set, `command` is launched directly (no
+  // cmd.exe wrapper) and the per-arch broker picker uses this
+  // binary's PE Machine field. Required for ARM64-host launches
+  // where the target is x64 (e.g. msys2 bash). Ignored on macOS/
+  // Linux.
+  windowsDirectTargetExe?: string,
 ): Promise<string> {
   const platform = getPlatform()
 
@@ -704,6 +710,7 @@ async function wrapWithSandbox(
         writeConfig,
         binShell,
         windowsConfig: config?.windows,
+        directTargetExe: windowsDirectTargetExe,
       })
 
     case 'linux':
@@ -1048,6 +1055,7 @@ export interface ISandboxManager {
     binShell?: string,
     customConfig?: Partial<SandboxRuntimeConfig>,
     abortSignal?: AbortSignal,
+    windowsDirectTargetExe?: string,
   ): Promise<string>
   getSandboxViolationStore(): SandboxViolationStore
   annotateStderrWithSandboxFailures(command: string, stderr: string): string
