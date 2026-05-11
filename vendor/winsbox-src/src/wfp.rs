@@ -180,10 +180,22 @@ impl Drop for EngineHandle {
     }
 }
 
+#[allow(dead_code)]
 fn fwp_uint32(v: u32) -> FWP_VALUE0 {
     FWP_VALUE0 {
         r#type: FWP_UINT32,
         Anonymous: FWP_VALUE0_0 { uint32: v },
+    }
+}
+
+// Build an FWP_VALUE0 of type FWP_UINT64 pointing at `slot`. The caller
+// must keep `slot` alive until any FwpmFilterAdd0 using this value has
+// returned. (WFP copies the data out, but it dereferences the pointer
+// during the call.)
+fn fwp_uint64(slot: &mut u64) -> FWP_VALUE0 {
+    FWP_VALUE0 {
+        r#type: windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_UINT64,
+        Anonymous: FWP_VALUE0_0 { uint64: slot as *mut u64 },
     }
 }
 
@@ -254,12 +266,15 @@ fn add_filter(
     key: GUID,
     layer: GUID,
     name: &str,
-    weight: u32,
+    weight: u64,
     action_type: windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_ACTION_TYPE,
     conditions: &mut [FWPM_FILTER_CONDITION0],
 ) -> Result<()> {
     let mut name_w = wstr(name);
     let mut desc_w = wstr("winsbox WFP filter");
+    // Weight must be a stable u64 slot — the FWP_VALUE0 holds a pointer
+    // to it (FWP_UINT64 is pointer-valued in the union).
+    let mut weight_slot: u64 = weight;
     let mut filter = FWPM_FILTER0::default();
     filter.filterKey = key;
     filter.displayData = FWPM_DISPLAY_DATA0 {
@@ -269,7 +284,7 @@ fn add_filter(
     filter.flags = FWPM_FILTER_FLAG_PERSISTENT;
     filter.layerKey = layer;
     filter.subLayerKey = SUBLAYER_GUID;
-    filter.weight = fwp_uint32(weight);
+    filter.weight = fwp_uint64(&mut weight_slot);
     filter.numFilterConditions = conditions.len() as u32;
     filter.filterCondition = if conditions.is_empty() {
         std::ptr::null_mut()
@@ -280,6 +295,23 @@ fn add_filter(
         r#type: action_type,
         Anonymous: FWPM_ACTION0_0 { filterType: GUID::zeroed() },
     };
+    if std::env::var_os("WINSBOX_WFP_DEBUG").is_some() {
+        eprintln!(
+            "[winsbox-wfp] add_filter name={name} weight=0x{weight:016x} \
+             action=0x{:x} layer={:?} sublayer={:?} conds={} flags=0x{:x}",
+            action_type.0,
+            layer,
+            SUBLAYER_GUID,
+            conditions.len(),
+            filter.flags.0,
+        );
+        for (i, c) in conditions.iter().enumerate() {
+            eprintln!(
+                "[winsbox-wfp]   cond[{i}] field={:?} match={:?} value_type={:?}",
+                c.fieldKey, c.matchType.0, c.conditionValue.r#type.0,
+            );
+        }
+    }
     let rc = unsafe {
         FwpmFilterAdd0(engine, &filter, PSECURITY_DESCRIPTOR::default(), None)
     };
@@ -338,6 +370,14 @@ pub fn install_persistent(proxy_port: u16) -> Result<()> {
         let mut sd_allow_blob = sd_allow.byte_blob();
         let mut sd_deny_blob = sd_deny.byte_blob();
 
+        // Explicit FWP_UINT64 filter weights. Stay below 2^60 so we don't
+        // collide with the high 4 bits WFP reserves for the auto-weight
+        // class. The relative ordering preserves Phase 2's intent:
+        // PERMIT/proxy and BLOCK/non-sandbox-proxy outrank the catch-all
+        // BLOCK on SANDBOX_SID.
+        const W_HIGH: u64 = 0x0F00_0000_0000_0000;
+        const W_LOW:  u64 = 0x0400_0000_0000_0000;
+
         // -------- IPv4 --------
         // Filter #1 V4 PERMIT
         let mut c1 = [
@@ -347,7 +387,7 @@ pub fn install_persistent(proxy_port: u16) -> Result<()> {
         ];
         add_filter(
             engine.as_handle(), FILTER_GUIDS[0], FWPM_LAYER_ALE_AUTH_CONNECT_V4,
-            "winsbox-v4-permit-proxy", 0xF000_0000, FWP_ACTION_PERMIT, &mut c1,
+            "winsbox-v4-permit-proxy", W_HIGH, FWP_ACTION_PERMIT, &mut c1,
         )?;
         // Filter #2 V4 BLOCK (catch-all for SANDBOX_SID)
         let mut c2 = [
@@ -355,7 +395,7 @@ pub fn install_persistent(proxy_port: u16) -> Result<()> {
         ];
         add_filter(
             engine.as_handle(), FILTER_GUIDS[1], FWPM_LAYER_ALE_AUTH_CONNECT_V4,
-            "winsbox-v4-block-sandbox-default", 0x4000_0000, FWP_ACTION_BLOCK, &mut c2,
+            "winsbox-v4-block-sandbox-default", W_LOW, FWP_ACTION_BLOCK, &mut c2,
         )?;
         // Filter #3 V4 BLOCK (non-sandbox -> proxy port)
         let mut c3 = [
@@ -365,7 +405,7 @@ pub fn install_persistent(proxy_port: u16) -> Result<()> {
         ];
         add_filter(
             engine.as_handle(), FILTER_GUIDS[2], FWPM_LAYER_ALE_AUTH_CONNECT_V4,
-            "winsbox-v4-block-non-sandbox-proxy", 0xF000_0000, FWP_ACTION_BLOCK, &mut c3,
+            "winsbox-v4-block-non-sandbox-proxy", W_HIGH, FWP_ACTION_BLOCK, &mut c3,
         )?;
 
         // -------- IPv6 --------
@@ -376,14 +416,14 @@ pub fn install_persistent(proxy_port: u16) -> Result<()> {
         ];
         add_filter(
             engine.as_handle(), FILTER_GUIDS[3], FWPM_LAYER_ALE_AUTH_CONNECT_V6,
-            "winsbox-v6-permit-proxy", 0xF000_0000, FWP_ACTION_PERMIT, &mut c4,
+            "winsbox-v6-permit-proxy", W_HIGH, FWP_ACTION_PERMIT, &mut c4,
         )?;
         let mut c5 = [
             cond_sd(FWPM_CONDITION_ALE_USER_ID, &mut sd_allow_blob),
         ];
         add_filter(
             engine.as_handle(), FILTER_GUIDS[4], FWPM_LAYER_ALE_AUTH_CONNECT_V6,
-            "winsbox-v6-block-sandbox-default", 0x4000_0000, FWP_ACTION_BLOCK, &mut c5,
+            "winsbox-v6-block-sandbox-default", W_LOW, FWP_ACTION_BLOCK, &mut c5,
         )?;
         let mut c6 = [
             cond_v6_addr(FWPM_CONDITION_IP_REMOTE_ADDRESS, &mut v6_loopback),
@@ -392,7 +432,7 @@ pub fn install_persistent(proxy_port: u16) -> Result<()> {
         ];
         add_filter(
             engine.as_handle(), FILTER_GUIDS[5], FWPM_LAYER_ALE_AUTH_CONNECT_V6,
-            "winsbox-v6-block-non-sandbox-proxy", 0xF000_0000, FWP_ACTION_BLOCK, &mut c6,
+            "winsbox-v6-block-non-sandbox-proxy", W_HIGH, FWP_ACTION_BLOCK, &mut c6,
         )?;
 
         Ok(())
