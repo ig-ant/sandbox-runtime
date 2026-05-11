@@ -1,0 +1,187 @@
+2026-05-10T14:01:07.0303579Z   [stderr] [sbox-exec] AppContainer sid=S-1-15-2-148926539-1516191154-1721312399-4088966677-255418353-3730564855-2083731077 folder=C:\Users\runneradmin\AppData\Local\Packages\srt.ac.bb59b4dcba764016\AC
+2026-05-10T14:01:07.0305422Z   [stderr] [sbox-exec] policy-stamp: hash unchanged (0xde37f2fc744bcb7a); skipping apply
+2026-05-10T14:01:07.0314403Z   [stderr] [sbox-exec] auto-toolchain: detected 40 tooling dirs: C:\Program Files\PowerShell\7, C:\Program Files\MongoDB\Server\7.0\bin, C:\Program Files\dotnet, C:\Program Files\MySQL\MySQL Server 8.0\bin, C:\Program Files\R\R-4.6.0\bin\x64, C:\Program Files (x86)\sbt\bin, C:\Program Files (x86)\GitHub CLI, C:\Program Files\Git\bin, C:\Program Files (x86)\pipx_bin, C:\Program Files\OpenSSL\bin, C:\Program Files\ImageMagick-7.1.2-Q16-HDRI, C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin, C:\Program Files\PowerShell\7\, C:\Program Files\Microsoft\Web Platform Installer\, C:\Program Files\Microsoft SQL Server\Client SDK\ODBC\170\Tools\Binn\, C:\Program Files\Microsoft SQL Server\150\Tools\Binn\, C:\Program Files\dotnet\, C:\Program Files (x86)\Windows Kits\10\Windows Performance Toolkit\, C:\Program Files (x86)\WiX Toolset v3.14\bin, C:\Program Files\Microsoft SQL Server\130\DTS\Binn\, C:\Program Files\Microsoft SQL Server\140\DTS\Binn\, C:\Program Files\Microsoft SQL Server\150\DTS\Binn\, C:\Program Files\Microsoft SQL Server\160\DTS\Binn\, C:\Program Files\Microsoft SQL Server\170\DTS\Binn\, C:\Program Files\CMake\bin, C:\Program Files\Microsoft Service Fabric\bin\Fabric\Fabric.Code, C:\Program Files\Microsoft SDKs\Service Fabric\Tools\ServiceFabricLocalClusterManager, C:\Program Files\nodejs\, C:\Program Files\Git\cmd, C:\Program Files\Git\mingw64\bin, C:\Program Files\Git\usr\bin, C:\Program Files\GitHub CLI\, C:\Program Files\Amazon\AWSCLIV2\, C:\Program Files\Amazon\SessionManagerPlugin\bin\, C:\Program Files\Amazon\AWSSAMCLI\bin\, C:\Program Files\Microsoft SQL Server\130\Tools\Binn\, C:\Program Files\mongosh\, C:\Program Files\LLVM\bin, C:\Program Files (x86)\LLVM\bin, C:\Users\runneradmin\.cargo\bin
+2026-05-10T14:01:07.0323815Z   [stderr] [sbox-exec] broker-open: enabled=true allow_read=1 deny_read=1 allow_write=6 deny_write=0 auto_toolchain=40
+2026-05-10T14:01:07.0324323Z   [stderr] [sbox-exec] Job created
+2026-05-10T14:01:07.0325237Z   [stderr] [sbox-exec] bridge: outside relay http=C:\Users\runneradmin\AppData\Local\Packages\srt.ac.bb59b4dcba764016\AC\h.sock → 65030
+2026-05-10T14:01:07.0326152Z   [stderr] [sbox-exec] bridge: outside relay socks=C:\Users\runneradmin\AppData\Local\Packages\srt.ac.bb59b4dcba764016\AC\s.sock → 65031
+2026-05-10T14:01:07.0326918Z   [stderr] [sbox-exec] bridge: spawning inside relay
+2026-05-10T14:01:07.0327267Z   [stderr] [sbox-exec] bridge: inside relay pid=5640, reading ports
+2026-05-10T14:01:07.0327613Z   [stderr] [sbox-exec] bridge up: ports=[65032, 65033]
+2026-05-10T14:01:07.0328878Z   [stderr] [sbox-exec] broker tokens: primary=LockdownSpec { keep_enabled: ["S-1-1-0", "S-1-5-11", "S-1-5-32-545"] }+lowbox, initial=USER_RESTRICTED_SAME_ACCESS+lowbox, IL=0x1000; ac_bno=\Sessions\2\AppContainerNamedObjects\S-1-15-2-148926539-1516191154-1721312399-4088966677-255418353-3730564855-2083731077
+2026-05-10T14:01:07.0330221Z   [stderr] [sbox-exec] launching target (cwd=C:\Users\RUNNER~1\AppData\Local\Temp\srt-win-jXMpz6\allowWrite): cmd /d /s /c "git --version"
+2026-05-10T14:01:07.0330767Z   [stderr] [sbox-exec] target pid=7480
+2026-05-10T14:01:07.0331546Z   [stderr] [sbox-exec] cdylib stamp on \\?\D:\a\sandbox-runtime\sandbox-runtime\vendor\winsbox\x64: 2 stamped, 0 skipped (idempotent), 0 skipped (AC accessible), 0 soft-failed (access denied), 0 soft-failed (other), 0 ms
+2026-05-10T14:01:07.0332644Z   [stderr] [sbox-exec] cdylib: ac_bno=\Sessions\2\AppContainerNamedObjects\S-1-15-2-148926539-1516191154-1721312399-4088966677-255418353-3730564855-2083731077
+2026-05-10T14:01:07.0333404Z   [stderr] [sbox-exec] manual_map: cdylib mapped at 0x190000000 (0xa000 bytes), IPC @ 0x1900070c0, delta=0x0
+2026-05-10T14:01:07.0334464Z   [stderr] [sbox-exec] cdylib manual-mapped: base=0x190000000 size=0xa000 dll=\\?\D:\a\sandbox-runtime\sandbox-runtime\vendor\winsbox\x64\ac_cdylib.dll
+2026-05-10T14:01:07.0335276Z   [stderr] [sbox-exec] cdylib reported back: pid=6648 version=manual init=0xACDC0001 (manual-map)
+2026-05-10T14:01:07.0336087Z   [stderr] [sbox-exec] cdylib hook VAs: section=0x190003450 dirobj_create=0x190002420 dirobj_open=0x1900030a0 pipe=0x1900028b0 cpw=0x190001e20 attr=0x190003560 fullattr=0x190003700
+2026-05-10T14:01:07.0337042Z   [stderr] [sbox-exec] interception: NtCreateNamedPipeFile @ 0x7ff814d23450 → cdylib @ 0x1900028b0 (slim)
+2026-05-10T14:01:07.0337713Z   [stderr] [sbox-exec] interception: NtOpenSection @ 0x7ff814d223e0 → cdylib @ 0x190003450 (slim)
+2026-05-10T14:01:07.0338374Z   [stderr] [sbox-exec] interception: NtCreateDirectoryObject @ 0x7ff814d23270 → cdylib @ 0x190002420 (slim)
+2026-05-10T14:01:07.0339059Z   [stderr] [sbox-exec] interception: NtOpenDirectoryObject @ 0x7ff814d22800 → cdylib @ 0x1900030a0 (slim)
+2026-05-10T14:01:07.0340513Z   [stderr] [sbox-exec] interception: NtCreateFile @ 0x7ff814d227a0 → cdylib @ 0x1900024f0 (slim)
+2026-05-10T14:01:07.0341380Z   [stderr] [sbox-exec] interception: NtOpenFile @ 0x7ff814d22360 → cdylib @ 0x190003140 (slim)
+2026-05-10T14:01:07.0342081Z   [stderr] [sbox-exec] interception: NtQueryAttributesFile @ 0x7ff814d224a0 → cdylib @ 0x190003560 (slim)
+2026-05-10T14:01:07.0342802Z   [stderr] [sbox-exec] interception: NtQueryFullAttributesFile @ 0x7ff814d24710 → cdylib @ 0x190003700 (slim)
+2026-05-10T14:01:07.0344161Z   [stderr] [sbox-exec] cdylib ntdll hooks patched pre-resume; passthrough thunks: section=0x7df566370000 dirobj_create=0x7df566360000 dirobj_open=0x7df566350000 pipe=0x7df566380000 denylog_create=0x7df566340000 denylog_open=0x7df566330000 attr=0x7df566320000 fullattr=0x7df566310000 (log_denies=true trace_mode=false)
+2026-05-10T14:01:07.0345392Z   [stderr] [sbox-exec] cdylib serve_ipc thread spawned (pre-resume)
+2026-05-10T14:01:07.0345936Z   [stderr] [sbox-exec] entry_trampoline: rtlstart=0x7ff814c4c510 → stub @ 0x7df566300000
+2026-05-10T14:01:07.0346705Z   [stderr] [sbox-exec] interception: CreateProcessInternalW @ 0x7ff81234faa0 → cdylib @ 0x190001e20 (slim)
+2026-05-10T14:01:07.0347305Z   [stderr] [sbox-exec] cdylib CPW hook patched post-loader; cpw passthrough=0x7df4641c0000
+2026-05-10T14:01:07.0347898Z   [stderr] [sbox-exec] broker-open: GRANTED (NtOpenFile) path="C:\\" canonical="C:\\" access=0x80100001 handle=0xc0
+2026-05-10T14:01:07.0348898Z   [stderr] [sbox-exec] broker-open: GRANTED (NtOpenFile) path="C:\\Users\\" canonical="C:\\Users" access=0x80100001 handle=0xb8
+2026-05-10T14:01:07.0349667Z   [stderr] [sbox-exec] broker-open: GRANTED (NtOpenFile) path="C:\\Users\\RUNNER~1\\" canonical="C:\\Users\\runneradmin" access=0x80100001 handle=0xc4
+2026-05-10T14:01:07.0350681Z   [stderr] [sbox-exec] broker-open: REJECTED-CANONICAL (NtOpenFile) path="C:\\Users\\RUNNER~1\\AppData\\" canonical="C:\\Users\\runneradmin\\AppData" reason="not in allow list" (symlink/junction escape)
+2026-05-10T14:01:07.0351834Z   [stderr] [sbox-exec] denied-open: NtOpenFile path="\\??\\C:\\Users\\RUNNER~1\\AppData\\" access=0x100001 share=0x7 options=0x4021 status=0xc0000022
+2026-05-10T14:01:07.0352870Z   [stderr] [sbox-exec] broker-open: REJECTED-CANONICAL (NtOpenFile) path="C:\\Users\\RUNNER~1\\AppData\\Local\\" canonical="C:\\Users\\runneradmin\\AppData\\Local" reason="not in allow list" (symlink/junction escape)
+2026-05-10T14:01:07.0353901Z   [stderr] [sbox-exec] denied-open: NtOpenFile path="\\??\\C:\\Users\\RUNNER~1\\AppData\\Local\\" access=0x100001 share=0x7 options=0x4021 status=0xc0000022
+2026-05-10T14:01:07.0354968Z   [stderr] [sbox-exec] broker-open: REJECTED-CANONICAL (NtOpenFile) path="C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\" canonical="C:\\Users\\runneradmin\\AppData\\Local\\Temp" reason="not in allow list" (symlink/junction escape)
+2026-05-10T14:01:07.0356044Z   [stderr] [sbox-exec] denied-open: NtOpenFile path="\\??\\C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\" access=0x100001 share=0x7 options=0x4021 status=0xc0000022
+2026-05-10T14:01:07.0356897Z   [stderr] [sbox-exec] broker-open: REJECTED (NtOpenFile) path="C:\\Users\\runneradmin\\.bun\\bin\\" access=0x100001 reason="not in allow list"
+2026-05-10T14:01:07.0357704Z   [stderr] [sbox-exec] denied-open: NtOpenFile path="\\??\\C:\\Users\\runneradmin\\.bun\\bin\\" access=0x100001 share=0x7 options=0x4021 status=0xc0000022
+2026-05-10T14:01:07.0358448Z   [stderr] [sbox-exec] broker-open: REJECTED (NtOpenFile) path="C:\\vcpkg\\" access=0x100001 reason="not in allow list"
+2026-05-10T14:01:07.0359122Z   [stderr] [sbox-exec] denied-open: NtOpenFile path="\\??\\C:\\vcpkg\\" access=0x100001 share=0x7 options=0x4021 status=0xc0000022
+2026-05-10T14:01:07.0359812Z   [stderr] [sbox-exec] broker-open: REJECTED (NtOpenFile) path="C:\\tools\\zstd\\" access=0x100001 reason="not in allow list"
+2026-05-10T14:01:07.0360514Z   [stderr] [sbox-exec] denied-open: NtOpenFile path="\\??\\C:\\tools\\zstd\\" access=0x100001 share=0x7 options=0x4021 status=0xc0000022
+2026-05-10T14:01:07.0361411Z   [stderr] [sbox-exec] broker-open: REJECTED (NtOpenFile) path="C:\\hostedtoolcache\\windows\\stack\\3.9.3\\x64\\" access=0x100001 reason="not in allow list"
+2026-05-10T14:01:07.0362300Z   [stderr] [sbox-exec] denied-open: NtOpenFile path="\\??\\C:\\hostedtoolcache\\windows\\stack\\3.9.3\\x64\\" access=0x100001 share=0x7 options=0x4021 status=0xc0000022
+2026-05-10T14:01:07.0363103Z   [stderr] [sbox-exec] broker-open: REJECTED (NtOpenFile) path="C:\\ghcup\\bin\\" access=0x100001 reason="not in allow list"
+2026-05-10T14:01:07.0363811Z   [stderr] [sbox-exec] denied-open: NtOpenFile path="\\??\\C:\\ghcup\\bin\\" access=0x100001 share=0x7 options=0x4021 status=0xc0000022
+2026-05-10T14:01:07.0364513Z   [stderr] [sbox-exec] broker-open: REJECTED (NtOpenFile) path="C:\\mingw64\\bin\\" access=0x100001 reason="not in allow list"
+2026-05-10T14:01:07.0365215Z   [stderr] [sbox-exec] denied-open: NtOpenFile path="\\??\\C:\\mingw64\\bin\\" access=0x100001 share=0x7 options=0x4021 status=0xc0000022
+2026-05-10T14:01:07.0366093Z   [stderr] [sbox-exec] broker-open: REJECTED (NtOpenFile) path="C:\\SeleniumWebDrivers\\GeckoDriver\\" access=0x100001 reason="not in allow list"
+2026-05-10T14:01:07.0366948Z   [stderr] [sbox-exec] denied-open: NtOpenFile path="\\??\\C:\\SeleniumWebDrivers\\GeckoDriver\\" access=0x100001 share=0x7 options=0x4021 status=0xc0000022
+2026-05-10T14:01:07.0367789Z   [stderr] [sbox-exec] broker-open: REJECTED (NtOpenFile) path="C:\\SeleniumWebDrivers\\EdgeDriver\\" access=0x100001 reason="not in allow list"
+2026-05-10T14:01:07.0368918Z   [stderr] [sbox-exec] denied-open: NtOpenFile path="\\??\\C:\\SeleniumWebDrivers\\EdgeDriver\\" access=0x100001 share=0x7 options=0x4021 status=0xc0000022
+2026-05-10T14:01:07.0369774Z   [stderr] [sbox-exec] broker-open: REJECTED (NtOpenFile) path="C:\\SeleniumWebDrivers\\ChromeDriver\\" access=0x100001 reason="not in allow list"
+2026-05-10T14:01:07.0370634Z   [stderr] [sbox-exec] denied-open: NtOpenFile path="\\??\\C:\\SeleniumWebDrivers\\ChromeDriver\\" access=0x100001 share=0x7 options=0x4021 status=0xc0000022
+2026-05-10T14:01:07.0371746Z   [stderr] [sbox-exec] grandchild spawn: ppid=7480 new_pid=7600 app="C:\\Program Files\\Git\\bin\\git.exe" cmdline="git  --version" cwd="C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\srt-win-jXMpz6\\allowWrite" token=primary flags=0x80000
+2026-05-10T14:01:07.0372688Z   [stderr] [sbox-exec] manual_map: cdylib mapped at 0x190000000 (0xa000 bytes), IPC @ 0x1900070c0, delta=0x0
+2026-05-10T14:01:07.0373398Z   [stderr] [sbox-exec] interception: NtCreateNamedPipeFile @ 0x7ff814d23450 → cdylib @ 0x1900028b0 (slim)
+2026-05-10T14:01:07.0374050Z   [stderr] [sbox-exec] interception: NtOpenSection @ 0x7ff814d223e0 → cdylib @ 0x190003450 (slim)
+2026-05-10T14:01:07.0374711Z   [stderr] [sbox-exec] interception: NtCreateDirectoryObject @ 0x7ff814d23270 → cdylib @ 0x190002420 (slim)
+2026-05-10T14:01:07.0375384Z   [stderr] [sbox-exec] interception: NtOpenDirectoryObject @ 0x7ff814d22800 → cdylib @ 0x1900030a0 (slim)
+2026-05-10T14:01:07.0376023Z   [stderr] [sbox-exec] interception: NtCreateFile @ 0x7ff814d227a0 → cdylib @ 0x1900024f0 (slim)
+2026-05-10T14:01:07.0376624Z   [stderr] [sbox-exec] interception: NtOpenFile @ 0x7ff814d22360 → cdylib @ 0x190003140 (slim)
+2026-05-10T14:01:07.0377241Z   [stderr] [sbox-exec] interception: NtQueryAttributesFile @ 0x7ff814d224a0 → cdylib @ 0x190003560 (slim)
+2026-05-10T14:01:07.0377931Z   [stderr] [sbox-exec] interception: NtQueryFullAttributesFile @ 0x7ff814d24710 → cdylib @ 0x190003700 (slim)
+2026-05-10T14:01:07.0378567Z   [stderr] [sbox-exec] entry_trampoline: rtlstart=0x7ff814c4c510 → stub @ 0x7ff5b0a70000
+2026-05-10T14:01:07.0379193Z   [stderr] [sbox-exec] interception: CreateProcessInternalW @ 0x7ff81234faa0 → cdylib @ 0x190001e20 (slim)
+2026-05-10T14:01:07.0380010Z   [stderr] [sbox-exec] grandchild cdylib injected: pid=7600 depth=1 elapsed_ms=8 dll=\\?\D:\a\sandbox-runtime\sandbox-runtime\vendor\winsbox\x64\ac_cdylib.dll base=0x190000000
+2026-05-10T14:01:07.0380946Z   [stderr] [sbox-exec] broker-open: GRANTED (NtCreateFile) path="MountPointManager" canonical="MountPointManager" access=0x100080 handle=0x198
+2026-05-10T14:01:07.0382172Z   [stderr] [sbox-exec] grandchild spawn: ppid=7600 new_pid=9488 app="C:\\Program Files\\Git\\mingw64\\bin\\git.exe" cmdline="git.exe  --version" cwd="C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\srt-win-jXMpz6\\allowWrite" token=primary flags=0x400
+2026-05-10T14:01:07.0383143Z   [stderr] [sbox-exec] manual_map: cdylib mapped at 0x190000000 (0xa000 bytes), IPC @ 0x1900070c0, delta=0x0
+2026-05-10T14:01:07.0383850Z   [stderr] [sbox-exec] interception: NtCreateNamedPipeFile @ 0x7ff814d23450 → cdylib @ 0x1900028b0 (slim)
+2026-05-10T14:01:07.0384487Z   [stderr] [sbox-exec] interception: NtOpenSection @ 0x7ff814d223e0 → cdylib @ 0x190003450 (slim)
+2026-05-10T14:01:07.0385138Z   [stderr] [sbox-exec] interception: NtCreateDirectoryObject @ 0x7ff814d23270 → cdylib @ 0x190002420 (slim)
+2026-05-10T14:01:07.0385918Z   [stderr] [sbox-exec] interception: NtOpenDirectoryObject @ 0x7ff814d22800 → cdylib @ 0x1900030a0 (slim)
+2026-05-10T14:01:07.0386581Z   [stderr] [sbox-exec] interception: NtCreateFile @ 0x7ff814d227a0 → cdylib @ 0x1900024f0 (slim)
+2026-05-10T14:01:07.0387180Z   [stderr] [sbox-exec] interception: NtOpenFile @ 0x7ff814d22360 → cdylib @ 0x190003140 (slim)
+2026-05-10T14:01:07.0387821Z   [stderr] [sbox-exec] interception: NtQueryAttributesFile @ 0x7ff814d224a0 → cdylib @ 0x190003560 (slim)
+2026-05-10T14:01:07.0388813Z   [stderr] [sbox-exec] interception: NtQueryFullAttributesFile @ 0x7ff814d24710 → cdylib @ 0x190003700 (slim)
+2026-05-10T14:01:07.0389469Z   [stderr] [sbox-exec] entry_trampoline: rtlstart=0x7ff814c4c510 → stub @ 0x7ff5ebf90000
+2026-05-10T14:01:07.0390115Z   [stderr] [sbox-exec] interception: CreateProcessInternalW @ 0x7ff81234faa0 → cdylib @ 0x190001e20 (slim)
+2026-05-10T14:01:07.0390947Z   [stderr] [sbox-exec] grandchild cdylib injected: pid=9488 depth=2 elapsed_ms=9 dll=\\?\D:\a\sandbox-runtime\sandbox-runtime\vendor\winsbox\x64\ac_cdylib.dll base=0x190000000
+2026-05-10T14:01:07.0391931Z   [stderr] [sbox-exec] broker-open: GRANTED (NtCreateFile) path="C:\\Users\\runneradmin" canonical="C:\\Users\\runneradmin" access=0x80100080 handle=0x128
+2026-05-10T14:01:07.0392796Z   [stderr] [sbox-exec] broker-open: GRANTED (NtCreateFile) path="MountPointManager" canonical="MountPointManager" access=0x100080 handle=0x13c
+2026-05-10T14:01:07.0393343Z   [stderr] [sbox-exec] target exit=0x0
+2026-05-10T14:01:07.0393623Z (pass) windows sandbox > git --version [375.00ms]
+2026-05-10T14:01:07.4343657Z   [stderr] [sbox-exec] AppContainer sid=S-1-15-2-148926539-1516191154-1721312399-4088966677-255418353-3730564855-2083731077 folder=C:\Users\runneradmin\AppData\Local\Packages\srt.ac.bb59b4dcba764016\AC
+2026-05-10T14:01:07.4345353Z   [stderr] [sbox-exec] policy-stamp: hash unchanged (0xde37f2fc744bcb7a); skipping apply
+2026-05-10T14:01:07.4354447Z   [stderr] [sbox-exec] auto-toolchain: detected 40 tooling dirs: C:\Program Files\PowerShell\7, C:\Program Files\MongoDB\Server\7.0\bin, C:\Program Files\dotnet, C:\Program Files\MySQL\MySQL Server 8.0\bin, C:\Program Files\R\R-4.6.0\bin\x64, C:\Program Files (x86)\sbt\bin, C:\Program Files (x86)\GitHub CLI, C:\Program Files\Git\bin, C:\Program Files (x86)\pipx_bin, C:\Program Files\OpenSSL\bin, C:\Program Files\ImageMagick-7.1.2-Q16-HDRI, C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin, C:\Program Files\PowerShell\7\, C:\Program Files\Microsoft\Web Platform Installer\, C:\Program Files\Microsoft SQL Server\Client SDK\ODBC\170\Tools\Binn\, C:\Program Files\Microsoft SQL Server\150\Tools\Binn\, C:\Program Files\dotnet\, C:\Program Files (x86)\Windows Kits\10\Windows Performance Toolkit\, C:\Program Files (x86)\WiX Toolset v3.14\bin, C:\Program Files\Microsoft SQL Server\130\DTS\Binn\, C:\Program Files\Microsoft SQL Server\140\DTS\Binn\, C:\Program Files\Microsoft SQL Server\150\DTS\Binn\, C:\Program Files\Microsoft SQL Server\160\DTS\Binn\, C:\Program Files\Microsoft SQL Server\170\DTS\Binn\, C:\Program Files\CMake\bin, C:\Program Files\Microsoft Service Fabric\bin\Fabric\Fabric.Code, C:\Program Files\Microsoft SDKs\Service Fabric\Tools\ServiceFabricLocalClusterManager, C:\Program Files\nodejs\, C:\Program Files\Git\cmd, C:\Program Files\Git\mingw64\bin, C:\Program Files\Git\usr\bin, C:\Program Files\GitHub CLI\, C:\Program Files\Amazon\AWSCLIV2\, C:\Program Files\Amazon\SessionManagerPlugin\bin\, C:\Program Files\Amazon\AWSSAMCLI\bin\, C:\Program Files\Microsoft SQL Server\130\Tools\Binn\, C:\Program Files\mongosh\, C:\Program Files\LLVM\bin, C:\Program Files (x86)\LLVM\bin, C:\Users\runneradmin\.cargo\bin
+2026-05-10T14:01:07.4365071Z   [stderr] [sbox-exec] broker-open: enabled=true allow_read=1 deny_read=1 allow_write=6 deny_write=0 auto_toolchain=40
+2026-05-10T14:01:07.4365909Z   [stderr] [sbox-exec] Job created
+2026-05-10T14:01:07.4367219Z   [stderr] [sbox-exec] bridge: outside relay http=C:\Users\runneradmin\AppData\Local\Packages\srt.ac.bb59b4dcba764016\AC\h.sock → 65034
+2026-05-10T14:01:07.4369078Z   [stderr] [sbox-exec] bridge: outside relay socks=C:\Users\runneradmin\AppData\Local\Packages\srt.ac.bb59b4dcba764016\AC\s.sock → 65035
+2026-05-10T14:01:07.4370092Z   [stderr] [sbox-exec] bridge: spawning inside relay
+2026-05-10T14:01:07.4370662Z   [stderr] [sbox-exec] bridge: inside relay pid=3656, reading ports
+2026-05-10T14:01:07.4371254Z   [stderr] [sbox-exec] bridge up: ports=[65036, 65037]
+2026-05-10T14:01:07.4373519Z   [stderr] [sbox-exec] broker tokens: primary=LockdownSpec { keep_enabled: ["S-1-1-0", "S-1-5-11", "S-1-5-32-545"] }+lowbox, initial=USER_RESTRICTED_SAME_ACCESS+lowbox, IL=0x1000; ac_bno=\Sessions\2\AppContainerNamedObjects\S-1-15-2-148926539-1516191154-1721312399-4088966677-255418353-3730564855-2083731077
+2026-05-10T14:01:07.4376087Z   [stderr] [sbox-exec] launching target (cwd=C:\Users\RUNNER~1\AppData\Local\Temp\srt-win-jXMpz6\allowWrite): cmd /d /s /c ""C:\Program Files\Git\bin\bash.exe" -c "echo hello""
+2026-05-10T14:01:07.4377218Z   [stderr] [sbox-exec] target pid=492
+2026-05-10T14:01:07.4378593Z   [stderr] [sbox-exec] cdylib stamp on \\?\D:\a\sandbox-runtime\sandbox-runtime\vendor\winsbox\x64: 2 stamped, 0 skipped (idempotent), 0 skipped (AC accessible), 0 soft-failed (access denied), 0 soft-failed (other), 0 ms
+2026-05-10T14:01:07.4380609Z   [stderr] [sbox-exec] cdylib: ac_bno=\Sessions\2\AppContainerNamedObjects\S-1-15-2-148926539-1516191154-1721312399-4088966677-255418353-3730564855-2083731077
+2026-05-10T14:01:07.4381984Z   [stderr] [sbox-exec] manual_map: cdylib mapped at 0x190000000 (0xa000 bytes), IPC @ 0x1900070c0, delta=0x0
+2026-05-10T14:01:07.4383504Z   [stderr] [sbox-exec] cdylib manual-mapped: base=0x190000000 size=0xa000 dll=\\?\D:\a\sandbox-runtime\sandbox-runtime\vendor\winsbox\x64\ac_cdylib.dll
+2026-05-10T14:01:07.4384538Z   [stderr] [sbox-exec] cdylib reported back: pid=6764 version=manual init=0xACDC0001 (manual-map)
+2026-05-10T14:01:07.4385399Z   [stderr] [sbox-exec] cdylib hook VAs: section=0x190003450 dirobj_create=0x190002420 dirobj_open=0x1900030a0 pipe=0x1900028b0 cpw=0x190001e20 attr=0x190003560 fullattr=0x190003700
+2026-05-10T14:01:07.4386471Z   [stderr] [sbox-exec] interception: NtCreateNamedPipeFile @ 0x7ff814d23450 → cdylib @ 0x1900028b0 (slim)
+2026-05-10T14:01:07.4387186Z   [stderr] [sbox-exec] interception: NtOpenSection @ 0x7ff814d223e0 → cdylib @ 0x190003450 (slim)
+2026-05-10T14:01:07.4387857Z   [stderr] [sbox-exec] interception: NtCreateDirectoryObject @ 0x7ff814d23270 → cdylib @ 0x190002420 (slim)
+2026-05-10T14:01:07.4388561Z   [stderr] [sbox-exec] interception: NtOpenDirectoryObject @ 0x7ff814d22800 → cdylib @ 0x1900030a0 (slim)
+2026-05-10T14:01:07.4390114Z   [stderr] [sbox-exec] interception: NtCreateFile @ 0x7ff814d227a0 → cdylib @ 0x1900024f0 (slim)
+2026-05-10T14:01:07.4391006Z   [stderr] [sbox-exec] interception: NtOpenFile @ 0x7ff814d22360 → cdylib @ 0x190003140 (slim)
+2026-05-10T14:01:07.4392805Z   [stderr] [sbox-exec] interception: NtQueryAttributesFile @ 0x7ff814d224a0 → cdylib @ 0x190003560 (slim)
+2026-05-10T14:01:07.4393873Z   [stderr] [sbox-exec] interception: NtQueryFullAttributesFile @ 0x7ff814d24710 → cdylib @ 0x190003700 (slim)
+2026-05-10T14:01:07.4395451Z   [stderr] [sbox-exec] cdylib ntdll hooks patched pre-resume; passthrough thunks: section=0x7ff5dfe20000 dirobj_create=0x7ff5dfe10000 dirobj_open=0x7ff5dfe00000 pipe=0x7ff5dfe30000 denylog_create=0x7ff5dfdf0000 denylog_open=0x7ff5dfde0000 attr=0x7ff5dfdd0000 fullattr=0x7ff5dfdc0000 (log_denies=true trace_mode=false)
+2026-05-10T14:01:07.4396670Z   [stderr] [sbox-exec] cdylib serve_ipc thread spawned (pre-resume)
+2026-05-10T14:01:07.4397226Z   [stderr] [sbox-exec] entry_trampoline: rtlstart=0x7ff814c4c510 → stub @ 0x7ff5dfdb0000
+2026-05-10T14:01:07.4397896Z   [stderr] [sbox-exec] interception: CreateProcessInternalW @ 0x7ff81234faa0 → cdylib @ 0x190001e20 (slim)
+2026-05-10T14:01:07.4398480Z   [stderr] [sbox-exec] cdylib CPW hook patched post-loader; cpw passthrough=0x7ff5ddc90000
+2026-05-10T14:01:07.4399082Z   [stderr] [sbox-exec] broker-open: GRANTED (NtOpenFile) path="C:\\" canonical="C:\\" access=0x80100001 handle=0xc0
+2026-05-10T14:01:07.4399883Z   [stderr] [sbox-exec] broker-open: GRANTED (NtOpenFile) path="C:\\Users\\" canonical="C:\\Users" access=0x80100001 handle=0xb8
+2026-05-10T14:01:07.4400666Z   [stderr] [sbox-exec] broker-open: GRANTED (NtOpenFile) path="C:\\Users\\RUNNER~1\\" canonical="C:\\Users\\runneradmin" access=0x80100001 handle=0xc4
+2026-05-10T14:01:07.4401670Z   [stderr] [sbox-exec] broker-open: REJECTED-CANONICAL (NtOpenFile) path="C:\\Users\\RUNNER~1\\AppData\\" canonical="C:\\Users\\runneradmin\\AppData" reason="not in allow list" (symlink/junction escape)
+2026-05-10T14:01:07.4402661Z   [stderr] [sbox-exec] denied-open: NtOpenFile path="\\??\\C:\\Users\\RUNNER~1\\AppData\\" access=0x100001 share=0x7 options=0x4021 status=0xc0000022
+2026-05-10T14:01:07.4403685Z   [stderr] [sbox-exec] broker-open: REJECTED-CANONICAL (NtOpenFile) path="C:\\Users\\RUNNER~1\\AppData\\Local\\" canonical="C:\\Users\\runneradmin\\AppData\\Local" reason="not in allow list" (symlink/junction escape)
+2026-05-10T14:01:07.4404742Z   [stderr] [sbox-exec] denied-open: NtOpenFile path="\\??\\C:\\Users\\RUNNER~1\\AppData\\Local\\" access=0x100001 share=0x7 options=0x4021 status=0xc0000022
+2026-05-10T14:01:07.4405834Z   [stderr] [sbox-exec] broker-open: REJECTED-CANONICAL (NtOpenFile) path="C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\" canonical="C:\\Users\\runneradmin\\AppData\\Local\\Temp" reason="not in allow list" (symlink/junction escape)
+2026-05-10T14:01:07.4406912Z   [stderr] [sbox-exec] denied-open: NtOpenFile path="\\??\\C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\" access=0x100001 share=0x7 options=0x4021 status=0xc0000022
+2026-05-10T14:01:07.4408134Z   [stderr] [sbox-exec] grandchild spawn: ppid=492 new_pid=6540 app="C:\\Program Files\\Git\\bin\\bash.exe" cmdline="\"C:\\Program Files\\Git\\bin\\bash.exe\"  -c \"echo hello\"" cwd="C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\srt-win-jXMpz6\\allowWrite" token=primary flags=0x80000
+2026-05-10T14:01:07.4409563Z   [stderr] [sbox-exec] manual_map: cdylib mapped at 0x190000000 (0xa000 bytes), IPC @ 0x1900070c0, delta=0x0
+2026-05-10T14:01:07.4410298Z   [stderr] [sbox-exec] interception: NtCreateNamedPipeFile @ 0x7ff814d23450 → cdylib @ 0x1900028b0 (slim)
+2026-05-10T14:01:07.4410968Z   [stderr] [sbox-exec] interception: NtOpenSection @ 0x7ff814d223e0 → cdylib @ 0x190003450 (slim)
+2026-05-10T14:01:07.4411631Z   [stderr] [sbox-exec] interception: NtCreateDirectoryObject @ 0x7ff814d23270 → cdylib @ 0x190002420 (slim)
+2026-05-10T14:01:07.4412317Z   [stderr] [sbox-exec] interception: NtOpenDirectoryObject @ 0x7ff814d22800 → cdylib @ 0x1900030a0 (slim)
+2026-05-10T14:01:07.4412958Z   [stderr] [sbox-exec] interception: NtCreateFile @ 0x7ff814d227a0 → cdylib @ 0x1900024f0 (slim)
+2026-05-10T14:01:07.4413562Z   [stderr] [sbox-exec] interception: NtOpenFile @ 0x7ff814d22360 → cdylib @ 0x190003140 (slim)
+2026-05-10T14:01:07.4414183Z   [stderr] [sbox-exec] interception: NtQueryAttributesFile @ 0x7ff814d224a0 → cdylib @ 0x190003560 (slim)
+2026-05-10T14:01:07.4414896Z   [stderr] [sbox-exec] interception: NtQueryFullAttributesFile @ 0x7ff814d24710 → cdylib @ 0x190003700 (slim)
+2026-05-10T14:01:07.4415668Z   [stderr] [sbox-exec] entry_trampoline: rtlstart=0x7ff814c4c510 → stub @ 0x7ff54ce00000
+2026-05-10T14:01:07.4416305Z   [stderr] [sbox-exec] interception: CreateProcessInternalW @ 0x7ff81234faa0 → cdylib @ 0x190001e20 (slim)
+2026-05-10T14:01:07.4417148Z   [stderr] [sbox-exec] grandchild cdylib injected: pid=6540 depth=1 elapsed_ms=8 dll=\\?\D:\a\sandbox-runtime\sandbox-runtime\vendor\winsbox\x64\ac_cdylib.dll base=0x190000000
+2026-05-10T14:01:07.4418092Z   [stderr] [sbox-exec] broker-open: GRANTED (NtCreateFile) path="MountPointManager" canonical="MountPointManager" access=0x100080 handle=0x198
+2026-05-10T14:01:07.4420089Z   [stderr] [sbox-exec] grandchild spawn: ppid=6540 new_pid=6028 app="C:\\Program Files\\Git\\bin\\..\\usr\\bin\\bash.exe" cmdline="\"C:\\Program Files\\Git\\bin\\..\\usr\\bin\\bash.exe\"  -c \"echo hello\"" cwd="C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\srt-win-jXMpz6\\allowWrite" token=primary flags=0x400
+2026-05-10T14:01:07.4421281Z   [stderr] [sbox-exec] manual_map: cdylib mapped at 0x190000000 (0xa000 bytes), IPC @ 0x1900070c0, delta=0x0
+2026-05-10T14:01:07.4422026Z   [stderr] [sbox-exec] interception: NtCreateNamedPipeFile @ 0x7ff814d23450 → cdylib @ 0x1900028b0 (slim)
+2026-05-10T14:01:07.4422681Z   [stderr] [sbox-exec] interception: NtOpenSection @ 0x7ff814d223e0 → cdylib @ 0x190003450 (slim)
+2026-05-10T14:01:07.4423345Z   [stderr] [sbox-exec] interception: NtCreateDirectoryObject @ 0x7ff814d23270 → cdylib @ 0x190002420 (slim)
+2026-05-10T14:01:07.4424032Z   [stderr] [sbox-exec] interception: NtOpenDirectoryObject @ 0x7ff814d22800 → cdylib @ 0x1900030a0 (slim)
+2026-05-10T14:01:07.4424675Z   [stderr] [sbox-exec] interception: NtCreateFile @ 0x7ff814d227a0 → cdylib @ 0x1900024f0 (slim)
+2026-05-10T14:01:07.4425266Z   [stderr] [sbox-exec] interception: NtOpenFile @ 0x7ff814d22360 → cdylib @ 0x190003140 (slim)
+2026-05-10T14:01:07.4425907Z   [stderr] [sbox-exec] interception: NtQueryAttributesFile @ 0x7ff814d224a0 → cdylib @ 0x190003560 (slim)
+2026-05-10T14:01:07.4426613Z   [stderr] [sbox-exec] interception: NtQueryFullAttributesFile @ 0x7ff814d24710 → cdylib @ 0x190003700 (slim)
+2026-05-10T14:01:07.4427237Z   [stderr] [sbox-exec] entry_trampoline: rtlstart=0x7ff814c4c510 → stub @ 0x7ff587570000
+2026-05-10T14:01:07.4427918Z   [stderr] [sbox-exec] broker-open: GRANTED (NtCreateFile) path="MountPointManager" canonical="MountPointManager" access=0x100080 handle=0x128
+2026-05-10T14:01:07.4429691Z   [stderr] [sbox-exec] dirobj: \BaseNamedObjects\msys-2.0S5-1888ae32e00d56aa → \Sessions\2\AppContainerNamedObjects\S-1-15-2-148926539-1516191154-1721312399-4088966677-255418353-3730564855-2083731077\msys-2.0S5-1888ae32e00d56aa: 0x0 access=0x2000f
+2026-05-10T14:01:07.4431455Z   [stderr] [sbox-exec] dirobj: \Sessions\BNOLINKS\2\msys-2.0S5-1888ae32e00d56aa → \Sessions\2\AppContainerNamedObjects\S-1-15-2-148926539-1516191154-1721312399-4088966677-255418353-3730564855-2083731077\msys-2.0S5-1888ae32e00d56aa: 0x40000000 access=0x2000f
+2026-05-10T14:01:07.4432627Z   [stderr] [sbox-exec] broker-open: GRANTED (pipe-client NtCreateFile) leaf=msys-1888ae32e00d56aa-6028-sigwait handle=0x148
+2026-05-10T14:01:07.4433390Z   [stderr] [sbox-exec] interception: CreateProcessInternalW @ 0x7ff81234faa0 → cdylib @ 0x190001e20 (slim)
+2026-05-10T14:01:07.4434222Z   [stderr] [sbox-exec] grandchild cdylib injected: pid=6028 depth=2 elapsed_ms=14 dll=\\?\D:\a\sandbox-runtime\sandbox-runtime\vendor\winsbox\x64\ac_cdylib.dll base=0x190000000
+2026-05-10T14:01:07.4435400Z   [stderr] [sbox-exec] broker-open: REJECTED-CANONICAL (NtOpenFile) path="C:\\Users\\RUNNER~1\\AppData\\Local\\Temp" canonical="C:\\Users\\runneradmin\\AppData\\Local\\Temp" reason="not in allow list" (symlink/junction escape)
+2026-05-10T14:01:07.4436507Z   [stderr] [sbox-exec] denied-open: NtOpenFile path="\\??\\C:\\Users\\RUNNER~1\\AppData\\Local\\Temp" access=0x20000 share=0x7 options=0x4000 status=0xc0000022
+2026-05-10T14:01:07.4437712Z   [stderr] [sbox-exec] broker-open: REJECTED-CANONICAL (NtOpenFile) path="C:\\Users\\RUNNER~1\\AppData\\Local" canonical="C:\\Users\\runneradmin\\AppData\\Local" reason="not in allow list" (symlink/junction escape)
+2026-05-10T14:01:07.4438739Z   [stderr] [sbox-exec] denied-open: NtOpenFile path="\\??\\C:\\Users\\RUNNER~1\\AppData\\Local" access=0x20000 share=0x7 options=0x4000 status=0xc0000022
+2026-05-10T14:01:07.4439737Z   [stderr] [sbox-exec] broker-open: REJECTED-CANONICAL (NtOpenFile) path="C:\\Users\\RUNNER~1\\AppData" canonical="C:\\Users\\runneradmin\\AppData" reason="not in allow list" (symlink/junction escape)
+2026-05-10T14:01:07.4440712Z   [stderr] [sbox-exec] denied-open: NtOpenFile path="\\??\\C:\\Users\\RUNNER~1\\AppData" access=0x20000 share=0x7 options=0x4000 status=0xc0000022
+2026-05-10T14:01:07.4441522Z   [stderr] [sbox-exec] broker-open: GRANTED (NtOpenFile) path="C:\\Users\\RUNNER~1" canonical="C:\\Users\\runneradmin" access=0x80020000 handle=0x1c4
+2026-05-10T14:01:07.4442672Z   [stderr] [sbox-exec] broker-open: REJECTED-CANONICAL (NtOpenFile) path="C:\\Users\\RUNNER~1\\AppData\\Local\\Temp" canonical="C:\\Users\\runneradmin\\AppData\\Local\\Temp" reason="not in allow list" (symlink/junction escape)
+2026-05-10T14:01:07.4443753Z   [stderr] [sbox-exec] denied-open: NtOpenFile path="\\??\\C:\\Users\\RUNNER~1\\AppData\\Local\\Temp" access=0x20000 share=0x7 options=0x4000 status=0xc0000022
+2026-05-10T14:01:07.4444798Z   [stderr] [sbox-exec] broker-open: REJECTED-CANONICAL (NtOpenFile) path="C:\\Users\\RUNNER~1\\AppData\\Local" canonical="C:\\Users\\runneradmin\\AppData\\Local" reason="not in allow list" (symlink/junction escape)
+2026-05-10T14:01:07.4445828Z   [stderr] [sbox-exec] denied-open: NtOpenFile path="\\??\\C:\\Users\\RUNNER~1\\AppData\\Local" access=0x20000 share=0x7 options=0x4000 status=0xc0000022
+2026-05-10T14:01:07.4446831Z   [stderr] [sbox-exec] broker-open: REJECTED-CANONICAL (NtOpenFile) path="C:\\Users\\RUNNER~1\\AppData" canonical="C:\\Users\\runneradmin\\AppData" reason="not in allow list" (symlink/junction escape)
+2026-05-10T14:01:07.4447803Z   [stderr] [sbox-exec] denied-open: NtOpenFile path="\\??\\C:\\Users\\RUNNER~1\\AppData" access=0x20000 share=0x7 options=0x4000 status=0xc0000022
+2026-05-10T14:01:07.4448605Z   [stderr] [sbox-exec] broker-open: GRANTED (NtOpenFile) path="C:\\Users\\RUNNER~1" canonical="C:\\Users\\runneradmin" access=0x80020000 handle=0x1dc
+2026-05-10T14:01:07.4449303Z   [stderr] bash.exe: warning: could not find /tmp, please create!
+2026-05-10T14:01:07.4450484Z   [stderr] [sbox-exec] broker-open: REJECTED (NtCreateFile) path="\\DEVICE\\NETBT_TCPIP_{01DB0EEE-354C-487B-BC6D-F6EB493C2D0B}" reason="non-DOS path (e.g., \Device\…)"
+2026-05-10T14:01:07.4451509Z   [stderr] [sbox-exec] denied-open: NtCreateFile path="\\DEVICE\\NETBT_TCPIP_{01DB0EEE-354C-487B-BC6D-F6EB493C2D0B}" access=0x100001 share=0x3 options=0x0 status=0xc0000022
+2026-05-10T14:01:07.4452635Z   [stderr] [sbox-exec] broker-open: REJECTED (NtCreateFile) path="\\DEVICE\\NETBT_TCPIP_{305476DB-7472-4C76-9CA1-98A5247FA617}" reason="non-DOS path (e.g., \Device\…)"
+2026-05-10T14:01:07.4453608Z   [stderr] [sbox-exec] denied-open: NtCreateFile path="\\DEVICE\\NETBT_TCPIP_{305476DB-7472-4C76-9CA1-98A5247FA617}" access=0x100001 share=0x3 options=0x0 status=0xc0000022
+2026-05-10T14:01:07.4454680Z   [stderr] [sbox-exec] broker-open: REJECTED (NtCreateFile) path="\\DEVICE\\NETBT_TCPIP_{01DB0EEE-354C-487B-BC6D-F6EB493C2D0B}" reason="non-DOS path (e.g., \Device\…)"
+2026-05-10T14:01:07.4455656Z   [stderr] [sbox-exec] denied-open: NtCreateFile path="\\DEVICE\\NETBT_TCPIP_{01DB0EEE-354C-487B-BC6D-F6EB493C2D0B}" access=0x100001 share=0x3 options=0x0 status=0xc0000022
+2026-05-10T14:01:07.4456729Z   [stderr] [sbox-exec] broker-open: REJECTED (NtCreateFile) path="\\DEVICE\\NETBT_TCPIP_{305476DB-7472-4C76-9CA1-98A5247FA617}" reason="non-DOS path (e.g., \Device\…)"
+2026-05-10T14:01:07.4457705Z   [stderr] [sbox-exec] denied-open: NtCreateFile path="\\DEVICE\\NETBT_TCPIP_{305476DB-7472-4C76-9CA1-98A5247FA617}" access=0x100001 share=0x3 options=0x0 status=0xc0000022
+2026-05-10T14:01:07.4458481Z   [stderr] [sbox-exec] target exit=0x0
+2026-05-10T14:01:07.4458794Z (pass) windows sandbox > bash (msys2) prints hello [406.00ms]

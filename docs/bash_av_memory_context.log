@@ -1,0 +1,124 @@
+
+************* Preparing the environment for Debugger Extensions Gallery repositories **************
+   ExtensionRepository : Implicit
+   UseExperimentalFeatureForNugetShare : true
+   AllowNugetExeUpdate : true
+   NonInteractiveNuget : true
+   AllowNugetMSCredentialProviderInstall : true
+   AllowParallelInitializationOfLocalRepositories : true
+
+   EnableRedirectToV8JsProvider : false
+
+   -- Configuring repositories
+      ----> Repository : LocalInstalled, Enabled: true
+      ----> Repository : UserExtensions, Enabled: true
+
+>>>>>>>>>>>>> Preparing the environment for Debugger Extensions Gallery repositories completed, duration 0.000 seconds
+
+************* Waiting for Debugger Extensions Gallery to Initialize **************
+
+>>>>>>>>>>>>> Waiting for Debugger Extensions Gallery to Initialize completed, duration 0.031 seconds
+   ----> Repository : UserExtensions, Enabled: true, Packages count: 0
+   ----> Repository : LocalInstalled, Enabled: true, Packages count: 28
+
+Microsoft (R) Windows Debugger Version 10.0.26100.7705 ARM64
+Copyright (c) Microsoft Corporation. All rights reserved.
+
+*** wait with pending attach
+
+************* Path validation summary **************
+Response                         Time (ms)     Location
+Deferred                                       srv*
+Symbol search path is: srv*
+Executable search path is: 
+ModLoad: 00000272`2b800000 00000272`2ba6a000   bash.exe
+ModLoad: 00007ffc`0d8d0000 00007ffc`0dd03000   ntdll.dll
+(1c18.15f8): Break instruction exception - code 80000003 (first chance)
+ntdll!DbgBreakPoint:
+00007ffc`0da44e60 d43e0000 brk         #0xF000
+0:001:ARM64EC> cdb: Reading initial command 'sxd ld; sxd ud; sxd ibp; sxe c0000005; g; g; .echo ===AV===; .lastevent; .echo ===INSN===; u rip-10 rip+10; .echo ===CTX===; .exr -1; .echo ===VPROT_RDX===; !vprot @rdx; .echo ===VPROT_NEAR===; !address @rdx; .echo ===PRIORS===; ub rip 8; .echo ===STACK_DETAIL===; kn 40; .echo ===END===; qd'
+ModLoad: 00007ffc`09fb0000 00007ffc`0a17d000   C:\WINDOWS\System32\xtajit64se.dll
+ModLoad: 00007ffc`0d2e0000 00007ffc`0d448000   C:\WINDOWS\System32\KERNEL32.DLL
+ModLoad: 00007ffc`07b60000 00007ffc`08220000   C:\WINDOWS\System32\KERNELBASE.dll
+ModLoad: 00007ffc`07390000 00007ffc`07495000   C:\WINDOWS\SYSTEM32\apphelp.dll
+ModLoad: 00007ffc`0d040000 00007ffc`0d2b9000   C:\WINDOWS\System32\USER32.dll
+ModLoad: 00007ffc`07af0000 00007ffc`07b51000   C:\WINDOWS\System32\win32u.dll
+ModLoad: 00000272`31450000 00000272`317b0000   C:\Program Files\Git\usr\bin\msys-2.0.dll
+ModLoad: 00007ffc`0baf0000 00007ffc`0bb55000   C:\WINDOWS\System32\GDI32.dll
+ModLoad: 00007ffc`099f0000 00007ffc`09bd6000   C:\WINDOWS\System32\gdi32full.dll
+Unload module C:\Program Files\Git\usr\bin\msys-2.0.dll at 00000272`31450000
+ModLoad: 00007ffc`08540000 00007ffc`08699000   C:\WINDOWS\System32\msvcp_win.dll
+ModLoad: 00007ffc`077c0000 00007ffc`079e8000   C:\WINDOWS\System32\ucrtbase.dll
+ModLoad: 00000272`31520000 00000272`31880000   C:\Program Files\Git\usr\bin\msys-2.0.dll
+(1c18.1a08): Break instruction exception - code 80000003 (first chance)
+cYgFFFFFFFF 272317A34A0 0ModLoad: 00007ffc`0c340000 00007ffc`0c484000   C:\WINDOWS\System32\advapi32.dll
+ModLoad: 00007ffc`0d450000 00007ffc`0d598000   C:\WINDOWS\System32\msvcrt.dll
+ModLoad: 00007ffc`0c4e0000 00007ffc`0c600000   C:\WINDOWS\System32\sechost.dll
+ModLoad: 00007ffc`0a1b0000 00007ffc`0a3b3000   C:\WINDOWS\System32\RPCRT4.dll
+ModLoad: 00007ffc`06420000 00007ffc`06438000   C:\WINDOWS\SYSTEM32\CRYPTBASE.DLL
+ModLoad: 00007ffc`079f0000 00007ffc`07ae3000   C:\WINDOWS\System32\bcryptPrimitives.dll
+(1c18.1a08): Access violation - code c0000005 (first chance)
+First chance exceptions are reported before any exception handling.
+This exception may be expected and handled.
+===AV===
+Last event: 1c18.1a08: Access violation - code c0000005 (first chance)
+  debugger time: Sun May 10 20:20:55.486 2026 (UTC - 4:00)
+===INSN===
+msys_2_0!alloca+0x1e0a:
+00000272`3171369a 0000            add     byte ptr [rax],al
+00000272`3171369c 4889059dce0200  mov     qword ptr [msys_2_0!reent_data+0xe40 (00000272`31740540)],rax
+00000272`317136a3 488d0506770000  lea     rax,[msys_2_0!abort+0x6e30 (00000272`3171adb0)]
+00000272`317136aa f6420108        test    byte ptr [rdx+1],8
+00000272`317136ae 488d15bb780000  lea     rdx,[msys_2_0!abort+0x6ff0 (00000272`3171af70)]
+00000272`317136b5 480f45c2        cmovne  rax,rdx
+00000272`317136b9 48890588ce0200  mov     qword ptr [msys_2_0!reent_data+0xe48 (00000272`31740548)],rax
+===CTX===
+ExceptionAddress: 00000272317136aa (msys_2_0!alloca+0x0000000000001e1a)
+   ExceptionCode: c0000005 (Access violation)
+  ExceptionFlags: 00000000
+NumberParameters: 2
+   Parameter[0]: 0000000000000000
+   Parameter[1]: 00000002102fb981
+Attempt to read from address 00000002102fb981
+===VPROT_RDX===
+BaseAddress:       00000002102fb000
+AllocationBase:    0000000000000000
+RegionSize:        000000847f705000
+State:             00010000  MEM_FREE
+Protect:           00000001  PAGE_NOACCESS
+===VPROT_NEAR===
+
+Building memory map: 0000000000000000Building memory map: 000000007ffe0000Building memory map: 000000007ffe1000Building memory map: 000000868fa00000Building memory map: 000000868fa85000Building memory map: 000000868fa88000Building memory map: 000000868fa8a000Building memory map: 000000868fa90000Building memory map: 000000868fc00000Building memory map: 000000868fdf6000Building memory map: 000000868fdf9000Building memory map: 000000868fe00000Building memory map: 000000868fffb000Building memory map: 000000868fffe000Building memory map: 0000008690000000Building memory map: 00000086901fb000Building memory map: 00000086901fe000Building memory map: 0000008690200000Building memory map: 00000086903fc000Building memory map: 00000086903ff000Building memory map: 0000008690400000Building memory map: 000002722b800000Building memory map: 000002722b801000Building memory map: 000002722b908000Building memory map: 000002722b911000Building memory map: 000002722ba41000Building memory map: 000002722ba50000Building memory map: 000002722ba6a000Building memory map: 000002722ba70000Building memory map: 000002722ba71000Building memory map: 000002722ba80000Building memory map: 000002722ba90000Building memory map: 000002722baba000Building memory map: 000002722bac0000Building memory map: 000002722bac1000Building memory map: 000002722bad0000Building memory map: 000002722bad4000Building memory map: 000002722bae0000Building memory map: 000002722bae1000Building memory map: 000002722baf0000Building memory map: 000002722baf2000Building memory map: 000002722bb00000Building memory map: 000002722bb11000Building memory map: 000002722bb20000Building memory map: 000002722bb31000Building memory map: 000002722bb40000Building memory map: 000002722bb43000Building memory map: 000002722bb50000Building memory map: 000002722bb59000Building memory map: 000002722bb60000Building memory map: 000002722bb69000Building memory map: 000002722bb70000Building memory map: 000002722bb75000Building memory map: 000002722bb80000Building memory map: 000002722bb85000Building memory map: 000002722bb90000Building memory map: 000002722bb91000Building memory map: 000002722bba0000Building memory map: 000002722bba1000Building memory map: 000002722bbb0000Building memory map: 000002722bbbf000Building memory map: 000002722bbc0000Building memory map: 000002722bc6f000Building memory map: 000002722bcc0000Building memory map: 000002722bcc1000Building memory map: 000002722bcd0000Building memory map: 000002722bcd1000Building memory map: 000002722bcd6000Building memory map: 000002722bce0000Building memory map: 000002722bce1000Building memory map: 000002722bcf0000Building memory map: 000002722bcf1000Building memory map: 000002722bd00000Building memory map: 000002722bd01000Building memory map: 000002722bd10000Building memory map: 000002722bd11000Building memory map: 000002722bd20000Building memory map: 000002722bd38000Building memory map: 000002722be20000Building memory map: 000002722bf20000Building memory map: 000002722bf30000Building memory map: 000002722bf40000Building memory map: 000002722c020000Building memory map: 0000027230a20000Building memory map: 0000027230aa1000Building memory map: 0000027230ab0000Building memory map: 0000027230b31000Building memory map: 0000027230b40000Building memory map: 0000027230bc1000Building memory map: 0000027230bd0000Building memory map: 0000027230c51000Building memory map: 0000027230c60000Building memory map: 0000027230ce1000Building memory map: 0000027230cf0000Building memory map: 0000027230d71000Building memory map: 0000027230d80000Building memory map: 0000027230e4e000Building memory map: 0000027230e50000Building memory map: 0000027231074000Building memory map: 0000027231080000Building memory map: 00000272310c1000Building memory map: 00000272310c4000Building memory map: 00000272310c8000Building memory map: 00000272310c9000Building memory map: 00000272310ca000Building memory map: 00000272310d0000Building memory map: 0000027231100000Building memory map: 0000027231101000Building memory map: 0000027231102000Building memory map: 0000027231110000Building memory map: 000002723118a000Building memory map: 0000027231190000Building memory map: 00000272311f5000Building memory map: 0000027231200000Building memory map: 0000027231210000Building memory map: 0000027231213000Building memory map: 0000027231220000Building memory map: 00000272312f3000Building memory map: 0000027231300000Building memory map: 0000027231311000Building memory map: 0000027231320000Building memory map: 0000027231331000Building memory map: 0000027231340000Building memory map: 0000027231341000Building memory map: 0000027231350000Building memory map: 0000027231380000Building memory map: 00000272313c1000Building memory map: 00000272313c4000Building memory map: 00000272313c8000Building memory map: 00000272313c9000Building memory map: 00000272313ca000Building memory map: 00000272313d0000Building memory map: 00000272313d1000Building memory map: 00000272313e0000Building memory map: 000002723141b000Building memory map: 0000027231420000Building memory map: 0000027231434000Building memory map: 0000027231440000Building memory map: 0000027231441000Building memory map: 0000027231450000Building memory map: 0000027231480000Building memory map: 00000272314c1000Building memory map: 00000272314c4000Building memory map: 00000272314c8000Building memory map: 00000272314c9000Building memory map: 00000272314ca000Building memory map: 00000272314d0000Building memory map: 00000272314e4000Building memory map: 00000272314f0000Building memory map: 000002723151b000Building memory map: 0000027231520000Building memory map: 0000027231521000Building memory map: 0000027231722000Building memory map: 0000027231726000Building memory map: 0000027231739000Building memory map: 000002723173a000Building memory map: 000002723173b000Building memory map: 000002723173f000Building memory map: 0000027231742000Building memory map: 0000027231751000Building memory map: 0000027231763000Building memory map: 0000027231792000Building memory map: 0000027231793000Building memory map: 00000272317a2000Building memory map: 00000272317a5000Building memory map: 0000027231832000Building memory map: 0000027231833000Building memory map: 000002723183a000Building memory map: 000002723183b000Building memory map: 0000027231842000Building memory map: 0000027231843000Building memory map: 0000027231852000Building memory map: 0000027231855000Building memory map: 0000027231856000Building memory map: 0000027231858000Building memory map: 0000027231859000Building memory map: 000002723185b000Building memory map: 000002723186d000Building memory map: 000002723187a000Building memory map: 0000027231880000Building memory map: 0000027231881000Building memory map: 0000027231890000Building memory map: 0000027231891000Building memory map: 00000272318a0000Building memory map: 00000272318a1000Building memory map: 00000272318b0000Building memory map: 00000272318d8000Building memory map: 00000272318e0000Building memory map: 00000272318f4000Building memory map: 0000027231900000Building memory map: 0000027231928000Building memory map: 0000027231930000Building memory map: 0000027231958000Building memory map: 0000027231960000Building memory map: 0000027231974000Building memory map: 0000027231980000Building memory map: 0000027231994000Building memory map: 0000027231b00000Building memory map: 0000027231b05000Building memory map: 0000027231b10000Building memory map: 0000027231b24000Building memory map: 00007df45b470000Building memory map: 00007df45b47e000Building memory map: 00007df45b47f000Building memory map: 00007df4602b5000Building memory map: 00007df4602b7000Building memory map: 00007df55b3db000Building memory map: 00007df55b3f0000Building memory map: 00007df55b3f2000Building memory map: 00007df55b470000Building memory map: 00007ff32aab0000Building memory map: 00007ff32aab5000Building memory map: 00007ff32abb0000Building memory map: 00007ff32abb4000Building memory map: 00007ff32abc0000Building memory map: 00007ff42abe0000Building memory map: 00007ff52ac00000Building memory map: 00007ff52cc00000Building memory map: 00007ff52cc01000Building memory map: 00007ff52cc10000Building memory map: 00007ff52cc11000Building memory map: 00007ffc06420000Building memory map: 00007ffc06421000Building memory map: 00007ffc0642b000Building memory map: 00007ffc06432000Building memory map: 00007ffc06433000Building memory map: 00007ffc06438000Building memory map: 00007ffc0643c000Building memory map: 00007ffc07390000Building memory map: 00007ffc07391000Building memory map: 00007ffc07444000Building memory map: 00007ffc07473000Building memory map: 00007ffc07476000Building memory map: 00007ffc07495000Building memory map: 00007ffc07497000Building memory map: 00007ffc07499000Building memory map: 00007ffc077c0000Building memory map: 00007ffc077c1000Building memory map: 00007ffc07964000Building memory map: 00007ffc079ce000Building memory map: 00007ffc079cf000Building memory map: 00007ffc079d2000Building memory map: 00007ffc079df000Building memory map: 00007ffc079e0000Building memory map: 00007ffc079e8000Building memory map: 00007ffc079ea000Building memory map: 00007ffc079ec000Building memory map: 00007ffc079f0000Building memory map: 00007ffc079f1000Building memory map: 00007ffc07ab9000Building memory map: 00007ffc07ad9000Building memory map: 00007ffc07adb000Building memory map: 00007ffc07ae3000Building memory map: 00007ffc07ae5000Building memory map: 00007ffc07ae7000Building memory map: 00007ffc07af0000Building memory map: 00007ffc07af1000Building memory map: 00007ffc07b18000Building memory map: 00007ffc07b44000Building memory map: 00007ffc07b45000Building memory map: 00007ffc07b51000Building memory map: 00007ffc07b55000Building memory map: 00007ffc07b60000Building memory map: 00007ffc07b61000Building memory map: 00007ffc07e68000Building memory map: 00007ffc0817c000Building memory map: 00007ffc08182000Building memory map: 00007ffc08183000Building memory map: 00007ffc08184000Building memory map: 00007ffc08185000Building memory map: 00007ffc08188000Building memory map: 00007ffc08189000Building memory map: 00007ffc0818c000Building memory map: 00007ffc08190000Building memory map: 00007ffc08220000Building memory map: 00007ffc08222000Building memory map: 00007ffc08224000Building memory map: 00007ffc08540000Building memory map: 00007ffc08541000Building memory map: 00007ffc085f8000Building memory map: 00007ffc08674000Building memory map: 00007ffc08675000Building memory map: 00007ffc0868a000Building memory map: 00007ffc08699000Building memory map: 00007ffc0869b000Building memory map: 00007ffc0869d000Building memory map: 00007ffc099f0000Building memory map: 00007ffc099f1000Building memory map: 00007ffc09b36000Building memory map: 00007ffc09bab000Building memory map: 00007ffc09bad000Building memory map: 00007ffc09bb4000Building memory map: 00007ffc09bd6000Building memory map: 00007ffc09bd8000Building memory map: 00007ffc09bda000Building memory map: 00007ffc09fb0000Building memory map: 00007ffc09fb1000Building memory map: 00007ffc0a0d9000Building memory map: 00007ffc0a16b000Building memory map: 00007ffc0a16d000Building memory map: 00007ffc0a17d000Building memory map: 00007ffc0a181000Building memory map: 00007ffc0a1b0000Building memory map: 00007ffc0a1b1000Building memory map: 00007ffc0a353000Building memory map: 00007ffc0a397000Building memory map: 00007ffc0a39a000Building memory map: 00007ffc0a3b3000Building memory map: 00007ffc0a3b5000Building memory map: 00007ffc0a3b7000Building memory map: 00007ffc0baf0000Building memory map: 00007ffc0baf1000Building memory map: 00007ffc0bb18000Building memory map: 00007ffc0bb4a000Building memory map: 00007ffc0bb4b000Building memory map: 00007ffc0bb55000Building memory map: 00007ffc0bb57000Building memory map: 00007ffc0bb59000Building memory map: 00007ffc0c340000Building memory map: 00007ffc0c341000Building memory map: 00007ffc0c409000Building memory map: 00007ffc0c46e000Building memory map: 00007ffc0c46f000Building memory map: 00007ffc0c470000Building memory map: 00007ffc0c472000Building memory map: 00007ffc0c473000Building memory map: 00007ffc0c475000Building memory map: 00007ffc0c484000Building memory map: 00007ffc0c486000Building memory map: 00007ffc0c488000Building memory map: 00007ffc0c4e0000Building memory map: 00007ffc0c4e1000Building memory map: 00007ffc0c5aa000Building memory map: 00007ffc0c5ee000Building memory map: 00007ffc0c5ef000Building memory map: 00007ffc0c5f0000Building memory map: 00007ffc0c5f3000Building memory map: 00007ffc0c600000Building memory map: 00007ffc0c602000Building memory map: 00007ffc0c604000Building memory map: 00007ffc0d040000Building memory map: 00007ffc0d041000Building memory map: 00007ffc0d17a000Building memory map: 00007ffc0d1ba000Building memory map: 00007ffc0d1bb000Building memory map: 00007ffc0d1be000Building memory map: 00007ffc0d2b9000Building memory map: 00007ffc0d2bb000Building memory map: 00007ffc0d2bd000Building memory map: 00007ffc0d2e0000Building memory map: 00007ffc0d2e1000Building memory map: 00007ffc0d3d7000Building memory map: 00007ffc0d434000Building memory map: 00007ffc0d437000Building memory map: 00007ffc0d448000Building memory map: 00007ffc0d44a000Building memory map: 00007ffc0d44c000Building memory map: 00007ffc0d450000Building memory map: 00007ffc0d451000Building memory map: 00007ffc0d553000Building memory map: 00007ffc0d584000Building memory map: 00007ffc0d58a000Building memory map: 00007ffc0d58b000Building memory map: 00007ffc0d58c000Building memory map: 00007ffc0d598000Building memory map: 00007ffc0d59a000Building memory map: 00007ffc0d59c000Building memory map: 00007ffc0d8d0000Building memory map: 00007ffc0d8d1000Building memory map: 00007ffc0dbd6000Building memory map: 00007ffc0dc53000Building memory map: 00007ffc0dc5b000Building memory map: 00007ffc0dc5e000Building memory map: 00007ffc0dc5f000Building memory map: 00007ffc0dc60000Building memory map: 00007ffc0dc65000Building memory map: 00007ffc0dd03000Building memory map: 00007ffc0dd05000Building memory map: 00007ffc0dd07000                                     
+Mapping file section regions...
+Mapping module regions...
+Mapping PEB regions...
+Mapping TEB and stack regions...
+Mapping heap regions...
+Mapping page heap regions...
+Mapping other regions...
+Mapping stack trace database regions...
+Mapping activation context regions...
+
+Usage:                  Free
+Base Address:           00000000`7ffe1000
+End Address:            00000086`8fa00000
+Region Size:            00000086`0fa1f000 ( 536.244 GB)
+State:                  00010000          MEM_FREE
+Protect:                00000001          PAGE_NOACCESS
+Type:                   <info not present at the target>
+
+
+Content source: 0 (invalid), length: 847f704680
+===PRIORS===
+                                                                                                                                                                                                                                                           ^ Range error in 'sxd ld; sxd ud; sxd ibp; sxe c0000005; g; g; .echo ===AV===; .lastevent; .echo ===INSN===; u rip-10 rip+10; .echo ===CTX===; .exr -1; .echo ===VPROT_RDX===; !vprot @rdx; .echo ===VPROT_NEAR===; !address @rdx; .echo ===PRIORS===; ub rip 8; .echo ===STACK_DETAIL===; kn 40; .echo ===END===; qd'
+0:000:AMD64> NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\arm64\Visualizers\atlmfc.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\arm64\Visualizers\ObjectiveC.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\arm64\Visualizers\concurrency.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\arm64\Visualizers\cpp_rest.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\arm64\Visualizers\stl.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\arm64\Visualizers\Windows.Data.Json.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\arm64\Visualizers\Windows.Devices.Geolocation.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\arm64\Visualizers\Windows.Devices.Sensors.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\arm64\Visualizers\Windows.Media.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\arm64\Visualizers\windows.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\arm64\Visualizers\winrt.natvis'

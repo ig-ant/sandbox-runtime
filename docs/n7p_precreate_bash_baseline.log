@@ -1,0 +1,246 @@
+warning: unused variable: `temp_dir`
+   --> examples\smoke_bash.rs:219:9
+    |
+219 |         temp_dir: &str, bash_smoke_dir: &PathBuf, ssh_dir: &std::path::Path,
+    |         ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_temp_dir`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `sbox-exec` (example "smoke_bash") generated 1 warning (run `cargo fix --example "smoke_bash" -p sbox-exec` to apply 1 suggestion)
+    Finished `release` profile [optimized] target(s) in 0.04s
+     Running `C:\Users\ig\AppData\Local\Temp\winsbox-target\release\examples\smoke_bash.exe`
+[smoke_bash] broker = Y:\vendor\winsbox\x64\sbox-exec.exe
+[smoke_bash] cdylib = Y:\vendor\winsbox\x64\ac_cdylib.dll
+[smoke_bash] bash = C:\Program Files\Git\usr\bin\bash.exe
+[smoke_bash] user_profile = C:\Users\ig
+[smoke_bash] temp_dir     = C:\Users\ig\AppData\Local\Temp
+[smoke_bash] ssh_dir      = C:\Users\ig\.ssh (exists=true)
+[smoke_bash] ─── Test 1: bash -c 'echo hello && /usr/bin/uname -a' ───
+[smoke_bash] broker exited code=Some(-1073741819) (460 ms)
+--- stdout ---
+--- stderr ---
+[sbox-exec] AppContainer sid=S-1-15-2-1042877285-728242556-2716852200-4266365861-1513398043-1098811045-1806164921 folder=C:\Users\ig\AppData\Local\Packages\srt.ac.d4f626df492ee1e8\AC
+[sbox-exec] policy-stamp: hash unchanged (0x648c0c9ee819af17); skipping apply
+[sbox-exec] auto-toolchain: detected 10 tooling dirs: C:\Program Files\Git\clangarm64\bin, C:\Program Files\Git\usr\local\bin, C:\Program Files\Git\usr\bin, C:\Program Files\Parallels\Parallels Tools\Applications, C:\Program Files\Git\cmd, C:\Program Files (x86)\Windows Kits\10\Windows Performance Toolkit, C:\Program Files\nodejs, C:\Users\ig\.cargo\bin, C:\Program Files\Git\usr\bin\vendor_perl, C:\Program Files\Git\usr\bin\core_perl
+[sbox-exec] broker-open: enabled=true allow_read=3 deny_read=1 allow_write=1 deny_write=0 auto_toolchain=10
+[sbox-exec] Job created
+[sbox-exec] no proxy ports in policy; skipping bridge
+[sbox-exec] broker tokens: primary=LockdownSpec { keep_enabled: ["S-1-1-0", "S-1-5-11", "S-1-5-32-545"] }+lowbox, initial=USER_RESTRICTED_SAME_ACCESS+lowbox, IL=0x1000; ac_bno=\Sessions\1\AppContainerNamedObjects\S-1-15-2-1042877285-728242556-2716852200-4266365861-1513398043-1098811045-1806164921
+[sbox-exec] launching target (cwd=C:\Users\ig\AppData\Local\Temp\bash-smoke): "C:\Program Files\Git\usr\bin\bash.exe" -c "echo hello && /usr/bin/uname -a"
+[sbox-exec] target pid=976
+[acl_stamper] WARN TreeSetNamedSecurityInfoW("\\\\?\\UNC\\Mac\\sandbox-runtime\\vendor\\winsbox\\x64") returned ERROR_ACCESS_DENIED — admin-protected dir, skipping (path may already be AC-readable via inherited ALL APPLICATION PACKAGES; verify with `icacls`)
+[acl_stamper] WARN TreeSetNamedSecurityInfoW("\\\\?\\UNC\\Mac\\sandbox-runtime\\vendor\\winsbox\\x64") returned ERROR_ACCESS_DENIED — admin-protected dir, skipping (path may already be AC-readable via inherited ALL APPLICATION PACKAGES; verify with `icacls`)
+[sbox-exec] cdylib stamp on \\?\UNC\Mac\sandbox-runtime\vendor\winsbox\x64: 0 stamped, 0 skipped (idempotent), 0 skipped (AC accessible), 2 soft-failed (access denied), 0 soft-failed (other), 2 ms
+[sbox-exec] cdylib: ac_bno=\Sessions\1\AppContainerNamedObjects\S-1-15-2-1042877285-728242556-2716852200-4266365861-1513398043-1098811045-1806164921
+[sbox-exec] manual_map: cdylib mapped at 0x190000000 (0xa000 bytes), IPC @ 0x1900070c0, delta=0x0
+[sbox-exec] cdylib manual-mapped: base=0x190000000 size=0xa000 dll=\\?\UNC\Mac\sandbox-runtime\vendor\winsbox\x64\ac_cdylib.dll
+[sbox-exec] cdylib reported back: pid=2188 version=manual init=0xACDC0001 (manual-map)
+[sbox-exec] cdylib hook VAs: section=0x190003450 dirobj_create=0x190002420 dirobj_open=0x1900030a0 pipe=0x1900028b0 cpw=0x190001e20 attr=0x190003560 fullattr=0x190003700
+[sbox-exec] interception: GetModuleHandle(ntdll.dll) handle=0x7ffc0d8d0000 machine=0x8664 path=C:\WINDOWS\SYSTEM32\ntdll.dll
+[sbox-exec] interception: NtCreateNamedPipeFile @ 0x7ffc0dbbe400 → cdylib @ 0x1900028b0 (slim)
+[sbox-exec] interception: NtOpenSection @ 0x7ffc0dbbd380 → cdylib @ 0x190003450 (slim)
+[sbox-exec] interception: NtCreateDirectoryObject @ 0x7ffc0dbbe220 → cdylib @ 0x190002420 (slim)
+[sbox-exec] interception: NtOpenDirectoryObject @ 0x7ffc0dbbd7a0 → cdylib @ 0x1900030a0 (slim)
+[sbox-exec] interception: NtQueryAttributesFile @ 0x7ffc0dbbd440 → cdylib @ 0x190003560 (slim)
+[sbox-exec] interception: NtQueryFullAttributesFile @ 0x7ffc0dbbf6c0 → cdylib @ 0x190003700 (slim)
+[sbox-exec] cdylib ntdll hooks patched pre-resume; passthrough thunks: section=0x7ff52f3b0000 dirobj_create=0x7ff52f3a0000 dirobj_open=0x7ff52f390000 pipe=0x7ff52f3c0000 denylog_create=0x0 denylog_open=0x0 attr=0x7ff52f380000 fullattr=0x7ff52f370000 (log_denies=true trace_mode=true)
+[sbox-exec] interception: NtCreateFile @ 0x7ffc0dbbd740 → cdylib @ 0x190002600 (slim)
+[sbox-exec] interception: NtOpenFile @ 0x7ffc0dbbd300 → cdylib @ 0x190003200 (slim)
+[sbox-exec] interception: NtDeviceIoControlFile @ 0x7ffc0dbbcd80 → cdylib @ 0x190002e10 (slim)
+[sbox-exec] interception: NtAlpcConnectPort @ 0x7ffc0dbbdc00 → cdylib @ 0x190002230 (slim)
+[sbox-exec] interception: NtAlpcSendWaitReceivePort @ 0x7ffc0dbbde60 → cdylib @ 0x190002310 (slim)
+[sbox-exec] interception: NtOpenKey @ 0x7ffc0dbbcee0 → cdylib @ 0x190003300 (slim)
+[sbox-exec] interception: NtOpenKeyEx @ 0x7ffc0dbbf200 → cdylib @ 0x190003290 (slim)
+[sbox-exec] interception: NtQueryValueKey @ 0x7ffc0dbbcf80 → cdylib @ 0x190003930 (slim)
+[sbox-exec] interception: NtCreateEvent @ 0x7ffc0dbbd5a0 → cdylib @ 0x190002450 (slim)
+[sbox-exec] interception: NtOpenEvent @ 0x7ffc0dbbd4a0 → cdylib @ 0x1900030d0 (slim)
+[sbox-exec] interception: NtCreateMutant @ 0x7ffc0dbbe3e0 → cdylib @ 0x190002840 (slim)
+[sbox-exec] interception: NtOpenMutant @ 0x7ffc0dbbf280 → cdylib @ 0x190003370 (slim)
+[sbox-exec] interception: NtMapViewOfSection @ 0x7ffc0dbbd1a0 → cdylib @ 0x190002fd0 (slim)
+[sbox-exec] interception: NtCreateSection @ 0x7ffc0dbbd5e0 → cdylib @ 0x190002d60 (slim)
+[sbox-exec] interception: NtAllocateVirtualMemory @ 0x7ffc0dbbcfa0 → cdylib @ 0x1900021a0 (slim)
+[sbox-exec] interception(trace): cdylib export missing for NtOpenSection; skip
+[sbox-exec] interception: NtQueryInformationProcess @ 0x7ffc0dbbcfc0 → cdylib @ 0x1900037b0 (slim)
+[sbox-exec] interception: NtOpenProcessToken @ 0x7ffc0dbbf300 → cdylib @ 0x1900033e0 (slim)
+[sbox-exec] interception: NtOpenThreadToken @ 0x7ffc0dbbd120 → cdylib @ 0x1900034f0 (slim)
+[sbox-exec] interception: NtQueryInformationToken @ 0x7ffc0dbbd0c0 → cdylib @ 0x190003830 (slim)
+[sbox-exec] interception: NtQuerySystemInformation @ 0x7ffc0dbbd360 → cdylib @ 0x1900038b0 (slim)
+[sbox-exec] interception: NtReadVirtualMemory @ 0x7ffc0dbbd480 → cdylib @ 0x1900039d0 (slim)
+[sbox-exec] interception: NtClose @ 0x7ffc0dbbce80 → cdylib @ 0x1900023c0 (slim)
+[sbox-exec] interception(trace): cdylib export missing for NtCreateNamedPipeFile; skip
+[sbox-exec] interception: NtFsControlFile @ 0x7ffc0dbbd3c0 → cdylib @ 0x190002ef0 (slim)
+[sbox-exec] interception: NtSetInformationFile @ 0x7ffc0dbbd180 → cdylib @ 0x190003a50 (slim)
+[sbox-exec] interception: NtQueryDirectoryFile @ 0x7ffc0dbbd340 → cdylib @ 0x190003610 (slim)
+[sbox-exec] interception: NtCreateKey @ 0x7ffc0dbbd040 → cdylib @ 0x1900026e0 (slim)
+[sbox-exec] interception: NtCreateMailslotFile @ 0x7ffc0dbbe3c0 → cdylib @ 0x190002780 (slim)
+[sbox-exec] interception: NtUnmapViewOfSection @ 0x7ffc0dbbd1e0 → cdylib @ 0x190003ad0 (slim)
+[sbox-exec] cdylib trace hooks patched pre-resume (28/30 of TRACE_SYSCALL_NAMES)
+[sbox-exec] cdylib serve_ipc thread spawned (pre-resume)
+[sbox-exec] entry_trampoline: rtlstart=0x7ffc0daec3a0 → stub @ 0x7ff52f1a0000
+[sbox-trace] tid=0 NtMapViewOfSection sect_h=0x98 proc_h=0xffffffffffffffff prot=0x80 -> 0x00000000
+[sbox-trace] tid=0 NtMapViewOfSection sect_h=0x9c proc_h=0xffffffffffffffff prot=0x80 -> 0x00000000
+[sbox-trace] tid=0 NtQuerySystemInformation class=50 buf_len=8 -> 0x00000000
+[sbox-trace] tid=0 NtQuerySystemInformation class=0 buf_len=64 -> 0x00000000
+[sbox-trace] tid=0 NtCreateSection name="(null)" access=0xf001f prot=0x4 attr=0x8000000 -> 0x00000000
+[sbox-trace] tid=0 NtMapViewOfSection sect_h=0x98 proc_h=0xffffffffffffffff prot=0x2 -> 0x00000000
+[sbox-trace] tid=0 NtCreateFile path="\\Connect" access=0x12019f disp=0x2 -> 0x00000000
+[sbox-trace] tid=0 NtDeviceIoControlFile h=0x98 ioctl=0x00500023 in_len=0 out_len=8 -> 0x00000000
+[sbox-trace] tid=0 NtDeviceIoControlFile h=0x98 ioctl=0x00500016 in_len=48 out_len=0 -> 0xc00700bb
+[sbox-trace] [DENY] tid=0 NtOpenThreadToken thread_h=0xfffffffffffffffe access=0x4 as_self=1 -> 0xc0000022
+[sbox-trace] [DENY] tid=0 NtOpenThreadToken thread_h=0xfffffffffffffffe access=0x4 as_self=1 -> 0xc0000022
+[sbox-trace] [DENY] tid=0 NtOpenThreadToken thread_h=0xfffffffffffffffe access=0x4 as_self=1 -> 0xc0000022
+[sbox-trace] [DENY] tid=0 NtOpenThreadToken thread_h=0xfffffffffffffffe access=0x4 as_self=1 -> 0xc0000022
+[sbox-trace] tid=0 NtQuerySystemInformation class=0 buf_len=64 -> 0x00000000
+[sbox-trace] tid=0 NtOpenKey key="\\Registry\\Machine\\System\\CurrentControlSet\\Control\\FileSystem\\" access=0x20019 -> 0x00000000
+[sbox-trace] tid=0 NtQueryValueKey key_h=0xbc value="LongPathsEnabled" class=2 buf_len=20 -> 0x00000000
+[sbox-trace] tid=0 NtClose h=0xbc -> 0x00000000
+[sbox-trace] tid=0 NtOpenFile path="\\??\\C:\\WINDOWS\\SYSTEM32\\apphelp.dll" access=0x100021 opts=0x60 -> 0x00000000
+[sbox-trace] tid=0 NtCreateSection name="(null)" access=0xd prot=0x10 attr=0x1000000 -> 0x00000000
+[sbox-trace] tid=0 NtOpenFile path="\\Device\\SrpDevice" access=0x1 opts=0x0 -> 0x00000000
+[sbox-trace] tid=0 NtMapViewOfSection sect_h=0xc4 proc_h=0xffffffffffffffff prot=0x80 -> 0x00000000
+[sbox-trace] tid=0 NtOpenKey key="\\Registry\\Machine\\Software\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags" access=0x1 -> 0x00000000
+[sbox-trace] tid=0 NtQueryValueKey key_h=0xc8 value="LogFlags" class=2 buf_len=20 -> 0xc0000034
+[sbox-trace] tid=0 NtClose h=0xc8 -> 0x00000000
+[sbox-trace] tid=0 NtOpenKey key="\\Registry\\Machine\\OSDATA\\Software\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags" access=0x1 -> 0xc0000034
+[sbox-trace] tid=0 NtOpenKey key="\\Registry\\Machine\\Software\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags" access=0x1 -> 0x00000000
+[sbox-trace] tid=0 NtQueryValueKey key_h=0xdc value="ShowDebugInfo" class=2 buf_len=20 -> 0xc0000034
+[sbox-trace] tid=0 NtClose h=0xdc -> 0x00000000
+[sbox-trace] tid=0 NtOpenFile path="\\??\\C:\\Program Files\\Git\\usr\\bin\\bash.exe" access=0x20000 opts=0x0 -> 0x00000000
+[sbox-trace] tid=0 NtClose h=0xe0 -> 0x00000000
+[sbox-trace] tid=0 NtOpenFile path="\\??\\C:\\WINDOWS\\SYSTEM32\\ntdll.dll" access=0x20000 opts=0x0 -> 0x00000000
+[sbox-trace] tid=0 NtClose h=0xdc -> 0x00000000
+[sbox-trace] tid=0 NtOpenFile path="\\??\\C:\\WINDOWS\\System32\\xtajit64se.dll" access=0x20000 opts=0x0 -> 0x00000000
+[sbox-trace] tid=0 NtClose h=0xe4 -> 0x00000000
+[sbox-trace] tid=0 NtOpenFile path="\\??\\C:\\WINDOWS\\System32\\KERNEL32.DLL" access=0x20000 opts=0x0 -> 0x00000000
+[sbox-trace] tid=0 NtClose h=0xe4 -> 0x00000000
+[sbox-trace] tid=0 NtOpenFile path="\\??\\C:\\WINDOWS\\System32\\KERNELBASE.dll" access=0x20000 opts=0x0 -> 0x00000000
+[sbox-trace] tid=0 NtClose h=0xe8 -> 0x00000000
+[sbox-trace] tid=0 NtOpenKey key="\\Registry\\Machine\\Software\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags\\SdbUpdates" access=0x80000100 -> 0x00000000
+[sbox-trace] tid=0 NtQueryValueKey key_h=0xe8 value="StagedDelete_sysmain.sdb" class=2 buf_len=0 -> 0xc0000034
+[sbox-trace] tid=0 NtClose h=0xe8 -> 0x00000000
+[sbox-trace] tid=0 NtOpenKey key="\\Registry\\Machine\\Software\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags\\SdbUpdates" access=0x80000100 -> 0x00000000
+[sbox-trace] tid=0 NtQueryValueKey key_h=0xec value="sysmain.sdb" class=2 buf_len=0 -> 0xc0000023
+[sbox-trace] tid=0 NtQueryValueKey key_h=0xec value="sysmain.sdb" class=2 buf_len=72 -> 0x00000000
+[sbox-trace] tid=0 NtQueryValueKey key_h=0xec value="MergeVer_sysmain.sdb" class=2 buf_len=20 -> 0x00000000
+[sbox-trace] tid=0 NtQueryValueKey key_h=0xec value="MergeVer" class=2 buf_len=20 -> 0x00000000
+[sbox-trace] tid=0 NtQueryValueKey key_h=0xec value="MinMergeVer" class=2 buf_len=20 -> 0x00000000
+[sbox-trace] tid=0 NtOpenKey key="\\Registry\\Machine\\Software\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags\\SdbUpdates" access=0x80000100 -> 0x00000000
+[sbox-trace] tid=0 NtQueryValueKey key_h=0xf0 value="DisableDoubleQuerySdbs" class=2 buf_len=20 -> 0xc0000034
+[sbox-trace] tid=0 NtClose h=0xf0 -> 0x00000000
+[sbox-trace] tid=0 NtOpenKey key="\\Registry\\Machine\\Software\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags\\SdbUpdates\\ManifestedMergeStubSdbs" access=0x80000100 -> 0x00000000
+[sbox-trace] tid=0 NtClose h=0xe8 -> 0x00000000
+[sbox-trace] tid=0 NtClose h=0xec -> 0x00000000
+[sbox-trace] tid=0 NtCreateFile path="\\??\\C:\\WINDOWS\\AppPatch\\01DCDEACA1EDEDFD.sysmain.sdb" access=0x80100080 disp=0x1 -> 0x00000000
+[sbox-trace] tid=0 NtCreateSection name="" access=0xf0005 prot=0x2 attr=0x8000000 -> 0x00000000
+[sbox-trace] tid=0 NtMapViewOfSection sect_h=0xf0 proc_h=0xffffffffffffffff prot=0x2 -> 0x00000000
+[sbox-trace] tid=0 NtOpenKey key="\\Registry\\Machine\\Software\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags\\SdbUpdates" access=0x80000100 -> 0x00000000
+[sbox-trace] tid=0 NtQueryValueKey key_h=0xec value="DisableDoubleQuerySdbs" class=2 buf_len=20 -> 0xc0000034
+[sbox-trace] tid=0 NtClose h=0xec -> 0x00000000
+[sbox-trace] tid=0 NtOpenKey key="\\Registry\\Machine\\Software\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags\\SdbUpdates\\ManifestedMergeStubSdbs" access=0x80000100 -> 0x00000000
+[sbox-trace] tid=0 NtClose h=0xe8 -> 0x00000000
+[sbox-trace] tid=0 NtOpenKey key="\\Registry\\Machine\\Software\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags\\SdbUpdates" access=0x80000100 -> 0x00000000
+[sbox-trace] tid=0 NtQueryValueKey key_h=0xe4 value="StagedDelete_sysMerge.sdb" class=2 buf_len=0 -> 0xc0000034
+[sbox-trace] tid=0 NtClose h=0xe4 -> 0x00000000
+[sbox-trace] tid=0 NtOpenKey key="\\Registry\\Machine\\Software\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags\\SdbUpdates" access=0x80000100 -> 0x00000000
+[sbox-trace] tid=0 NtQueryValueKey key_h=0xe8 value="sysMerge.sdb" class=2 buf_len=0 -> 0xc0000034
+[sbox-trace] tid=0 NtClose h=0xe8 -> 0x00000000
+[sbox-trace] tid=0 NtOpenProcessToken proc_h=0xe4 access=0x8 -> 0x00000000
+[sbox-trace] tid=0 NtQueryInformationToken tok_h=0xdc class=39 buf_len=0 -> 0xc0000023
+[sbox-trace] tid=0 NtQueryInformationToken tok_h=0xdc class=39 buf_len=104 -> 0x00000000
+[sbox-trace] tid=0 NtClose h=0xdc -> 0x00000000
+[sbox-trace] tid=0 NtCreateFile path="\\??\\C:\\Program Files\\Git\\usr\\bin\\bash.exe" access=0x80100080 disp=0x1 -> 0x00000000
+[sbox-trace] tid=0 NtOpenKey key="\\REGISTRY\\USER\\S-1-5-21-3528996993-951074867-4239358747-1000\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Shell Folders" access=0x1 -> 0x00000000
+[sbox-trace] tid=0 NtQueryValueKey key_h=0xe8 value="Cache" class=1 buf_len=520 -> 0x00000000
+[sbox-trace] tid=0 NtClose h=0xe8 -> 0x00000000
+[sbox-trace] tid=0 NtClose h=0xdc -> 0x00000000
+[sbox-trace] tid=0 NtCreateFile path="\\??\\C:\\Program Files\\Git\\usr\\bin\\bash.exe" access=0x80100080 disp=0x1 -> 0x00000000
+[sbox-trace] tid=0 NtOpenKey key="\\REGISTRY\\USER\\S-1-5-21-3528996993-951074867-4239358747-1000\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Shell Folders" access=0x1 -> 0x00000000
+[sbox-trace] tid=0 NtQueryValueKey key_h=0xf4 value="Cache" class=1 buf_len=520 -> 0x00000000
+[sbox-trace] tid=0 NtClose h=0xf4 -> 0x00000000
+[sbox-trace] tid=0 NtClose h=0xdc -> 0x00000000
+[sbox-trace] tid=0 NtClose h=0xe4 -> 0x00000000
+[sbox-trace] [DENY] tid=0 NtOpenThreadToken thread_h=0xfffffffffffffffe access=0x4 as_self=1 -> 0xc0000022
+[sbox-trace] tid=0 NtClose h=0xe0 -> 0x00000000
+[sbox-trace] tid=0 NtClose h=0xf0 -> 0x00000000
+[sbox-trace] tid=0 NtUnmapViewOfSection proc_h=0xffffffffffffffff addr=0x7ff32cc30000 -> 0x00000000
+[sbox-trace] tid=0 NtMapViewOfSection sect_h=0xe4 proc_h=0xffffffffffffffff prot=0x80 -> 0x00000000
+[sbox-trace] tid=0 NtMapViewOfSection sect_h=0xfc proc_h=0xffffffffffffffff prot=0x80 -> 0x00000000
+[sbox-trace] tid=0 NtMapViewOfSection sect_h=0xfc proc_h=0xffffffffffffffff prot=0x80 -> 0x00000000
+[sbox-trace] tid=0 NtMapViewOfSection sect_h=0xf4 proc_h=0xffffffffffffffff prot=0x80 -> 0x00000000
+[sbox-trace] tid=0 NtMapViewOfSection sect_h=0x104 proc_h=0xffffffffffffffff prot=0x80 -> 0x00000000
+[sbox-trace] tid=0 NtMapViewOfSection sect_h=0x108 proc_h=0xffffffffffffffff prot=0x80 -> 0x00000000
+[sbox-trace] tid=0 NtOpenFile path="\\??\\C:\\Program Files\\Git\\usr\\bin\\msys-2.0.dll" access=0x100021 opts=0x60 -> 0x00000000
+[sbox-trace] tid=0 NtCreateSection name="(null)" access=0xd prot=0x10 attr=0x1000000 -> 0x00000000
+[sbox-trace] tid=0 NtOpenFile path="\\Device\\SrpDevice" access=0x1 opts=0x0 -> 0x00000000
+[sbox-trace] tid=0 NtMapViewOfSection sect_h=0xf4 proc_h=0xffffffffffffffff prot=0x80 -> 0x40000003
+[sbox-trace] tid=0 NtOpenFile path="\\??\\C:\\Program Files\\Git\\usr\\bin\\msys-2.0.dll" access=0x20000 opts=0x0 -> 0x00000000
+[sbox-trace] tid=0 NtClose h=0xfc -> 0x00000000
+[sbox-trace] tid=0 NtOpenFile path="\\??\\C:\\WINDOWS\\System32\\win32u.dll" access=0x20000 opts=0x0 -> 0x00000000
+[sbox-trace] tid=0 NtClose h=0xfc -> 0x00000000
+[sbox-trace] tid=0 NtOpenFile path="\\??\\C:\\WINDOWS\\System32\\ucrtbase.dll" access=0x20000 opts=0x0 -> 0x00000000
+[sbox-trace] tid=0 NtClose h=0xfc -> 0x00000000
+[sbox-trace] tid=0 NtOpenFile path="\\??\\C:\\WINDOWS\\System32\\msvcp_win.dll" access=0x20000 opts=0x0 -> 0x00000000
+[sbox-trace] tid=0 NtClose h=0xfc -> 0x00000000
+[sbox-trace] tid=0 NtOpenFile path="\\??\\C:\\WINDOWS\\System32\\gdi32full.dll" access=0x20000 opts=0x0 -> 0x00000000
+[sbox-trace] tid=0 NtClose h=0xfc -> 0x00000000
+[sbox-trace] tid=0 NtOpenFile path="\\??\\C:\\WINDOWS\\System32\\GDI32.dll" access=0x20000 opts=0x0 -> 0x00000000
+[sbox-trace] tid=0 NtClose h=0xf4 -> 0x00000000
+[sbox-trace] tid=0 NtOpenFile path="\\??\\C:\\WINDOWS\\System32\\USER32.dll" access=0x20000 opts=0x0 -> 0x00000000
+[sbox-trace] tid=0 NtClose h=0xf4 -> 0x00000000
+[sbox-trace] tid=0 NtQueryInformationProcess proc_h=0xffffffffffffffff class=12 buf_len=4 -> 0x00000000
+[sbox-trace] tid=0 NtCreateEvent name="" access=0x1f0003 type=1 state=0 -> 0x00000000
+[sbox-trace] tid=0 NtOpenProcessToken proc_h=0xffffffffffffffff access=0x2000000 -> 0x00000000
+[sbox-trace] tid=0 NtMapViewOfSection sect_h=0x114 proc_h=0xffffffffffffffff prot=0x80 -> 0x00000000
+[sbox-trace] tid=0 NtMapViewOfSection sect_h=0x118 proc_h=0xffffffffffffffff prot=0x80 -> 0x00000000
+[sbox-trace] tid=0 NtMapViewOfSection sect_h=0x118 proc_h=0xffffffffffffffff prot=0x80 -> 0x00000000
+[sbox-trace] tid=0 NtMapViewOfSection sect_h=0x118 proc_h=0xffffffffffffffff prot=0x80 -> 0x00000000
+[sbox-trace] tid=0 NtOpenFile path="\\??\\C:\\WINDOWS\\System32\\msvcrt.dll" access=0x20000 opts=0x0 -> 0x00000000
+[sbox-trace] tid=0 NtClose h=0x114 -> 0x00000000
+[sbox-trace] tid=0 NtOpenFile path="\\??\\C:\\WINDOWS\\System32\\sechost.dll" access=0x20000 opts=0x0 -> 0x00000000
+[sbox-trace] tid=0 NtClose h=0x114 -> 0x00000000
+[sbox-trace] tid=0 NtOpenFile path="\\??\\C:\\WINDOWS\\System32\\RPCRT4.dll" access=0x20000 opts=0x0 -> 0x00000000
+[sbox-trace] tid=0 NtClose h=0x118 -> 0x00000000
+[sbox-trace] tid=0 NtOpenFile path="\\??\\C:\\WINDOWS\\System32\\advapi32.dll" access=0x20000 opts=0x0 -> 0x00000000
+[sbox-trace] tid=0 NtClose h=0x118 -> 0x00000000
+[sbox-trace] tid=0 NtOpenKey key="\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Nls\\Sorting\\Versions" access=0x20019 -> 0x00000000
+[sbox-trace] tid=0 NtQueryValueKey key_h=0x11c value="" class=1 buf_len=532 -> 0x00000000
+[sbox-trace] tid=0 NtQueryValueKey key_h=0x11c value="000605xx" class=1 buf_len=532 -> 0x00000000
+[sbox-trace] tid=0 NtOpenFile path="\\??\\C:\\WINDOWS\\SYSTEM32\\CRYPTBASE.DLL" access=0x100021 opts=0x60 -> 0x00000000
+[sbox-trace] tid=0 NtCreateSection name="(null)" access=0xd prot=0x10 attr=0x1000000 -> 0x00000000
+[sbox-trace] tid=0 NtOpenFile path="\\Device\\SrpDevice" access=0x1 opts=0x0 -> 0x00000000
+[sbox-trace] tid=0 NtMapViewOfSection sect_h=0x118 proc_h=0xffffffffffffffff prot=0x80 -> 0x00000000
+[sbox-trace] tid=0 NtOpenFile path="\\??\\C:\\WINDOWS\\SYSTEM32\\CRYPTBASE.DLL" access=0x20000 opts=0x0 -> 0x00000000
+[sbox-trace] tid=0 NtClose h=0x13c -> 0x00000000
+[sbox-trace] tid=0 NtOpenFile path="\\Device\\KsecDD" access=0x100001 opts=0x20 -> 0x00000000
+[sbox-trace] tid=0 NtMapViewOfSection sect_h=0x118 proc_h=0xffffffffffffffff prot=0x80 -> 0x00000000
+[sbox-trace] tid=0 NtOpenFile path="\\??\\C:\\WINDOWS\\System32\\bcryptPrimitives.dll" access=0x20000 opts=0x0 -> 0x00000000
+[sbox-trace] tid=0 NtClose h=0x118 -> 0x00000000
+[sbox-trace] tid=0 NtQueryInformationProcess proc_h=0xffffffffffffffff class=86 buf_len=176 -> 0xc0000003
+[sbox-trace] tid=0 NtQueryInformationProcess proc_h=0xffffffffffffffff class=0 buf_len=64 -> 0x00000000
+[sbox-trace] tid=0 NtOpenFile path="\\Device\\CNG" access=0x100001 opts=0x20 -> 0x00000000
+[sbox-trace] tid=0 NtDeviceIoControlFile h=0x148 ioctl=0x00390008 in_len=0 out_len=48 -> 0x00000000
+[sbox-trace] tid=0 NtOpenKeyEx key="\\REGISTRY\\MACHINE" access=0x2000000 opts=0x0 -> 0x00000000
+[sbox-trace] tid=0 NtOpenKeyEx key="System\\CurrentControlset\\Control\\Lsa" access=0x1 opts=0x0 -> 0x00000000
+[sbox-trace] tid=0 NtQueryValueKey key_h=0x14c value="LsaPid" class=2 buf_len=16 -> 0x00000000
+[sbox-trace] tid=0 NtClose h=0x14c -> 0x00000000
+[sbox-trace] tid=0 NtCreateEvent name="" access=0x1f0003 type=1 state=0 -> 0x00000000
+[sbox-trace] tid=0 NtCreateEvent name="" access=0x1f0003 type=1 state=0 -> 0x00000000
+[sbox-trace] tid=0 NtCreateEvent name="" access=0x1f0003 type=1 state=0 -> 0x00000000
+[sbox-trace] tid=0 NtCreateEvent name="" access=0x1f0003 type=1 state=0 -> 0x00000000
+[sbox-trace] tid=0 NtCreateEvent name="" access=0x1f0003 type=1 state=0 -> 0x00000000
+[sbox-trace] tid=0 NtCreateEvent name="" access=0x1f0003 type=1 state=0 -> 0x00000000
+[sbox-trace] tid=0 NtCreateEvent name="" access=0x1f0003 type=1 state=0 -> 0x00000000
+[sbox-trace] tid=0 NtCreateEvent name="" access=0x1f0003 type=1 state=0 -> 0x00000000
+[sbox-trace] tid=0 NtCreateEvent name="" access=0x1f0003 type=1 state=0 -> 0x00000000
+[sbox-trace] tid=0 NtCreateSection name="" access=0xf0007 prot=0x4 attr=0x8000000 -> 0x00000000
+[sbox-trace] tid=0 NtMapViewOfSection sect_h=0x15c proc_h=0xffffffffffffffff prot=0x4 -> 0x00000000
+[sbox-trace] tid=0 NtCreateSection name="" access=0xf0007 prot=0x4 attr=0x8000000 -> 0x00000000
+[sbox-trace] tid=0 NtMapViewOfSection sect_h=0x164 proc_h=0xffffffffffffffff prot=0x4 -> 0x00000000
+[sbox-exec] cdylib injection setup failed (entry rendezvous failed: target exited before signalling (exit=0xc0000005)); resuming target without cdylib
+[sbox-exec] target exit=0xc0000005
+--- end ---
+[smoke_bash] FAIL — 3 sub-test failure(s):
+[smoke_bash]   - test1: expected exit 0, got Some(-1073741819)
+[smoke_bash]   - test1: stdout missing 'hello': ""
+[smoke_bash]   - test1: crash code 0xc0000005 on stderr
+error: process didn't exit successfully: `C:\Users\ig\AppData\Local\Temp\winsbox-target\release\examples\smoke_bash.exe` (exit code: 2)

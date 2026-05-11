@@ -1,0 +1,94 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="860" height="560" viewBox="0 0 860 560">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#333"/>
+    </marker>
+  </defs>
+  <style>
+    text       { font-family: -apple-system, Helvetica, Arial, sans-serif; font-size: 13px; fill: #222; }
+    .title     { font-size: 14px; font-weight: 600; }
+    .small     { font-size: 11px; fill: #555; }
+    .proc      { fill: #fff; stroke: #333; stroke-width: 1.5; }
+    .sub       { fill: #f6f6f6; stroke: #888; stroke-width: 1; }
+    .relay     { fill: #eef4ff; stroke: #336; stroke-width: 1; }
+    .boundary  { stroke: #c0392b; stroke-width: 2; stroke-dasharray: 8 6; }
+    .ipc       { stroke: #333; stroke-width: 2; fill: none; }
+    .net       { stroke: #2a6; stroke-width: 2; fill: none; }
+    .unix      { stroke: #26c; stroke-width: 2; fill: none; }
+    .lbl-ipc   { fill: #333; font-size: 11px; }
+    .lbl-net   { fill: #2a6; font-size: 11px; }
+    .lbl-unix  { fill: #26c; font-size: 11px; }
+    .lbl-bound { fill: #c0392b; font-size: 12px; font-weight: 600; }
+  </style>
+
+  <!-- Broker process -->
+  <rect class="proc" x="40" y="30" width="640" height="170" rx="6"/>
+  <text class="title" x="56" y="52">Broker</text>
+  <text class="small" x="56" y="68">user token · medium IL</text>
+
+  <rect class="sub" x="60"  y="90" width="150" height="80" rx="4"/>
+  <text x="75"  y="115">policy / spawn</text>
+  <text class="small" x="75" y="135">token, job, ACLs</text>
+
+  <rect class="sub" x="240" y="90" width="150" height="80" rx="4"/>
+  <text x="255" y="115">IPC service</text>
+  <text class="small" x="255" y="135">brokered syscalls</text>
+
+  <rect class="relay" x="450" y="90" width="200" height="80" rx="4"/>
+  <text x="465" y="115">outside relay</text>
+  <text class="small" x="465" y="135">AF_UNIX accept</text>
+  <text class="small" x="465" y="151">→ TCP 127.0.0.1</text>
+
+  <!-- SRT proxy (external) -->
+  <rect class="sub" x="730" y="100" width="100" height="60" rx="4"/>
+  <text x="745" y="128">SRT proxy</text>
+  <text class="small" x="745" y="144">127.0.0.1</text>
+
+  <!-- AppContainer boundary -->
+  <line class="boundary" x1="20" y1="280" x2="840" y2="280"/>
+  <text class="lbl-bound" x="30" y="272">AppContainer boundary</text>
+  <text class="small" x="30" y="296" fill="#c0392b">restricted + lowbox token · Untrusted IL · Job · alt-desktop</text>
+
+  <!-- Target process -->
+  <rect class="proc" x="40" y="340" width="370" height="170" rx="6"/>
+  <text class="title" x="56" y="362">Target</text>
+
+  <rect class="sub" x="60" y="380" width="330" height="50" rx="4"/>
+  <text x="75" y="400">ntdll + CreateProcessInternalW hooks</text>
+  <text class="small" x="75" y="418">spill args → IPC, or passthrough</text>
+
+  <rect class="sub" x="60" y="445" width="330" height="45" rx="4"/>
+  <text x="75" y="465">user code</text>
+  <text class="small" x="75" y="481">HTTP_PROXY = 127.0.0.1:&lt;inside-port&gt;</text>
+
+  <!-- Inside relay -->
+  <rect class="proc" x="450" y="340" width="230" height="170" rx="6"/>
+  <text class="title" x="466" y="362">Inside relay</text>
+  <text class="small" x="466" y="378">same AC SID · same Job</text>
+
+  <rect class="relay" x="466" y="395" width="198" height="95" rx="4"/>
+  <text class="small" x="480" y="418">bind 127.0.0.1:0</text>
+  <text class="small" x="480" y="436">accept TCP</text>
+  <text class="small" x="480" y="454">→ connect AF_UNIX</text>
+  <text class="small" x="480" y="472">(intra-AC loopback)</text>
+
+  <!-- IPC: broker IPC service <-> target hooks -->
+  <line class="ipc" x1="315" y1="170" x2="315" y2="380" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+  <text class="lbl-ipc" x="324" y="248">IPC</text>
+  <text class="lbl-ipc" x="324" y="262">shared section</text>
+
+  <!-- AF_UNIX: inside relay -> outside relay (crosses boundary) -->
+  <line class="unix" x1="565" y1="395" x2="565" y2="170" marker-end="url(#arrow)"/>
+  <text class="lbl-unix" x="574" y="248">AF_UNIX</text>
+  <text class="lbl-unix" x="574" y="262">socket in AC pkg dir</text>
+
+  <!-- TCP: target user code -> inside relay -->
+  <line class="net" x1="390" y1="467" x2="466" y2="442" marker-end="url(#arrow)"/>
+  <text class="lbl-net" x="396" y="445">TCP</text>
+
+  <!-- TCP: outside relay -> SRT proxy -->
+  <line class="net" x1="650" y1="130" x2="730" y2="130" marker-end="url(#arrow)"/>
+  <text class="lbl-net" x="670" y="122">TCP</text>
+</svg>

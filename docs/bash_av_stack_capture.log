@@ -1,0 +1,134 @@
+
+************* Preparing the environment for Debugger Extensions Gallery repositories **************
+   ExtensionRepository : Implicit
+   UseExperimentalFeatureForNugetShare : true
+   AllowNugetExeUpdate : true
+   NonInteractiveNuget : true
+   AllowNugetMSCredentialProviderInstall : true
+   AllowParallelInitializationOfLocalRepositories : true
+
+   EnableRedirectToV8JsProvider : false
+
+   -- Configuring repositories
+      ----> Repository : LocalInstalled, Enabled: true
+      ----> Repository : UserExtensions, Enabled: true
+
+>>>>>>>>>>>>> Preparing the environment for Debugger Extensions Gallery repositories completed, duration 0.000 seconds
+
+************* Waiting for Debugger Extensions Gallery to Initialize **************
+
+>>>>>>>>>>>>> Waiting for Debugger Extensions Gallery to Initialize completed, duration 0.016 seconds
+   ----> Repository : UserExtensions, Enabled: true, Packages count: 0
+   ----> Repository : LocalInstalled, Enabled: true, Packages count: 28
+
+Microsoft (R) Windows Debugger Version 10.0.26100.7705 ARM64
+Copyright (c) Microsoft Corporation. All rights reserved.
+
+*** wait with pending attach
+
+************* Path validation summary **************
+Response                         Time (ms)     Location
+Deferred                                       srv*
+Symbol search path is: srv*
+Executable search path is: 
+ModLoad: 0000022f`63500000 0000022f`6376a000   bash.exe
+ModLoad: 00007ffc`0d8d0000 00007ffc`0dd03000   ntdll.dll
+(1628.17b4): Break instruction exception - code 80000003 (first chance)
+ntdll!DbgBreakPoint:
+00007ffc`0da44e60 d43e0000 brk         #0xF000
+0:001:ARM64EC> cdb: Reading initial command 'sxd ld; sxd ud; sxd ibp; sxe c0000005; g; .echo ===INITBP===; g; .echo ===AV===; .lastevent; .exr -1; .echo ===REGS===; r; .echo ===STACK===; k 40; .echo ===MODS===; lm; .echo ===END===; qd'
+ModLoad: 00007ffc`09fb0000 00007ffc`0a17d000   C:\WINDOWS\System32\xtajit64se.dll
+ModLoad: 00007ffc`0d2e0000 00007ffc`0d448000   C:\WINDOWS\System32\KERNEL32.DLL
+ModLoad: 00007ffc`07b60000 00007ffc`08220000   C:\WINDOWS\System32\KERNELBASE.dll
+ModLoad: 00007ffc`07390000 00007ffc`07495000   C:\WINDOWS\SYSTEM32\apphelp.dll
+ModLoad: 00007ffc`0d040000 00007ffc`0d2b9000   C:\WINDOWS\System32\USER32.dll
+ModLoad: 00007ffc`07af0000 00007ffc`07b51000   C:\WINDOWS\System32\win32u.dll
+ModLoad: 0000022f`69360000 0000022f`696c0000   C:\Program Files\Git\usr\bin\msys-2.0.dll
+ModLoad: 00007ffc`0baf0000 00007ffc`0bb55000   C:\WINDOWS\System32\GDI32.dll
+ModLoad: 00007ffc`099f0000 00007ffc`09bd6000   C:\WINDOWS\System32\gdi32full.dll
+Unload module C:\Program Files\Git\usr\bin\msys-2.0.dll at 0000022f`69360000
+ModLoad: 00007ffc`08540000 00007ffc`08699000   C:\WINDOWS\System32\msvcp_win.dll
+ModLoad: 00007ffc`077c0000 00007ffc`079e8000   C:\WINDOWS\System32\ucrtbase.dll
+ModLoad: 0000022f`69360000 0000022f`696c0000   C:\Program Files\Git\usr\bin\msys-2.0.dll
+(1628.193c): Break instruction exception - code 80000003 (first chance)
+===INITBP===
+cYgFFFFFFFF 22F695E34A0 0ModLoad: 00007ffc`0c340000 00007ffc`0c484000   C:\WINDOWS\System32\advapi32.dll
+ModLoad: 00007ffc`0d450000 00007ffc`0d598000   C:\WINDOWS\System32\msvcrt.dll
+ModLoad: 00007ffc`0c4e0000 00007ffc`0c600000   C:\WINDOWS\System32\sechost.dll
+ModLoad: 00007ffc`0a1b0000 00007ffc`0a3b3000   C:\WINDOWS\System32\RPCRT4.dll
+ModLoad: 00007ffc`06420000 00007ffc`06438000   C:\WINDOWS\SYSTEM32\CRYPTBASE.DLL
+ModLoad: 00007ffc`079f0000 00007ffc`07ae3000   C:\WINDOWS\System32\bcryptPrimitives.dll
+(1628.193c): Access violation - code c0000005 (first chance)
+First chance exceptions are reported before any exception handling.
+This exception may be expected and handled.
+===AV===
+Last event: 1628.193c: Access violation - code c0000005 (first chance)
+  debugger time: Sun May 10 20:20:22.725 2026 (UTC - 4:00)
+ExceptionAddress: 0000022f695536aa (msys_2_0!alloca+0x0000000000001e1a)
+   ExceptionCode: c0000005 (Access violation)
+  ExceptionFlags: 00000000
+NumberParameters: 2
+   Parameter[0]: 0000000000000000
+   Parameter[1]: 00000002102fb981
+Attempt to read from address 00000002102fb981
+===REGS===
+rax=0000022f6955adb0 rbx=0000022f69561d48 rcx=0000000000000000
+rdx=00000002102fb980 rsi=0000022f69561d40 rdi=00000099671fd3a0
+rip=0000022f695536aa rsp=00000099671fb158 rbp=00000099671fe420
+ r8=0000000000000000  r9=0000000000000000 r10=0000000000000001
+r11=00007ffc0dbde000 r12=000000007ffe0384 r13=00000099671fecc0
+r14=0000000000000001 r15=0000022f69360000
+iopl=3         nv up ei ng nz na pe cy
+cs=0033  ss=002b  ds=002b  es=002b  fs=0053  gs=002b             efl=00003281
+msys_2_0!alloca+0x1e1a:
+0000022f`695536aa f6420108        test    byte ptr [rdx+1],8 ds:00000002`102fb981=??
+===STACK===
+  Arch   Child-SP          RetAddr               Call Site
+   AMD64 00000099`671fb158 0000022f`69368a12     msys_2_0!alloca+0x1e1a
+   AMD64 00000099`671fb160 0000022f`69393c18     msys_2_0!msys_dll_init+0x1652
+   AMD64 00000099`671fb1c0 00007ffc`0dbb15dc     msys_2_0!dll_entry+0xc8
+ ARM64EC 00000099`671fe430 00007ffc`0dba05c4     ntdll!$iexit_thunk$cdecl$i8$i8+0x1c
+ ARM64EC 00000099`671fe460 00007ffc`0dae8f94     ntdll!#LdrpCallInitRoutineInternal+0x94
+ ARM64EC 00000099`671fe5b0 00007ffc`0dae0b98     ntdll!#LdrpCallInitRoutine+0x64
+ ARM64EC 00000099`671fe600 00007ffc`0dae8450     ntdll!#LdrpInitializeNode+0x1b0
+ ARM64EC 00000099`671fe730 00007ffc`0dae8474     ntdll!#LdrpInitializeGraphRecurse+0x48
+ ARM64EC 00000099`671fe780 00007ffc`0dade05c     ntdll!#LdrpInitializeGraphRecurse+0x6c
+ ARM64EC 00000099`671fe7d0 00007ffc`0dadf92c     ntdll!#LdrpInitializeProcess+0x1aec
+ ARM64EC 00000099`671febc0 00007ffc`0dadbf68     ntdll!#_LdrpInitialize+0x13c
+ ARM64EC 00000099`671fec40 00007ffc`0dadb134     ntdll!#LdrpInitializeInternal+0xd8
+ ARM64EC 00000099`671fec90 00007ffc`0daf5948     ntdll!#LdrpInitialize+0x34
+ ARM64EC 00000099`671fecb0 00000000`00000000     ntdll!#LdrInitializeThunk+0x78
+===MODS===
+start             end                 module name
+0000022f`63500000 0000022f`6376a000   bash       (deferred)             
+0000022f`69360000 0000022f`696c0000   msys_2_0   (export symbols)       C:\Program Files\Git\usr\bin\msys-2.0.dll
+00007ffc`06420000 00007ffc`06438000   CRYPTBASE   (deferred)             
+00007ffc`07390000 00007ffc`07495000   apphelp    (deferred)             
+00007ffc`077c0000 00007ffc`079e8000   ucrtbase   (deferred)             
+00007ffc`079f0000 00007ffc`07ae3000   bcryptPrimitives   (deferred)             
+00007ffc`07af0000 00007ffc`07b51000   win32u     (deferred)             
+00007ffc`07b60000 00007ffc`08220000   KERNELBASE   (deferred)             
+00007ffc`08540000 00007ffc`08699000   msvcp_win   (deferred)             
+00007ffc`099f0000 00007ffc`09bd6000   gdi32full   (deferred)             
+00007ffc`09fb0000 00007ffc`0a17d000   xtajit64se   (deferred)             
+00007ffc`0a1b0000 00007ffc`0a3b3000   RPCRT4     (deferred)             
+00007ffc`0baf0000 00007ffc`0bb55000   GDI32      (deferred)             
+00007ffc`0c340000 00007ffc`0c484000   advapi32   (deferred)             
+00007ffc`0c4e0000 00007ffc`0c600000   sechost    (deferred)             
+00007ffc`0d040000 00007ffc`0d2b9000   USER32     (deferred)             
+00007ffc`0d2e0000 00007ffc`0d448000   KERNEL32   (deferred)             
+00007ffc`0d450000 00007ffc`0d598000   msvcrt     (deferred)             
+00007ffc`0d8d0000 00007ffc`0dd03000   ntdll      (pdb symbols)          C:\ProgramData\dbg\sym\ntdll.pdb\51ABD10A0831CE1EA3597691D41F9DEE1\ntdll.pdb
+===END===
+quit:
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\arm64\Visualizers\atlmfc.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\arm64\Visualizers\ObjectiveC.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\arm64\Visualizers\concurrency.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\arm64\Visualizers\cpp_rest.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\arm64\Visualizers\stl.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\arm64\Visualizers\Windows.Data.Json.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\arm64\Visualizers\Windows.Devices.Geolocation.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\arm64\Visualizers\Windows.Devices.Sensors.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\arm64\Visualizers\Windows.Media.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\arm64\Visualizers\windows.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\arm64\Visualizers\winrt.natvis'

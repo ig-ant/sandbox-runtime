@@ -1,0 +1,44 @@
+(lldb) process handle SIGSEGV --pass false --stop true --notify true
+NAME         PASS   STOP   NOTIFY  DESCRIPTION
+===========  =====  =====  ======  ===================
+SIGSEGV      false  true   true    segmentation violation
+(lldb) continue
+Process 9596 resuming
+Process 9596 stopped
+* thread #1, stop reason = Exception 0x80000003 encountered at address 0x7ffc0db9bd8c
+    frame #0: 0x00007ffc0db9bd90 ntdll.dll`EtwCheckCoverage + 75488
+ntdll.dll`EtwCheckCoverage:
+->  0x7ffc0db9bd90 <+75488>: addl   %eax, (%rax)
+    0x7ffc0db9bd92 <+75490>: addb   %dl, -0x573d85(,%rdi,8)
+    0x7ffc0db9bd99 <+75497>: andl   (%rbx), %eax
+    0x7ffc0db9bd9b <+75499>: lsll   -0x2a(%rdi), %r19d
+(lldb) bt
+* thread #1, stop reason = Exception 0x80000003 encountered at address 0x7ffc0db9bd8c
+  * frame #0: 0x00007ffc0db9bd90 ntdll.dll`EtwCheckCoverage + 75488
+    frame #1: 0x00007ffc0db9bd80 ntdll.dll`EtwCheckCoverage + 75472
+(lldb) thread backtrace -c 30
+* thread #1, stop reason = Exception 0x80000003 encountered at address 0x7ffc0db9bd8c
+  * frame #0: 0x00007ffc0db9bd90 ntdll.dll`EtwCheckCoverage + 75488
+    frame #1: 0x00007ffc0db9bd80 ntdll.dll`EtwCheckCoverage + 75472
+(lldb) register read rip rsp rbp
+error: Invalid register name 'rip'.
+error: Invalid register name 'rsp'.
+error: Invalid register name 'rbp'.
+(lldb) image lookup -a $rip
+error: address expression "$rip" evaluation failed
+(lldb) image lookup -a rip
+error: address expression "rip" evaluation failed
+(lldb) image list
+[  0] B8EF75E6-D1FA-E2DB-5F6B-18D40318312B-00000001 0x0000019402450000 C:\Program Files\Git\usr\bin\bash.exe
+[  1] 51ABD10A-0831-CE1E-A359-7691D41F9DEE-00000001 0x00007ffc0d8d0000 C:\Windows\System32\ntdll.dll
+[  2] 681181D3-8A53-6D42-6DAD-ABAE32F4279E-00000001 0x00007ffc09fb0000 C:\Windows\System32\xtajit64se.dll
+[  3] 7F5F7BD1-CF31-90C9-0FD6-6ED603862BF4-00000001 0x00007ffc0d2e0000 C:\Windows\System32\kernel32.dll
+[  4] 5007D08B-B7E0-C069-2F24-FB80B604CE44-00000001 0x00007ffc07b60000 C:\Windows\System32\KernelBase.dll
+[  5] 73F78946-BC27-2FE8-9CCE-6AE575702A94-00000001 0x00007ffc07390000 C:\Windows\System32\apphelp.dll
+[  6] A1A51042-BEC4-C2B3-9D4E-FC75A7FA0685-00000001 0x00007ffc0d040000 C:\Windows\System32\user32.dll
+[  7] 18828AC9-4623-5037-200E-B2FF73E4B5D3-00000001 0x00007ffc07af0000 C:\Windows\System32\win32u.dll
+[  8] CFF03460-DACF-05B3-32ED-1A7A61F3A360-00000001 0x00007ffc0baf0000 C:\Windows\System32\gdi32.dll
+[  9] 9A6FB818-AA32-ADB4-0CD1-597141C17F84-00000001 0x00007ffc099f0000 C:\Windows\System32\gdi32full.dll
+[ 10] 424F2A58-2070-A5B1-58D7-232DA2E1AD02-00000001 0x00007ffc08540000 C:\Windows\System32\msvcp_win.dll
+[ 11] 0DF869E8-F7C7-DD81-C767-1224BA7B7E88-00000001 0x00007ffc077c0000 C:\Windows\System32\ucrtbase.dll
+[ 12] 08D6441F-EF9A-BBF4-E891-C7EEF73B72A3-00000001 0x0000019407ff0000 C:\Program Files\Git\usr\bin\msys-2.0.dll

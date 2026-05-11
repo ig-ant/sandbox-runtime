@@ -1,0 +1,2 @@
+[debug-attach] loop started
+[debug-attach] WaitForDebugEvent failed: The handle is invalid. (0x80070006)
