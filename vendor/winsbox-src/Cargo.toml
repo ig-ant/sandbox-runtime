@@ -1,0 +1,51 @@
+[package]
+name = "winsbox"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[lib]
+name = "winsbox"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sbox-exec"
+path = "src/main.rs"
+
+[[bin]]
+name = "probe_token"
+path = "src/bin/probe_token.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+  "Win32_Foundation",
+  "Win32_System_Threading",
+  "Win32_System_Console",
+  "Win32_System_Environment",
+  "Win32_System_JobObjects",
+  "Win32_System_Registry",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_Storage_FileSystem",
+  "Win32_Networking_WinSock",
+  "Win32_NetworkManagement_WindowsFilteringPlatform",
+  "Win32_System_SystemInformation",
+  "Win32_System_Memory",
+  "Win32_System_LibraryLoader",
+  "Win32_System_SystemServices",
+  "Win32_System_IO",
+  "Win32_System_Diagnostics_Debug",
+] }
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
