@@ -228,7 +228,15 @@ d('windows sandbox', () => {
   // Deferred to a separate phase (~300 LOC + rcgen dep) — see trace
   // at `docs/curl_https_trace_n4.log` and the deferral note in
   // `plans/winsbox-phase-n.md` Phase N-4 / fallback section.
-  test.skip(
+  //
+  // TEMP — un-skipped to settle whether Schannel/LSA failure in our AC
+  // is structural to AppContainer or specific to Win11-25H2-ARM64 +
+  // xtajit64se emulation. N-4 probe ran on the ARM64 host's emulated
+  // x64 broker; we never directly tested Schannel-in-our-AC on real
+  // x64. If x64 CI passes this test, the failure is emulator-specific,
+  // not structural — reshapes Phase O scope significantly. Revert this
+  // gate change after one CI run captures the result.
+  test(
     'curl allowed domain via proxy succeeds (https — deferred, see Phase O MITM)',
     async () => {
       const r = await runSandboxed(
