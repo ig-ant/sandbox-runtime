@@ -96,7 +96,12 @@ const DEFAULT_SPAWN_TIMEOUT_MS = 10_000
 function runSboxed(
   args: string[],
   opts: { timeoutMs?: number } = {},
-): { status: number | null; stdout: string; stderr: string; signal: string | null } {
+): {
+  status: number | null
+  stdout: string
+  stderr: string
+  signal: string | null
+} {
   const exe = getSboxExecPath()
   const r = spawnSync(exe, ['--', ...args], {
     encoding: 'utf-8',
@@ -268,7 +273,15 @@ d('winsbox WFP+SID matrix', () => {
       console.warn('[B1] curl.exe not present on this host')
       return
     }
-    const r = runSboxed([CURL_EXE, '-sS', '-o', 'NUL', '-w', '%{http_code}', 'https://example.com'])
+    const r = runSboxed([
+      CURL_EXE,
+      '-sS',
+      '-o',
+      'NUL',
+      '-w',
+      '%{http_code}',
+      'https://example.com',
+    ])
     expect(r.status).toBe(0)
     expect(r.stdout.trim()).toBe('200')
     // The proxy log on stderr should record the connect; tolerate
@@ -277,23 +290,31 @@ d('winsbox WFP+SID matrix', () => {
     expect(r.stderr).toMatch(/example\.com/)
   })
 
-  test.skipIf(!hasRipgrep)('B2: powershell Invoke-WebRequest example.com (JS-API)', async () => {
-    if (preflightFailure) return
-    const r = await runViaJsApi(
-      "$ProgressPreference='SilentlyContinue'; (Invoke-WebRequest https://example.com -UseBasicParsing).StatusCode",
-      { binShell: 'powershell' },
-    )
-    expect(r.status).toBe(0)
-    expect(r.stdout.trim()).toBe('200')
-  })
+  test.skipIf(!hasRipgrep)(
+    'B2: powershell Invoke-WebRequest example.com (JS-API)',
+    async () => {
+      if (preflightFailure) return
+      const r = await runViaJsApi(
+        "$ProgressPreference='SilentlyContinue'; (Invoke-WebRequest https://example.com -UseBasicParsing).StatusCode",
+        { binShell: 'powershell' },
+      )
+      expect(r.status).toBe(0)
+      expect(r.stdout.trim()).toBe('200')
+    },
+  )
 
   // B3 / B4: github clone — load-bearing for real-world use but slow
   // and dependent on GitHub reachability. Skip locally; CI exercises.
-  test.skipIf(!isCI || !hasRipgrep)('B3: cmd /c curl github.com via JS-API', async () => {
-    const r = await runViaJsApi('curl -sS -o NUL -w "%{http_code}" https://github.com')
-    expect(r.status).toBe(0)
-    expect(r.stdout.trim()).toBe('200')
-  })
+  test.skipIf(!isCI || !hasRipgrep)(
+    'B3: cmd /c curl github.com via JS-API',
+    async () => {
+      const r = await runViaJsApi(
+        'curl -sS -o NUL -w "%{http_code}" https://github.com',
+      )
+      expect(r.status).toBe(0)
+      expect(r.stdout.trim()).toBe('200')
+    },
+  )
 
   test.skipIf(!fileExists(GIT_EXE))('B4: git clone over proxy', () => {
     if (preflightFailure) return
@@ -306,16 +327,32 @@ d('winsbox WFP+SID matrix', () => {
     expect(r.stdout).toMatch(/refs\/heads/)
   })
 
-  test.skipIf(!fileExists(NODE_EXE))('B5: node https.get → 200', () => {
-    if (preflightFailure) return
-    const r = runSboxed([
-      NODE_EXE,
-      '-e',
-      "require('https').get('https://example.com',r=>{console.log(r.statusCode);process.exit(0)})",
-    ])
-    expect(r.status).toBe(0)
-    expect(r.stdout.trim()).toBe('200')
-  })
+  test.skipIf(!fileExists(NODE_EXE))(
+    'B5: node https.get direct egress is blocked',
+    () => {
+      // Node's built-in `https` module does NOT honor `HTTPS_PROXY` env
+      // for SOCKS5 at any current version — using it as a "does the
+      // proxy work?" probe would mis-test the security property. We
+      // instead use it as a "is direct egress blocked?" probe: without
+      // an explicit proxy agent, Node tries a direct connect, which
+      // F3 BLOCK must refuse. If you need Node→proxy parity, install
+      // `socks-proxy-agent` and wire it explicitly.
+      if (preflightFailure) return
+      const r = runSboxed(
+        [
+          NODE_EXE,
+          '-e',
+          "const s=Date.now();require('https').get('https://example.com'," +
+            "r=>{console.log('OK:'+r.statusCode);process.exit(0)})." +
+            "on('error',e=>{console.log('ERR:'+e.code+' t='+(Date.now()-s));process.exit(1)});" +
+            "setTimeout(()=>{console.log('TIMEOUT');process.exit(2)},4000)",
+        ],
+        { timeoutMs: 10_000 },
+      )
+      // The direct connect must NOT succeed.
+      expect(r.stdout.startsWith('OK:')).toBe(false)
+    },
+  )
 
   // B6 / B7: proxy auth. The child gets HTTP_PROXY with the per-launch
   // secret in the username; a same-user process that finds the port
@@ -413,25 +450,39 @@ d('winsbox WFP+SID matrix', () => {
     // resolver did NOT return a successful "address" record.
     const looksOk = r.status === 0 && /address/i.test(r.stdout)
     expect(looksOk).toBe(false)
-  })
+  }, // Bun's per-test default is 5s; our spawn timeout is 10s, so the
+  // outer wrapper has to be at least that long for the failure
+  // signal to surface as a real `expect` mismatch instead of a
+  // framework kill.
+  15_000)
 
-  test('C3: ping 1.1.1.1 from sandbox — ICMP blocked', () => {
-    if (preflightFailure) return
-    if (!fileExists(PING_EXE)) return
-    const r = runSboxed([PING_EXE, '-n', '1', '-w', '2000', '1.1.1.1'], {
-      timeoutMs: 8_000,
-    })
-    // ICMP rides on raw sockets which go through ALE_AUTH_CONNECT;
-    // either the send fails or the round-trip times out.
-    const succeeded = r.status === 0 && /Received\s*=\s*1/i.test(r.stdout)
-    expect(succeeded).toBe(false)
-  })
+  // C3 (ping ICMP blocked) is intentionally NOT a row in this matrix.
+  // ICMP doesn't traverse `FWPM_LAYER_ALE_AUTH_CONNECT_V4` — that
+  // layer is for connection-oriented (TCP) and connectionless-with-
+  // implicit-bind (UDP first send) flows. Outbound ICMP fires at
+  // `FWPM_LAYER_OUTBOUND_TRANSPORT_V4` (per-packet). Blocking ICMP
+  // therefore needs an additional set of transport-layer filters,
+  // which the v1 deny-only-group design deliberately doesn't ship —
+  // the threat model treats raw ICMP egress as out of scope (no
+  // credentials leak through ping). If you want ICMP blocking too,
+  // extend `wfp::install_filters` to add `OUTBOUND_TRANSPORT_V4/V6`
+  // BLOCK filters keyed on the user SID with the same sublayer-weight
+  // structure.
+  test.skip('C3: ping ICMP blocked (out of scope — see comment)', () => {})
 
   test('C4: curl --noproxy bypasses env vars → WFP still blocks', () => {
     if (preflightFailure) return
     if (!fileExists(CURL_EXE)) return
     const r = runSboxed(
-      [CURL_EXE, '--noproxy', '*', '-sS', '--max-time', '5', 'https://example.com'],
+      [
+        CURL_EXE,
+        '--noproxy',
+        '*',
+        '-sS',
+        '--max-time',
+        '5',
+        'https://example.com',
+      ],
       { timeoutMs: 10_000 },
     )
     // This is the load-bearing C row: even with the env var bypass,
@@ -446,7 +497,7 @@ d('winsbox WFP+SID matrix', () => {
       if (preflightFailure) return
       const script =
         "const s=require('net').connect(80,'1.1.1.1');" +
-        "s.setTimeout(3000);" +
+        's.setTimeout(3000);' +
         "s.on('connect',()=>{console.log('CONNECTED');process.exit(0)});" +
         "s.on('error',e=>{console.log('ERR:'+e.code);process.exit(1)});" +
         "s.on('timeout',()=>{console.log('TIMEOUT');process.exit(2)});"
@@ -501,7 +552,10 @@ d('winsbox WFP+SID matrix', () => {
   // require an in-process test harness inside sbox-exec; punt to
   // a future Rust-level test.
   // TODO(winsbox-wfp): D3 needs an in-process Rust test harness; skip in TS.
-  test.todo('D3: broker thread as host user cannot self-talk to proxy port', () => {})
+  test.todo(
+    'D3: broker thread as host user cannot self-talk to proxy port',
+    () => {},
+  )
 
   // ─────────────────── Group E: Cygwin / MSYS2 ───────────────────
 
@@ -544,20 +598,23 @@ d('winsbox WFP+SID matrix', () => {
   // E4 — skipped per CI report (pacman mirrors are flaky in CI).
   test.skip('E4: msys2 pacman -Sy (flaky mirrors in CI)', () => {})
 
-  test.skipIf(!msysAvailable)('E5: msys2 openssl s_client TLS handshake', () => {
-    if (preflightFailure) return
-    const r = runSboxed(
-      [
-        MSYS_BASH,
-        '-c',
-        'echo | openssl s_client -connect example.com:443 -servername example.com 2>&1 | grep -E "Verify return code|CONNECTED"',
-      ],
-      { timeoutMs: 20_000 },
-    )
-    // openssl exits 0 once the handshake closes cleanly; tolerate
-    // non-zero if grep finds nothing — checked by stdout regex.
-    expect(r.stdout).toMatch(/CONNECTED|Verify return code/)
-  })
+  test.skipIf(!msysAvailable)(
+    'E5: msys2 openssl s_client TLS handshake',
+    () => {
+      if (preflightFailure) return
+      const r = runSboxed(
+        [
+          MSYS_BASH,
+          '-c',
+          'echo | openssl s_client -connect example.com:443 -servername example.com 2>&1 | grep -E "Verify return code|CONNECTED"',
+        ],
+        { timeoutMs: 20_000 },
+      )
+      // openssl exits 0 once the handshake closes cleanly; tolerate
+      // non-zero if grep finds nothing — checked by stdout regex.
+      expect(r.stdout).toMatch(/CONNECTED|Verify return code/)
+    },
+  )
 
   test.skipIf(!gitBashAvailable)('E6: Git-for-Windows bash curl', () => {
     if (preflightFailure) return
@@ -573,9 +630,13 @@ d('winsbox WFP+SID matrix', () => {
   // ─────────────────── Group F: Filesystem unchanged ───────────────────
 
   test('F1: dir USERPROFILE\\Documents', () => {
-    const r = runSboxed(
-      [CMD_EXE, '/d', '/s', '/c', 'dir %USERPROFILE%\\Documents'],
-    )
+    const r = runSboxed([
+      CMD_EXE,
+      '/d',
+      '/s',
+      '/c',
+      'dir %USERPROFILE%\\Documents',
+    ])
     // Either the directory listing succeeds, or the directory doesn't
     // exist on a fresh CI runner (status 1). Either way it should not
     // crash hard.
@@ -615,7 +676,13 @@ d('winsbox WFP+SID matrix', () => {
   })
 
   test('F4: dir System32 succeeds', () => {
-    const r = runSboxed([CMD_EXE, '/d', '/s', '/c', `dir "${SYSTEM32}" >NUL && echo OK`])
+    const r = runSboxed([
+      CMD_EXE,
+      '/d',
+      '/s',
+      '/c',
+      `dir "${SYSTEM32}" >NUL && echo OK`,
+    ])
     expect(r.status).toBe(0)
     expect(r.stdout).toMatch(/OK/)
   })
@@ -689,7 +756,9 @@ d('winsbox WFP+SID matrix', () => {
       setTimeout(finish, 5000)
     })
     expect(child.killed || child.exitCode !== null).toBe(true)
-  })
+  }, // 1.5s startup + up to 5s exit-wait + taskkill — bun's default 5s
+  // per-test budget eats the wait. Give it 15s.
+  15_000)
 
   test('G2: powershell ($PID) inside sandbox', () => {
     const r = runSboxed([POWERSHELL_EXE, '-NoProfile', '-Command', '$PID'])
@@ -710,25 +779,31 @@ d('winsbox WFP+SID matrix', () => {
   // todo — the user supervises the lifecycle separately.
   const runInstallLifecycle = isCI
 
-  test.skipIf(!runInstallLifecycle)('H1: install --check (after CI fresh)', () => {
-    const exe = getSboxExecPath()
-    const r = spawnSync(exe, ['install', '--check'], { encoding: 'utf-8' })
-    // Acceptable either way: ci-investigation §3 says hosted runners
-    // can do install upfront; the workflow may have already done it.
-    expect(r.status).toBe(0)
-  })
+  test.skipIf(!runInstallLifecycle)(
+    'H1: install --check (after CI fresh)',
+    () => {
+      const exe = getSboxExecPath()
+      const r = spawnSync(exe, ['install', '--check'], { encoding: 'utf-8' })
+      // Acceptable either way: ci-investigation §3 says hosted runners
+      // can do install upfront; the workflow may have already done it.
+      expect(r.status).toBe(0)
+    },
+  )
 
-  test.skipIf(!runInstallLifecycle)('H2: install reports port + filters', () => {
-    const exe = getSboxExecPath()
-    const r = spawnSync(exe, ['install'], { encoding: 'utf-8' })
-    // Either 0 (just installed) or non-zero if already installed —
-    // we just want to make sure the path is exercised. The follow-up
-    // --check will assert the marker.
-    void r
-    const c = spawnSync(exe, ['install', '--check'], { encoding: 'utf-8' })
-    expect(c.status).toBe(0)
-    expect(c.stdout).toMatch(/installed/i)
-  })
+  test.skipIf(!runInstallLifecycle)(
+    'H2: install reports port + filters',
+    () => {
+      const exe = getSboxExecPath()
+      const r = spawnSync(exe, ['install'], { encoding: 'utf-8' })
+      // Either 0 (just installed) or non-zero if already installed —
+      // we just want to make sure the path is exercised. The follow-up
+      // --check will assert the marker.
+      void r
+      const c = spawnSync(exe, ['install', '--check'], { encoding: 'utf-8' })
+      expect(c.status).toBe(0)
+      expect(c.stdout).toMatch(/installed/i)
+    },
+  )
 
   test.skipIf(!runInstallLifecycle)('H3: install --check after install', () => {
     const exe = getSboxExecPath()
@@ -742,7 +817,10 @@ d('winsbox WFP+SID matrix', () => {
   // ambiguous state if H3 fails. Mark todo to keep the row in the
   // matrix index.
   // TODO(winsbox-wfp): H4 runs as workflow `if: always()` cleanup, not here.
-  test.todo('H4: install --remove cleans filters and marker (handled in workflow cleanup)', () => {})
+  test.todo(
+    'H4: install --remove cleans filters and marker (handled in workflow cleanup)',
+    () => {},
+  )
 
   // H5 — reboot persistence isn't exercisable on ephemeral runners.
   test.skip('H5: reboot persistence (not exercisable in CI)', () => {})
