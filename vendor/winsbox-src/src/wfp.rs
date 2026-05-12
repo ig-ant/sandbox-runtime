@@ -1,44 +1,83 @@
-//! Windows Filtering Platform (WFP) filter install/remove.
+//! Windows Filtering Platform (WFP) filter install/remove + local group
+//! provisioning.
 //!
-//! Six filters (3 at IPv4 + 3 at IPv6 ALE_AUTH_CONNECT):
-//!   1. PERMIT — match SANDBOX_SID + remote=loopback + remote_port=proxy.
-//!   2. BLOCK  — match SANDBOX_SID (lower weight than #1).
-//!   3. BLOCK  — remote=loopback + remote_port=proxy + NOT SANDBOX_SID
-//!               (speculative: SDDL `O:LSD:(D;;CC;;;<sid>)(A;;CC;;;WD)` so
-//!               Everyone passes but SANDBOX_SID is denied). If this
-//!               doesn't behave correctly, the alternative is a separate
-//!               sublayer with default-block + a higher-weight PERMIT
-//!               only for SANDBOX_SID; left for Phase 3 to confirm.
+//! Design (deny-only-group fence, locked in May 2026):
 //!
-//! Persistent (non-dynamic) filters; survive reboot. Marker file at
-//! `%ProgramData%\winsbox\installed.json` records port + sublayer GUID.
+//!   - Install creates a local group `winsbox-allowed`, adds the broker
+//!     user to it, and persists 6 WFP filters (3 each at IPv4 + IPv6
+//!     `FWPM_LAYER_ALE_AUTH_CONNECT_*`):
+//!
+//!       Filter 1 — PERMIT (high weight)
+//!         ALE_USER_ID SD `O:LSD:(A;;CC;;;<group_sid>)`
+//!         Hits whenever the `winsbox-allowed` group is ENABLED in the
+//!         caller's TokenGroups (broker, Explorer, normal user procs).
+//!
+//!       Filter 2 — PERMIT (medium weight)
+//!         ALE_USER_ID SD `O:LSD:(A;;CC;;;<user_sid>)`
+//!         + IP_REMOTE_ADDRESS == 127.0.0.1 (resp. ::1)
+//!         + IP_REMOTE_PORT == <proxy_port>
+//!         Lets sandbox children reach the SOCKS proxy.
+//!
+//!       Filter 3 — BLOCK (low weight)
+//!         ALE_USER_ID SD `O:LSD:(A;;CC;;;<user_sid>)`
+//!         Catches sandbox children that didn't match #1 (their group
+//!         is deny-only) and didn't match #2 (off proxy port).
+//!
+//!   - The broker is the same user as a sandbox child, but the broker's
+//!     token has the group ENABLED while the sandbox child's token has
+//!     it DENY-ONLY (`CreateRestrictedToken(SidsToDisable=[group_sid])`).
+//!     WFP's ALE_USER_ID AccessCheck honors deny-only — see
+//!     `Y:\synthetic-sid-probe.md` (S1) and `Y:\denyonly-probe.md` (D2)
+//!     for the underlying empirical work.
+//!
+//! Marker file: `%ProgramData%\winsbox\installed.json` carries port,
+//! sublayer GUID, group name + SID, user SID — read by the broker to
+//! validate state at every launch.
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::ffi::c_void;
 use std::path::PathBuf;
-use windows::core::{GUID, PCWSTR};
-use windows::Win32::Foundation::{LocalFree, HANDLE, HLOCAL};
+use windows::core::{GUID, PCWSTR, PWSTR};
+use windows::Win32::Foundation::{LocalFree, ERROR_MEMBER_IN_ALIAS, HANDLE, HLOCAL};
+use windows::Win32::NetworkManagement::NetManagement::{
+    NetLocalGroupAdd, NetLocalGroupAddMembers, NetLocalGroupDel,
+    NetLocalGroupGetInfo, NERR_GroupExists, NERR_GroupNotFound, NetApiBufferFree,
+    LOCALGROUP_INFO_1, LOCALGROUP_MEMBERS_INFO_0,
+};
 use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterAdd0, FwpmFilterDeleteByKey0,
     FwpmSubLayerAdd0, FwpmSubLayerDeleteByKey0, FwpmTransactionAbort0,
     FwpmTransactionBegin0, FwpmTransactionCommit0, FWPM_ACTION0, FWPM_ACTION0_0,
     FWPM_CONDITION_ALE_USER_ID, FWPM_CONDITION_IP_REMOTE_ADDRESS,
     FWPM_CONDITION_IP_REMOTE_PORT, FWPM_DISPLAY_DATA0, FWPM_FILTER0,
-    FWPM_FILTER_CONDITION0, FWPM_FILTER_FLAG_PERSISTENT, FWPM_SUBLAYER_FLAG_PERSISTENT,
+    FWPM_FILTER_CONDITION0, FWPM_FILTER_FLAG_PERSISTENT,
     FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_LAYER_ALE_AUTH_CONNECT_V6,
-    FWPM_SUBLAYER0, FWP_ACTION_BLOCK, FWP_ACTION_PERMIT, FWP_BYTE_BLOB,
-    FWP_CONDITION_VALUE0, FWP_CONDITION_VALUE0_0, FWP_MATCH_EQUAL,
-    FWP_SECURITY_DESCRIPTOR_TYPE, FWP_UINT16, FWP_UINT32, FWP_UINT8,
-    FWP_VALUE0, FWP_VALUE0_0, FWP_BYTE_ARRAY16,
+    FWPM_SUBLAYER0, FWPM_SUBLAYER_FLAG_PERSISTENT, FWP_ACTION_BLOCK,
+    FWP_ACTION_PERMIT, FWP_BYTE_ARRAY16, FWP_BYTE_BLOB, FWP_CONDITION_VALUE0,
+    FWP_CONDITION_VALUE0_0, FWP_MATCH_EQUAL, FWP_SECURITY_DESCRIPTOR_TYPE,
+    FWP_UINT16, FWP_UINT32, FWP_VALUE0, FWP_VALUE0_0,
 };
 use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
-use windows::Win32::Security::{GetSecurityDescriptorLength, PSECURITY_DESCRIPTOR};
+use windows::Win32::Security::{
+    GetSecurityDescriptorLength, PSECURITY_DESCRIPTOR, PSID,
+};
 
+use crate::sid;
 use crate::util::{pcwstr, wstr};
 
+/// Default local group name. Stable across installs so the broker can
+/// find it by name.
+pub const GROUP_NAME: &str = "winsbox-allowed";
+const GROUP_COMMENT: &str = "winsbox network sandbox membership group";
+
 // Sublayer GUID — stable, hard-coded for deterministic uninstall.
-// {a4f4e62c-3d8a-4f3a-9b9e-d2f5e8a17b41}
-const SUBLAYER_GUID: GUID = GUID::from_u128(0xa4f4e62c_3d8a_4f3a_9b9e_d2f5e8a17b41);
+// New GUID for the deny-only-group design to avoid conflicts with any
+// older Phase 2 (SANDBOX_SID restricting-array) install on the same
+// host. Sysinternals can still list both for diagnosis.
+// {2c5d0ad6-5f3b-4d4e-9b8f-1a3e7c9d0b21}
+const SUBLAYER_GUID: GUID =
+    GUID::from_u128(0x2c5d0ad6_5f3b_4d4e_9b8f_1a3e7c9d0b21);
 
 // Filter GUIDs derived from sublayer by mutating the low byte of Data4.
 const fn filter_guid(tag: u8) -> GUID {
@@ -49,8 +88,12 @@ const fn filter_guid(tag: u8) -> GUID {
 
 // Tags 1..=6.
 const FILTER_GUIDS: [GUID; 6] = [
-    filter_guid(1), filter_guid(2), filter_guid(3),
-    filter_guid(4), filter_guid(5), filter_guid(6),
+    filter_guid(1),
+    filter_guid(2),
+    filter_guid(3),
+    filter_guid(4),
+    filter_guid(5),
+    filter_guid(6),
 ];
 
 // WFP errors we want to swallow.
@@ -58,14 +101,17 @@ const FWP_E_ALREADY_EXISTS: u32 = 0x80320009;
 const FWP_E_FILTER_NOT_FOUND: u32 = 0x80320026;
 const FWP_E_SUBLAYER_NOT_FOUND: u32 = 0x80320042;
 
-// SDDL revision constant for ConvertStringSecurityDescriptorToSecurityDescriptorW.
+// SDDL revision constant.
 const SDDL_REVISION_1: u32 = 1;
 
-// Marker file shape.
-#[derive(Debug, Serialize, Deserialize)]
-struct Marker {
-    port: u16,
-    sublayer_guid: String,
+/// Marker file shape (`%ProgramData%\winsbox\installed.json`).
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Marker {
+    pub port: u16,
+    pub sublayer_guid: String,
+    pub group_name: String,
+    pub group_sid: String,
+    pub user_sid: String,
 }
 
 fn marker_path() -> PathBuf {
@@ -75,16 +121,13 @@ fn marker_path() -> PathBuf {
     base.join("winsbox").join("installed.json")
 }
 
-fn write_marker(port: u16) -> Result<()> {
+fn write_marker(m: &Marker) -> Result<()> {
     let p = marker_path();
     if let Some(parent) = p.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("mkdir {}", parent.display()))?;
     }
-    let m = Marker {
-        port,
-        sublayer_guid: format!("{:?}", SUBLAYER_GUID),
-    };
-    let s = serde_json::to_string_pretty(&m)?;
+    let s = serde_json::to_string_pretty(m)?;
     std::fs::write(&p, s).with_context(|| format!("write {}", p.display()))?;
     Ok(())
 }
@@ -102,12 +145,14 @@ fn read_marker() -> Result<Option<Marker>> {
     if !p.exists() {
         return Ok(None);
     }
-    let s = std::fs::read_to_string(&p).with_context(|| format!("read {}", p.display()))?;
+    let s = std::fs::read_to_string(&p)
+        .with_context(|| format!("read {}", p.display()))?;
     Ok(Some(serde_json::from_str(&s)?))
 }
 
 /// Heap-allocated security descriptor owned by us. Drop frees via
-/// `LocalFree` to mirror `ConvertStringSecurityDescriptorToSecurityDescriptorW`.
+/// `LocalFree` to mirror
+/// `ConvertStringSecurityDescriptorToSecurityDescriptorW`.
 struct OwnedSd {
     ptr: PSECURITY_DESCRIPTOR,
     len: u32,
@@ -125,9 +170,12 @@ impl OwnedSd {
                 &mut psd,
                 Some(&mut sz),
             )
-            .map_err(|e| anyhow!("ConvertStringSecurityDescriptorToSecurityDescriptorW({sddl}): {e}"))?;
+            .map_err(|e| {
+                anyhow!(
+                    "ConvertStringSecurityDescriptorToSecurityDescriptorW({sddl}): {e}"
+                )
+            })?;
             if sz == 0 {
-                // Some SKUs don't fill in sz; compute it.
                 sz = GetSecurityDescriptorLength(psd);
             }
         }
@@ -144,7 +192,9 @@ impl OwnedSd {
 impl Drop for OwnedSd {
     fn drop(&mut self) {
         if !self.ptr.0.is_null() {
-            unsafe { let _ = LocalFree(HLOCAL(self.ptr.0)); }
+            unsafe {
+                let _ = LocalFree(HLOCAL(self.ptr.0));
+            }
         }
     }
 }
@@ -154,28 +204,25 @@ struct EngineHandle(HANDLE);
 impl EngineHandle {
     fn open() -> Result<Self> {
         let mut h = HANDLE::default();
-        // Authn service RPC_C_AUTHN_DEFAULT = 0xFFFFFFFF.
         let rc = unsafe {
-            FwpmEngineOpen0(
-                PCWSTR::null(),
-                0xFFFFFFFF,
-                None,
-                None,
-                &mut h,
-            )
+            FwpmEngineOpen0(PCWSTR::null(), 0xFFFFFFFF, None, None, &mut h)
         };
         if rc != 0 {
             return Err(anyhow!("FwpmEngineOpen0 failed: 0x{rc:08x}"));
         }
         Ok(Self(h))
     }
-    fn as_handle(&self) -> HANDLE { self.0 }
+    fn as_handle(&self) -> HANDLE {
+        self.0
+    }
 }
 
 impl Drop for EngineHandle {
     fn drop(&mut self) {
         if !self.0.is_invalid() {
-            unsafe { let _ = FwpmEngineClose0(self.0); }
+            unsafe {
+                let _ = FwpmEngineClose0(self.0);
+            }
         }
     }
 }
@@ -188,20 +235,18 @@ fn fwp_uint32(v: u32) -> FWP_VALUE0 {
     }
 }
 
-// Build an FWP_VALUE0 of type FWP_UINT64 pointing at `slot`. The caller
-// must keep `slot` alive until any FwpmFilterAdd0 using this value has
-// returned. (WFP copies the data out, but it dereferences the pointer
-// during the call.)
+// Build an FWP_VALUE0 of type FWP_UINT64 pointing at `slot`. WFP
+// dereferences this during the FwpmFilterAdd0 call (lesson from Phase 4
+// fix in commit 85a6f29 on the parent branch).
 fn fwp_uint64(slot: &mut u64) -> FWP_VALUE0 {
     FWP_VALUE0 {
-        r#type: windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_UINT64,
-        Anonymous: FWP_VALUE0_0 { uint64: slot as *mut u64 },
+        r#type:
+            windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_UINT64,
+        Anonymous: FWP_VALUE0_0 {
+            uint64: slot as *mut u64,
+        },
     }
 }
-
-// Build a single filter condition for a u8/u16/u32 value.
-// All pointers in the condition struct must remain valid until
-// `FwpmFilterAdd0` returns.
 
 fn cond_uint32(field_key: GUID, v: u32) -> FWPM_FILTER_CONDITION0 {
     FWPM_FILTER_CONDITION0 {
@@ -225,14 +270,13 @@ fn cond_uint16(field_key: GUID, v: u16) -> FWPM_FILTER_CONDITION0 {
     }
 }
 
-// IPv6 address (16 bytes) condition.
 fn cond_v6_addr(field_key: GUID, addr: &mut FWP_BYTE_ARRAY16) -> FWPM_FILTER_CONDITION0 {
     FWPM_FILTER_CONDITION0 {
         fieldKey: field_key,
         matchType: FWP_MATCH_EQUAL,
         conditionValue: FWP_CONDITION_VALUE0 {
-            // FWP_BYTE_ARRAY16_TYPE = 13.
-            r#type: windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_BYTE_ARRAY16_TYPE,
+            r#type:
+                windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_BYTE_ARRAY16_TYPE,
             Anonymous: FWP_CONDITION_VALUE0_0 {
                 byteArray16: addr as *mut _,
             },
@@ -253,14 +297,6 @@ fn cond_sd(field_key: GUID, blob: &mut FWP_BYTE_BLOB) -> FWPM_FILTER_CONDITION0 
     }
 }
 
-#[allow(dead_code)]
-fn _silence_unused() {
-    // Keep these imports referenced even if some filters elide the v6 byte-array
-    // condition shape.
-    let _ = FWP_UINT8;
-    let _ = FWP_UINT16;
-}
-
 fn add_filter(
     engine: HANDLE,
     key: GUID,
@@ -272,14 +308,12 @@ fn add_filter(
 ) -> Result<()> {
     let mut name_w = wstr(name);
     let mut desc_w = wstr("winsbox WFP filter");
-    // Weight must be a stable u64 slot — the FWP_VALUE0 holds a pointer
-    // to it (FWP_UINT64 is pointer-valued in the union).
     let mut weight_slot: u64 = weight;
     let mut filter = FWPM_FILTER0::default();
     filter.filterKey = key;
     filter.displayData = FWPM_DISPLAY_DATA0 {
-        name: windows::core::PWSTR(name_w.as_mut_ptr()),
-        description: windows::core::PWSTR(desc_w.as_mut_ptr()),
+        name: PWSTR(name_w.as_mut_ptr()),
+        description: PWSTR(desc_w.as_mut_ptr()),
     };
     filter.flags = FWPM_FILTER_FLAG_PERSISTENT;
     filter.layerKey = layer;
@@ -293,7 +327,9 @@ fn add_filter(
     };
     filter.action = FWPM_ACTION0 {
         r#type: action_type,
-        Anonymous: FWPM_ACTION0_0 { filterType: GUID::zeroed() },
+        Anonymous: FWPM_ACTION0_0 {
+            filterType: GUID::zeroed(),
+        },
     };
     if std::env::var_os("WINSBOX_WFP_DEBUG").is_some() {
         eprintln!(
@@ -305,12 +341,6 @@ fn add_filter(
             conditions.len(),
             filter.flags.0,
         );
-        for (i, c) in conditions.iter().enumerate() {
-            eprintln!(
-                "[winsbox-wfp]   cond[{i}] field={:?} match={:?} value_type={:?}",
-                c.fieldKey, c.matchType.0, c.conditionValue.r#type.0,
-            );
-        }
     }
     let rc = unsafe {
         FwpmFilterAdd0(engine, &filter, PSECURITY_DESCRIPTOR::default(), None)
@@ -321,17 +351,107 @@ fn add_filter(
     Ok(())
 }
 
-/// Install the persistent WFP filter set keyed on SANDBOX_SID, with
-/// `proxy_port` as the only permitted destination on loopback.
-pub fn install_persistent(proxy_port: u16) -> Result<()> {
-    let sid_str = crate::sid::sandbox_sid_string()?;
+// ────────────────────── Local group provisioning ──────────────────────
 
-    // Pre-build security descriptors. Kept alive across the whole transaction.
-    let sd_allow = OwnedSd::from_sddl(&format!("O:LSD:(A;;CC;;;{sid_str})"))?;
-    // Filter #3 SD: deny SANDBOX_SID, allow Everyone. Speculative shape;
-    // see module docstring + plan open question. Alternative: separate
-    // sublayer with default-block.
-    let sd_deny = OwnedSd::from_sddl(&format!("O:LSD:(D;;CC;;;{sid_str})(A;;CC;;;WD)"))?;
+/// Create the local group if it doesn't already exist. Idempotent on
+/// `NERR_GroupExists`.
+pub fn ensure_group_exists() -> Result<()> {
+    unsafe {
+        let name_w = wstr(GROUP_NAME);
+        let mut comment_w = wstr(GROUP_COMMENT);
+        // Use name_w as a stable backing store referenced inside the
+        // info struct.
+        let mut name_w_mut = name_w.clone();
+        let info = LOCALGROUP_INFO_1 {
+            lgrpi1_name: PWSTR(name_w_mut.as_mut_ptr()),
+            lgrpi1_comment: PWSTR(comment_w.as_mut_ptr()),
+        };
+        let rc = NetLocalGroupAdd(
+            PCWSTR::null(),
+            1,
+            &info as *const _ as *const u8,
+            None,
+        );
+        if rc != 0 && rc != NERR_GroupExists {
+            return Err(anyhow!("NetLocalGroupAdd({GROUP_NAME}): {rc}"));
+        }
+        Ok(())
+    }
+}
+
+/// Add `user_sid_str` to the local group. Idempotent on
+/// `ERROR_MEMBER_IN_ALIAS`. `user_sid_str` must be a string SID
+/// (`"S-1-5-21-..."`).
+pub fn add_user_to_group(user_sid_str: &str) -> Result<()> {
+    let psid = sid::psid_from_string(user_sid_str)?;
+    let result = unsafe {
+        let name_w = wstr(GROUP_NAME);
+        let info = LOCALGROUP_MEMBERS_INFO_0 { lgrmi0_sid: psid };
+        let rc = NetLocalGroupAddMembers(
+            PCWSTR::null(),
+            pcwstr(&name_w),
+            0,
+            &info as *const _ as *const u8,
+            1,
+        );
+        if rc != 0 && rc != ERROR_MEMBER_IN_ALIAS.0 {
+            Err(anyhow!(
+                "NetLocalGroupAddMembers({GROUP_NAME}, {user_sid_str}): {rc}"
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    sid::free_psid(psid);
+    result
+}
+
+/// Delete the local group (and implicitly all its memberships) if it
+/// exists. Idempotent on `NERR_GroupNotFound`.
+pub fn delete_group() -> Result<()> {
+    unsafe {
+        let name_w = wstr(GROUP_NAME);
+        let rc = NetLocalGroupDel(PCWSTR::null(), pcwstr(&name_w));
+        if rc != 0 && rc != NERR_GroupNotFound {
+            return Err(anyhow!("NetLocalGroupDel({GROUP_NAME}): {rc}"));
+        }
+        Ok(())
+    }
+}
+
+/// Return `Ok(true)` if the local group exists, `Ok(false)` otherwise.
+pub fn group_exists() -> Result<bool> {
+    unsafe {
+        let name_w = wstr(GROUP_NAME);
+        let mut buf: *mut u8 = std::ptr::null_mut();
+        let rc =
+            NetLocalGroupGetInfo(PCWSTR::null(), pcwstr(&name_w), 1, &mut buf);
+        if rc == 0 {
+            let _ = NetApiBufferFree(Some(buf as *const c_void));
+            return Ok(true);
+        }
+        if rc == NERR_GroupNotFound {
+            return Ok(false);
+        }
+        Err(anyhow!("NetLocalGroupGetInfo({GROUP_NAME}): {rc}"))
+    }
+}
+
+// ────────────────────── WFP install/uninstall ──────────────────────
+
+/// Install the 6 persistent WFP filters keyed on `group_sid_str` and
+/// `user_sid_str`. `proxy_port` is the loopback port the sandbox child
+/// is permitted to reach.
+pub fn install_filters(
+    proxy_port: u16,
+    group_sid_str: &str,
+    user_sid_str: &str,
+) -> Result<()> {
+    // SDDL strings.
+    let sddl_group = format!("O:LSD:(A;;CC;;;{group_sid_str})");
+    let sddl_user = format!("O:LSD:(A;;CC;;;{user_sid_str})");
+    let sd_group = OwnedSd::from_sddl(&sddl_group)?;
+    let sd_user = OwnedSd::from_sddl(&sddl_user)?;
 
     let engine = EngineHandle::open()?;
     let rc = unsafe { FwpmTransactionBegin0(engine.as_handle(), 0) };
@@ -341,117 +461,151 @@ pub fn install_persistent(proxy_port: u16) -> Result<()> {
 
     let result: Result<()> = (|| {
         // 1) Sublayer.
-        let mut sl_name_w = wstr("winsbox-sandbox-net");
-        let mut sl_desc_w = wstr("winsbox WFP sublayer");
+        let mut sl_name_w = wstr("winsbox-denyonly-net");
+        let mut sl_desc_w = wstr("winsbox WFP sublayer (deny-only-group fence)");
         let sublayer = FWPM_SUBLAYER0 {
             subLayerKey: SUBLAYER_GUID,
             displayData: FWPM_DISPLAY_DATA0 {
-                name: windows::core::PWSTR(sl_name_w.as_mut_ptr()),
-                description: windows::core::PWSTR(sl_desc_w.as_mut_ptr()),
+                name: PWSTR(sl_name_w.as_mut_ptr()),
+                description: PWSTR(sl_desc_w.as_mut_ptr()),
             },
             flags: FWPM_SUBLAYER_FLAG_PERSISTENT,
             providerKey: std::ptr::null_mut(),
-            providerData: FWP_BYTE_BLOB { size: 0, data: std::ptr::null_mut() },
+            providerData: FWP_BYTE_BLOB {
+                size: 0,
+                data: std::ptr::null_mut(),
+            },
             weight: 0x8000,
         };
-        let rc = unsafe { FwpmSubLayerAdd0(engine.as_handle(), &sublayer, PSECURITY_DESCRIPTOR::default()) };
+        let rc = unsafe {
+            FwpmSubLayerAdd0(
+                engine.as_handle(),
+                &sublayer,
+                PSECURITY_DESCRIPTOR::default(),
+            )
+        };
         if rc != 0 && rc != FWP_E_ALREADY_EXISTS {
             return Err(anyhow!("FwpmSubLayerAdd0 failed: 0x{rc:08x}"));
         }
 
-        // Loopback addresses.
-        let v4_loopback: u32 = 0x7F000001; // 127.0.0.1 in network-host order (FWP expects host order).
-        // ::1
+        // Weights — high → permit-group, medium → permit-user-on-proxy,
+        // low → block-user. All below 2^60 so we don't collide with WFP's
+        // auto-weight class (top 4 bits).
+        const W_HIGH: u64 = 0x0F00_0000_0000_0000;
+        const W_MED: u64 = 0x0C00_0000_0000_0000;
+        const W_LOW: u64 = 0x0400_0000_0000_0000;
+
+        let v4_loopback: u32 = 0x7F000001; // 127.0.0.1
         let mut v6_loopback = FWP_BYTE_ARRAY16 {
-            byteArray16: [0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,1],
+            byteArray16: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
         };
 
-        // Two SD byte-blobs — one allow, one deny — kept alive here.
-        let mut sd_allow_blob = sd_allow.byte_blob();
-        let mut sd_deny_blob = sd_deny.byte_blob();
+        // Reusable byte-blob views — kept alive on the stack for the
+        // duration of each FwpmFilterAdd0 call.
+        let mut sd_group_blob = sd_group.byte_blob();
+        let mut sd_user_blob = sd_user.byte_blob();
 
-        // Explicit FWP_UINT64 filter weights. Stay below 2^60 so we don't
-        // collide with the high 4 bits WFP reserves for the auto-weight
-        // class. The relative ordering preserves Phase 2's intent:
-        // PERMIT/proxy and BLOCK/non-sandbox-proxy outrank the catch-all
-        // BLOCK on SANDBOX_SID.
-        const W_HIGH: u64 = 0x0F00_0000_0000_0000;
-        const W_LOW:  u64 = 0x0400_0000_0000_0000;
-
-        // -------- IPv4 --------
-        // Filter #1 V4 PERMIT
-        let mut c1 = [
-            cond_uint32(FWPM_CONDITION_IP_REMOTE_ADDRESS, v4_loopback),
-            cond_uint16(FWPM_CONDITION_IP_REMOTE_PORT, proxy_port),
-            cond_sd(FWPM_CONDITION_ALE_USER_ID, &mut sd_allow_blob),
-        ];
+        // ────────────── IPv4 ──────────────
+        // F1 V4 PERMIT (group enabled).
+        let mut c1 = [cond_sd(FWPM_CONDITION_ALE_USER_ID, &mut sd_group_blob)];
         add_filter(
-            engine.as_handle(), FILTER_GUIDS[0], FWPM_LAYER_ALE_AUTH_CONNECT_V4,
-            "winsbox-v4-permit-proxy", W_HIGH, FWP_ACTION_PERMIT, &mut c1,
+            engine.as_handle(),
+            FILTER_GUIDS[0],
+            FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+            "winsbox-v4-permit-group",
+            W_HIGH,
+            FWP_ACTION_PERMIT,
+            &mut c1,
         )?;
-        // Filter #2 V4 BLOCK (catch-all for SANDBOX_SID)
+
+        // F2 V4 PERMIT (user on proxy port loopback).
         let mut c2 = [
-            cond_sd(FWPM_CONDITION_ALE_USER_ID, &mut sd_allow_blob),
-        ];
-        add_filter(
-            engine.as_handle(), FILTER_GUIDS[1], FWPM_LAYER_ALE_AUTH_CONNECT_V4,
-            "winsbox-v4-block-sandbox-default", W_LOW, FWP_ACTION_BLOCK, &mut c2,
-        )?;
-        // Filter #3 V4 BLOCK (non-sandbox -> proxy port)
-        let mut c3 = [
             cond_uint32(FWPM_CONDITION_IP_REMOTE_ADDRESS, v4_loopback),
             cond_uint16(FWPM_CONDITION_IP_REMOTE_PORT, proxy_port),
-            cond_sd(FWPM_CONDITION_ALE_USER_ID, &mut sd_deny_blob),
+            cond_sd(FWPM_CONDITION_ALE_USER_ID, &mut sd_user_blob),
         ];
         add_filter(
-            engine.as_handle(), FILTER_GUIDS[2], FWPM_LAYER_ALE_AUTH_CONNECT_V4,
-            "winsbox-v4-block-non-sandbox-proxy", W_HIGH, FWP_ACTION_BLOCK, &mut c3,
+            engine.as_handle(),
+            FILTER_GUIDS[1],
+            FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+            "winsbox-v4-permit-sandbox-to-proxy",
+            W_MED,
+            FWP_ACTION_PERMIT,
+            &mut c2,
         )?;
 
-        // -------- IPv6 --------
-        let mut c4 = [
-            cond_v6_addr(FWPM_CONDITION_IP_REMOTE_ADDRESS, &mut v6_loopback),
-            cond_uint16(FWPM_CONDITION_IP_REMOTE_PORT, proxy_port),
-            cond_sd(FWPM_CONDITION_ALE_USER_ID, &mut sd_allow_blob),
-        ];
+        // F3 V4 BLOCK (catch-all on user; group is deny-only so F1
+        // doesn't apply for sandbox children).
+        let mut c3 = [cond_sd(FWPM_CONDITION_ALE_USER_ID, &mut sd_user_blob)];
         add_filter(
-            engine.as_handle(), FILTER_GUIDS[3], FWPM_LAYER_ALE_AUTH_CONNECT_V6,
-            "winsbox-v6-permit-proxy", W_HIGH, FWP_ACTION_PERMIT, &mut c4,
+            engine.as_handle(),
+            FILTER_GUIDS[2],
+            FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+            "winsbox-v4-block-user-default",
+            W_LOW,
+            FWP_ACTION_BLOCK,
+            &mut c3,
         )?;
+
+        // ────────────── IPv6 ──────────────
+        // F4 V6 PERMIT (group enabled).
+        let mut c4 = [cond_sd(FWPM_CONDITION_ALE_USER_ID, &mut sd_group_blob)];
+        add_filter(
+            engine.as_handle(),
+            FILTER_GUIDS[3],
+            FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+            "winsbox-v6-permit-group",
+            W_HIGH,
+            FWP_ACTION_PERMIT,
+            &mut c4,
+        )?;
+
+        // F5 V6 PERMIT (user on proxy port ::1).
         let mut c5 = [
-            cond_sd(FWPM_CONDITION_ALE_USER_ID, &mut sd_allow_blob),
-        ];
-        add_filter(
-            engine.as_handle(), FILTER_GUIDS[4], FWPM_LAYER_ALE_AUTH_CONNECT_V6,
-            "winsbox-v6-block-sandbox-default", W_LOW, FWP_ACTION_BLOCK, &mut c5,
-        )?;
-        let mut c6 = [
             cond_v6_addr(FWPM_CONDITION_IP_REMOTE_ADDRESS, &mut v6_loopback),
             cond_uint16(FWPM_CONDITION_IP_REMOTE_PORT, proxy_port),
-            cond_sd(FWPM_CONDITION_ALE_USER_ID, &mut sd_deny_blob),
+            cond_sd(FWPM_CONDITION_ALE_USER_ID, &mut sd_user_blob),
         ];
         add_filter(
-            engine.as_handle(), FILTER_GUIDS[5], FWPM_LAYER_ALE_AUTH_CONNECT_V6,
-            "winsbox-v6-block-non-sandbox-proxy", W_HIGH, FWP_ACTION_BLOCK, &mut c6,
+            engine.as_handle(),
+            FILTER_GUIDS[4],
+            FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+            "winsbox-v6-permit-sandbox-to-proxy",
+            W_MED,
+            FWP_ACTION_PERMIT,
+            &mut c5,
+        )?;
+
+        // F6 V6 BLOCK (catch-all on user).
+        let mut c6 = [cond_sd(FWPM_CONDITION_ALE_USER_ID, &mut sd_user_blob)];
+        add_filter(
+            engine.as_handle(),
+            FILTER_GUIDS[5],
+            FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+            "winsbox-v6-block-user-default",
+            W_LOW,
+            FWP_ACTION_BLOCK,
+            &mut c6,
         )?;
 
         Ok(())
     })();
 
     if result.is_err() {
-        unsafe { let _ = FwpmTransactionAbort0(engine.as_handle()); }
+        unsafe {
+            let _ = FwpmTransactionAbort0(engine.as_handle());
+        }
         return result;
     }
     let rc = unsafe { FwpmTransactionCommit0(engine.as_handle()) };
     if rc != 0 {
         return Err(anyhow!("FwpmTransactionCommit0 failed: 0x{rc:08x}"));
     }
-    write_marker(proxy_port).context("write marker file")?;
     Ok(())
 }
 
-/// Remove the filters and sublayer installed by `install_persistent`.
-pub fn uninstall_persistent() -> Result<()> {
+/// Remove the filters + sublayer installed by `install_filters`.
+pub fn uninstall_filters() -> Result<()> {
     let engine = EngineHandle::open()?;
     let rc = unsafe { FwpmTransactionBegin0(engine.as_handle(), 0) };
     if rc != 0 {
@@ -459,36 +613,111 @@ pub fn uninstall_persistent() -> Result<()> {
     }
     let result: Result<()> = (|| {
         for guid in &FILTER_GUIDS {
-            let rc = unsafe { FwpmFilterDeleteByKey0(engine.as_handle(), guid) };
+            let rc =
+                unsafe { FwpmFilterDeleteByKey0(engine.as_handle(), guid) };
             if rc != 0 && rc != FWP_E_FILTER_NOT_FOUND {
-                return Err(anyhow!("FwpmFilterDeleteByKey0({:?}) failed: 0x{rc:08x}", guid));
+                return Err(anyhow!(
+                    "FwpmFilterDeleteByKey0({:?}) failed: 0x{rc:08x}",
+                    guid
+                ));
             }
         }
-        let rc = unsafe { FwpmSubLayerDeleteByKey0(engine.as_handle(), &SUBLAYER_GUID) };
-        if rc != 0 && rc != FWP_E_FILTER_NOT_FOUND && rc != FWP_E_SUBLAYER_NOT_FOUND {
+        let rc =
+            unsafe { FwpmSubLayerDeleteByKey0(engine.as_handle(), &SUBLAYER_GUID) };
+        if rc != 0 && rc != FWP_E_FILTER_NOT_FOUND && rc != FWP_E_SUBLAYER_NOT_FOUND
+        {
             return Err(anyhow!("FwpmSubLayerDeleteByKey0 failed: 0x{rc:08x}"));
         }
         Ok(())
     })();
     if result.is_err() {
-        unsafe { let _ = FwpmTransactionAbort0(engine.as_handle()); }
+        unsafe {
+            let _ = FwpmTransactionAbort0(engine.as_handle());
+        }
         return result;
     }
     let rc = unsafe { FwpmTransactionCommit0(engine.as_handle()) };
     if rc != 0 {
         return Err(anyhow!("FwpmTransactionCommit0 failed: 0x{rc:08x}"));
     }
-    let _ = delete_marker();
     Ok(())
 }
 
-/// Return `Some(port)` if filters are present (from marker file),
-/// `None` if not installed.
+// ────────────────────── Marker file accessors ──────────────────────
+
+/// Write the full marker after a successful install.
+pub fn write_install_marker(m: &Marker) -> Result<()> {
+    write_marker(m)
+}
+
+/// Remove the marker file (called from `install --remove`).
+pub fn remove_install_marker() -> Result<()> {
+    delete_marker()
+}
+
+/// Return `Some(port)` if the marker file is present, `None` otherwise.
+/// Kept for compatibility with callers that only need the port (e.g.
+/// `--check`). New callers prefer `read_install_marker`.
+#[allow(dead_code)]
 pub fn is_installed() -> Result<Option<u16>> {
     Ok(read_marker()?.map(|m| m.port))
 }
 
-/// Public accessor for the marker file (used by `install --check`).
-pub fn marker_info() -> Result<Option<(u16, String)>> {
-    Ok(read_marker()?.map(|m| (m.port, m.sublayer_guid)))
+/// Return the full marker if present.
+pub fn read_install_marker() -> Result<Option<Marker>> {
+    read_marker()
+}
+
+/// Sublayer GUID — exposed for diagnostics (`install --verify`).
+pub fn sublayer_guid_string() -> String {
+    format!("{:?}", SUBLAYER_GUID)
+}
+
+// ────────────────────── Tests ──────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Compile-time-ish validation: build the SDDL strings used by
+    /// `install_filters` for a representative pair of SIDs and confirm
+    /// `ConvertStringSecurityDescriptorToSecurityDescriptorW` parses
+    /// them. This catches typos in the SDDL template without requiring
+    /// the WFP transaction to run.
+    #[test]
+    fn sddl_round_trip_for_representative_sids() {
+        // Use well-known SIDs that exist on every Windows install so the
+        // test is hermetic (no SAM lookup needed).
+        //   S-1-5-32-545 = BUILTIN\Users (stands in for the group SID)
+        //   S-1-5-18     = NT AUTHORITY\SYSTEM (stands in for the user SID)
+        let group_sid = "S-1-5-32-545";
+        let user_sid = "S-1-5-18";
+        let sddl_group = format!("O:LSD:(A;;CC;;;{group_sid})");
+        let sddl_user = format!("O:LSD:(A;;CC;;;{user_sid})");
+        let g = OwnedSd::from_sddl(&sddl_group).expect("SDDL group parse");
+        assert!(!g.ptr.0.is_null());
+        assert!(g.len > 0);
+        drop(g);
+        let u = OwnedSd::from_sddl(&sddl_user).expect("SDDL user parse");
+        assert!(!u.ptr.0.is_null());
+        assert!(u.len > 0);
+        drop(u);
+    }
+
+    #[test]
+    fn sddl_rejects_malformed() {
+        // Sanity: a clearly malformed SDDL should fail. Catches the
+        // case where some future refactor accidentally builds an empty
+        // template that nonetheless "parses" as a zero-length SD.
+        let bad = "O:LSD:(A;;CC;;;NOT-A-SID)";
+        let r = OwnedSd::from_sddl(bad);
+        assert!(r.is_err(), "expected SDDL parse error, got Ok");
+    }
+}
+
+// Keep some imports referenced even if a future refactor elides them.
+#[allow(dead_code)]
+fn _silence_unused() {
+    let _ = FWP_UINT16;
+    let _: PSID = PSID::default();
 }

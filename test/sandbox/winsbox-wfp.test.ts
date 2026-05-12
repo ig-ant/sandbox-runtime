@@ -1,12 +1,25 @@
 /**
  * WFP+SID network sandbox — verification matrix
- * (Groups A–H from `plans/we-ll-sync-with-upstream-linked-axolotl.md`).
+ * (Groups A–H from `plans/we-ll-sync-with-upstream-linked-axolotl.md`,
+ *  updated for the deny-only-group fence design — May 2026).
  *
  * Each test corresponds to one row of the matrix. Rows that need
  * admin/UAC are gated on `process.env.CI === 'true'` (hosted runners
  * are admin-with-UAC-disabled per `ci-investigation.md`); rows that
  * need optional toolchains (msys2, git-bash) are gated on the
  * binary existing.
+ *
+ * Design notes (relative to the older USER_LIMITED-restricting-array
+ * design captured in `phase3-results.md`):
+ *   - The discriminator is now the SID of a local group
+ *     `winsbox-allowed`; sandbox children have it deny-only and
+ *     the broker has it enabled. WFP's `ALE_USER_ID` AccessCheck
+ *     honors deny-only, so it correctly distinguishes the two.
+ *   - No restricting-SIDs array, so Schannel works in the child.
+ *     Group B (system curl, PowerShell Invoke-WebRequest) is
+ *     now expected to pass.
+ *   - The proxy is gated by a per-launch random 32-byte secret as
+ *     the SOCKS5 username. Group B6 / B7 cover this.
  *
  * On non-Windows platforms the entire describe block is skipped.
  */
@@ -72,14 +85,10 @@ function fileExists(p: string): boolean {
 }
 
 /** Per-test inner spawn timeout. sbox-exec's first invocation pays
- * WFP-engine + proxy-bind costs (~1s typical). Note: as of the v1
- * Phase 2 broker, `sbox-exec` may hang post-child-exit while
- * shutting down the proxy thread — known Phase 4 bug. Tests that
- * exercise the broker therefore frequently observe `status=null,
- * signal=SIGTERM` and a populated `stdout` matching the expected
- * answer; we still assert `status === 0` so the bug remains visible
- * (vs. silently green via overly lenient assertions). Keep the
- * timeout tight so the suite doesn't blow past the bun deadline.
+ * WFP-engine + proxy-bind costs (~1s typical). The Phase 4
+ * deny-only-group revision fixed the post-exit proxy-thread hang
+ * (non-blocking listener with shutdown polling), so we now expect
+ * a clean `status === 0` for tests where the child exits cleanly.
  */
 const DEFAULT_SPAWN_TIMEOUT_MS = 10_000
 
@@ -308,20 +317,90 @@ d('winsbox WFP+SID matrix', () => {
     expect(r.stdout.trim()).toBe('200')
   })
 
+  // B6 / B7: proxy auth. The child gets HTTP_PROXY with the per-launch
+  // secret in the username; a same-user process that finds the port
+  // but doesn't know the secret should be turned away at the SOCKS5
+  // handshake. We exercise this by running a curl/node inside the
+  // sandbox with `--noproxy '*'` (clearing the env) and a manual
+  // socks5 URL — direct or with a wrong secret.
+
+  test.skipIf(!fileExists(CURL_EXE))(
+    'B6: SOCKS5 without auth → handshake rejected',
+    () => {
+      if (preflightFailure || installedPort === undefined) return
+      // Note: this runs inside the sandbox; WFP filter #2 (user-on-
+      // proxy-port) lets the TCP connect succeed, but the SOCKS5
+      // server rejects NO-AUTH (0x00) because expected_secret is set.
+      const r = runSboxed(
+        [
+          CURL_EXE,
+          '--noproxy',
+          '*',
+          '--socks5',
+          `127.0.0.1:${installedPort}`,
+          '--max-time',
+          '5',
+          '-sS',
+          '-o',
+          'NUL',
+          '-w',
+          '%{http_code}',
+          'https://example.com',
+        ],
+        { timeoutMs: 10_000 },
+      )
+      // SOCKS5 NO-AUTH refused → curl returns 7 (CONNECT failed) or 5
+      // (couldn't resolve proxy). Either way, non-zero, no 200.
+      expect(r.status).not.toBe(0)
+    },
+  )
+
+  test.skipIf(!fileExists(CURL_EXE))(
+    'B7: SOCKS5 with wrong secret → handshake rejected',
+    () => {
+      if (preflightFailure || installedPort === undefined) return
+      // Wrong-but-syntactically-valid 64-hex-char username.
+      const wrong = '0'.repeat(64)
+      const r = runSboxed(
+        [
+          CURL_EXE,
+          '--noproxy',
+          '*',
+          '--socks5',
+          `${wrong}:x@127.0.0.1:${installedPort}`,
+          '--max-time',
+          '5',
+          '-sS',
+          '-o',
+          'NUL',
+          '-w',
+          '%{http_code}',
+          'https://example.com',
+        ],
+        { timeoutMs: 10_000 },
+      )
+      expect(r.status).not.toBe(0)
+    },
+  )
+
   // ─────────────────── Group C: direct egress denied ───────────────────
 
   test('C1: TCP to 1.1.1.1:80 is blocked at WFP', () => {
     if (preflightFailure) return
     // PowerShell Test-NetConnection — `TcpTestSucceeded : False`.
-    const r = runSboxed([
-      POWERSHELL_EXE,
-      '-NoProfile',
-      '-Command',
-      "$ErrorActionPreference='SilentlyContinue'; (Test-NetConnection 1.1.1.1 -Port 80 -WarningAction SilentlyContinue).TcpTestSucceeded",
-    ])
-    // Status 0 with stdout "False" is the canonical pass; we tolerate
-    // failures or timeouts as proof of the same property.
-    expect(r.stdout.trim().toLowerCase()).not.toBe('true')
+    const r = runSboxed(
+      [
+        POWERSHELL_EXE,
+        '-NoProfile',
+        '-Command',
+        "$ErrorActionPreference='SilentlyContinue'; (Test-NetConnection 1.1.1.1 -Port 80 -WarningAction SilentlyContinue).TcpTestSucceeded",
+      ],
+      { timeoutMs: 15_000 },
+    )
+    // Deny-only-group fence design: this must come back False (or the
+    // test must time out at the cmdlet level, which TNC handles
+    // internally). Anything other than 'true' is the kernel-fence pass.
+    expect(r.stdout.trim().toLowerCase()).toBe('false')
   })
 
   test('C2: nslookup example.com — direct UDP 53 fails or times out', () => {
@@ -330,8 +409,8 @@ d('winsbox WFP+SID matrix', () => {
     const r = runSboxed([NSLOOKUP_EXE, 'example.com', '1.1.1.1'], {
       timeoutMs: 10_000,
     })
-    // Soft assertion per CI report: just fails (non-zero or timeout).
-    // Don't tie to a specific error string.
+    // Deny-only-group fence: direct UDP 53 must fail. We assert the
+    // resolver did NOT return a successful "address" record.
     const looksOk = r.status === 0 && /address/i.test(r.stdout)
     expect(looksOk).toBe(false)
   })
@@ -342,9 +421,8 @@ d('winsbox WFP+SID matrix', () => {
     const r = runSboxed([PING_EXE, '-n', '1', '-w', '2000', '1.1.1.1'], {
       timeoutMs: 8_000,
     })
-    // ping returns non-zero on no reply. ICMP support in WFP at
-    // FWPM_LAYER_ALE_AUTH_CONNECT_V4 is the open question — accept
-    // either explicit failure or timeout.
+    // ICMP rides on raw sockets which go through ALE_AUTH_CONNECT;
+    // either the send fails or the round-trip times out.
     const succeeded = r.status === 0 && /Received\s*=\s*1/i.test(r.stdout)
     expect(succeeded).toBe(false)
   })

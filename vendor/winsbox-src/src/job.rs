@@ -22,6 +22,7 @@ use windows::Win32::System::JobObjects::{
 pub struct Job(HANDLE);
 
 impl Job {
+    #[allow(dead_code)]
     pub fn handle(&self) -> HANDLE { self.0 }
     pub fn new() -> Result<Self> {
         unsafe {

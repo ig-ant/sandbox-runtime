@@ -2,8 +2,9 @@
 //!
 //! Subcommands:
 //!   - (none) — run a policy and exec target.
-//!   - `install [--port N] [--remove] [--check]` — manage persistent
-//!     WFP filters (requires admin).
+//!   - `install [--port N] [--remove] [--check] [--verify] [--keep-group]`
+//!     — manage persistent WFP filters + local group (admin required
+//!     for install/remove; `--check` and `--verify` are unprivileged).
 
 mod policy;
 #[cfg(windows)] mod util;
@@ -32,7 +33,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Install / remove / inspect persistent WFP filters.
+    /// Install / remove / inspect persistent WFP filters + local group.
     Install {
         /// Proxy port to allow on loopback (default 60080).
         #[arg(long)] port: Option<u16>,
@@ -40,6 +41,10 @@ enum Cmd {
         #[arg(long)] remove: bool,
         /// Print install state without modifying.
         #[arg(long)] check: bool,
+        /// Deep-verify: token group membership + SAM + marker consistency.
+        #[arg(long)] verify: bool,
+        /// On --remove, leave the local group intact (default deletes).
+        #[arg(long)] keep_group: bool,
     },
 }
 
@@ -48,8 +53,9 @@ fn main() -> anyhow::Result<()> {
     use anyhow::{anyhow, Context};
     let cli = Cli::parse();
     match cli.cmd {
-        Some(Cmd::Install { remove: true, .. }) => install::remove(),
         Some(Cmd::Install { check: true, .. }) => install::check(),
+        Some(Cmd::Install { verify: true, .. }) => install::verify(),
+        Some(Cmd::Install { remove: true, keep_group, .. }) => install::remove(keep_group),
         Some(Cmd::Install { port, .. }) => install::install(port),
         None => {
             // Build a policy.

@@ -13,9 +13,10 @@ import type { SandboxDependencyCheck } from './linux-sandbox-utils.js'
 
 /**
  * Windows sandbox parameters. Mirrors the macOS/Linux shape but the
- * v1 WFP+SID design does NOT enforce filesystem restrictions inside
- * the sandbox — the child runs with the user's primary SID at Medium
- * IL plus an extra SANDBOX_SID used only as a WFP filter key. The
+ * v1 WFP+SID (deny-only-group) design does NOT enforce filesystem
+ * restrictions inside the sandbox — the child runs as the broker
+ * user at Medium IL with a single discriminator group flipped
+ * deny-only and `SidsToDisable` for `BUILTIN\Administrators`. The
  * `readConfig`/`writeConfig` fields are accepted for API parity and
  * logged for debugging, but not enforced.
  */

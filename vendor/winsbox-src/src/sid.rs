@@ -1,35 +1,33 @@
-// Cribbed: SID-string helpers from acl_stamper.rs in winsbox-msys2-iter.
-//! Deterministic per-machine SANDBOX_SID for the WFP+SID network sandbox.
+//! PSID + SID-string helpers and per-user / per-group SID lookups.
 //!
-//! Responsibilities:
-//!   - Read `HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid` and SHA-256
-//!     it to derive 4 u32 subauthorities.
-//!   - Build the SID via `AllocateAndInitializeSid` with identifier
-//!     authority `SECURITY_RESOURCE_MANAGER_AUTHORITY` (9) and five
-//!     subauthorities ending in a fixed RID of `1` so the same machine
-//!     can mint variant SIDs later by changing only the RID.
-//!   - Cache the result in a `OnceLock` so callers can hold static refs.
+//! Used by `wfp.rs`, `install.rs`, `launch.rs`, `token.rs`. The earlier
+//! deterministic-machine-SID logic (sha256 of MachineGuid → custom
+//! SECURITY_RESOURCE_MANAGER_AUTHORITY SID) is gone — empirical work
+//! (`Y:\synthetic-sid-probe.md`) showed `CreateRestrictedToken` cannot
+//! inject SIDs that aren't already in the source token, so the
+//! discriminator must be a real local group.
 
 use anyhow::{anyhow, Context, Result};
 use std::ffi::c_void;
-use std::sync::OnceLock;
 use windows::core::PWSTR;
-use windows::Win32::Foundation::{LocalFree, HLOCAL};
-use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
+use windows::Win32::Security::Authorization::{
+    ConvertSidToStringSidW, ConvertStringSidToSidW,
+};
 use windows::Win32::Security::{
-    AllocateAndInitializeSid, GetLengthSid, PSID, SECURITY_RESOURCE_MANAGER_AUTHORITY,
+    GetTokenInformation, LookupAccountNameW, PSID, SID_NAME_USE, TokenGroups,
+    TokenUser, TOKEN_GROUPS, TOKEN_QUERY, TOKEN_USER,
 };
-use windows::Win32::System::Registry::{
-    RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_LOCAL_MACHINE,
-    KEY_READ, REG_VALUE_TYPE,
+use windows::Win32::System::SystemServices::{
+    SE_GROUP_ENABLED, SE_GROUP_USE_FOR_DENY_ONLY,
 };
+use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 use crate::util::{from_pwstr, pcwstr, wstr};
 
-/// Convert a string SID like `"S-1-15-2-1"` to a heap-owned PSID.
+/// Convert a string SID like `"S-1-5-32-544"` to a heap-owned PSID.
 /// Caller frees with `free_psid` / `LocalFree`.
 pub fn psid_from_string(sid_str: &str) -> Result<PSID> {
-    use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
     let mut sid = PSID::default();
     let w = wstr(sid_str);
     unsafe {
@@ -42,7 +40,9 @@ pub fn psid_from_string(sid_str: &str) -> Result<PSID> {
 /// Free a SID returned by `psid_from_string`.
 pub fn free_psid(sid: PSID) {
     if !sid.0.is_null() {
-        unsafe { let _ = LocalFree(HLOCAL(sid.0)); }
+        unsafe {
+            let _ = LocalFree(HLOCAL(sid.0));
+        }
     }
 }
 
@@ -59,114 +59,132 @@ pub fn psid_to_string(sid: PSID) -> Result<String> {
     Ok(s)
 }
 
-static SANDBOX_SID_BYTES: OnceLock<&'static [u8]> = OnceLock::new();
-static SANDBOX_SID_STR: OnceLock<String> = OnceLock::new();
-
-/// Read `HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid` (REG_SZ).
-fn read_machine_guid() -> Result<String> {
+/// Resolve the SID of a local-machine account (user or group). Calls
+/// `LookupAccountNameW` with a `NULL` system name, which restricts the
+/// resolution to the local SAM. Returns the SID in string form.
+pub fn lookup_local_account_sid(name: &str) -> Result<String> {
     unsafe {
-        let mut hkey = HKEY::default();
-        let subkey = wstr("SOFTWARE\\Microsoft\\Cryptography");
-        let err = RegOpenKeyExW(
-            HKEY_LOCAL_MACHINE,
-            pcwstr(&subkey),
-            0,
-            KEY_READ,
-            &mut hkey,
+        let mut cb_sid: u32 = 0;
+        let mut cch_dom: u32 = 0;
+        let mut use_: SID_NAME_USE = SID_NAME_USE::default();
+        let name_w = wstr(name);
+        // First call to size the buffer. Returns ERROR_INSUFFICIENT_BUFFER.
+        let _ = LookupAccountNameW(
+            windows::core::PCWSTR::null(),
+            pcwstr(&name_w),
+            PSID::default(),
+            &mut cb_sid,
+            PWSTR::null(),
+            &mut cch_dom,
+            &mut use_,
         );
-        if err.0 != 0 {
-            return Err(anyhow!("RegOpenKeyExW(HKLM\\SOFTWARE\\Microsoft\\Cryptography): {}", err.0));
+        if cb_sid == 0 {
+            return Err(anyhow!("LookupAccountNameW({name}): zero size"));
         }
-        // First call: query size.
-        let value_name = wstr("MachineGuid");
-        let mut data_type = REG_VALUE_TYPE::default();
-        let mut cb: u32 = 0;
-        let err = RegQueryValueExW(
-            hkey,
-            pcwstr(&value_name),
-            None,
-            Some(&mut data_type),
-            None,
-            Some(&mut cb),
-        );
-        if err.0 != 0 {
-            let _ = RegCloseKey(hkey);
-            return Err(anyhow!("RegQueryValueExW(MachineGuid) size: {}", err.0));
-        }
-        let mut buf = vec![0u8; cb as usize];
-        let err = RegQueryValueExW(
-            hkey,
-            pcwstr(&value_name),
-            None,
-            Some(&mut data_type),
-            Some(buf.as_mut_ptr()),
-            Some(&mut cb),
-        );
-        let _ = RegCloseKey(hkey);
-        if err.0 != 0 {
-            return Err(anyhow!("RegQueryValueExW(MachineGuid): {}", err.0));
-        }
-        // Interpret as UTF-16, drop trailing NULs.
-        let slice = std::slice::from_raw_parts(
-            buf.as_ptr() as *const u16,
-            (cb as usize) / 2,
-        );
-        let mut s = String::from_utf16_lossy(slice);
-        while s.ends_with('\0') {
-            s.pop();
-        }
-        Ok(s)
-    }
-}
-
-/// Return the deterministic per-machine SANDBOX_SID as raw PSID bytes.
-/// Cached for process lifetime.
-pub fn sandbox_sid() -> Result<&'static [u8]> {
-    if let Some(s) = SANDBOX_SID_BYTES.get() {
-        return Ok(*s);
-    }
-    let guid = read_machine_guid().context("read MachineGuid")?;
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(guid.as_bytes());
-    // Take 4 u32 subauthorities (little-endian) from the first 16 bytes.
-    let sub0 = u32::from_le_bytes(digest[0..4].try_into().unwrap());
-    let sub1 = u32::from_le_bytes(digest[4..8].try_into().unwrap());
-    let sub2 = u32::from_le_bytes(digest[8..12].try_into().unwrap());
-    let sub3 = u32::from_le_bytes(digest[12..16].try_into().unwrap());
-    let sub4: u32 = 1;
-    let mut psid = PSID::default();
-    unsafe {
-        AllocateAndInitializeSid(
-            &SECURITY_RESOURCE_MANAGER_AUTHORITY,
-            5,
-            sub0, sub1, sub2, sub3, sub4,
-            0, 0, 0,
-            &mut psid,
+        let mut sid_buf = vec![0u8; cb_sid as usize];
+        let mut dom_buf = vec![0u16; cch_dom as usize];
+        LookupAccountNameW(
+            windows::core::PCWSTR::null(),
+            pcwstr(&name_w),
+            PSID(sid_buf.as_mut_ptr() as *mut c_void),
+            &mut cb_sid,
+            PWSTR(dom_buf.as_mut_ptr()),
+            &mut cch_dom,
+            &mut use_,
         )
-        .map_err(|e| anyhow!("AllocateAndInitializeSid: {e}"))?;
-        let len = GetLengthSid(psid) as usize;
-        // Copy the SID into a Vec, then heap-leak. AllocateAndInitializeSid
-        // returns a SID that must be freed with FreeSid; we copy then free.
-        let src = std::slice::from_raw_parts(psid.0 as *const u8, len);
-        let owned: Box<[u8]> = src.to_vec().into_boxed_slice();
-        windows::Win32::Security::FreeSid(psid);
-        let leaked: &'static [u8] = Box::leak(owned);
-        let _ = SANDBOX_SID_BYTES.set(leaked);
-        Ok(leaked)
+        .map_err(|e| anyhow!("LookupAccountNameW({name}): {e}"))?;
+        let psid = PSID(sid_buf.as_mut_ptr() as *mut c_void);
+        psid_to_string(psid)
     }
 }
 
-/// Return the SDDL string form of `sandbox_sid()`. Cached for process
-/// lifetime.
-pub fn sandbox_sid_string() -> Result<&'static str> {
-    if let Some(s) = SANDBOX_SID_STR.get() {
-        return Ok(s.as_str());
+/// Return the current process token user's SID in string form.
+pub fn current_user_sid() -> Result<String> {
+    unsafe {
+        let mut tok = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut tok)
+            .context("OpenProcessToken")?;
+        // Size query.
+        let mut len = 0u32;
+        let _ = GetTokenInformation(tok, TokenUser, None, 0, &mut len);
+        let mut buf = vec![0u8; len as usize];
+        let r = GetTokenInformation(
+            tok,
+            TokenUser,
+            Some(buf.as_mut_ptr() as *mut c_void),
+            len,
+            &mut len,
+        );
+        let _ = CloseHandle(tok);
+        r.context("GetTokenInformation(TokenUser)")?;
+        let tu = &*(buf.as_ptr() as *const TOKEN_USER);
+        psid_to_string(tu.User.Sid)
     }
-    let bytes = sandbox_sid()?;
-    let psid = PSID(bytes.as_ptr() as *mut c_void);
-    let s = psid_to_string(psid)?;
-    let _ = SANDBOX_SID_STR.set(s);
-    Ok(SANDBOX_SID_STR.get().unwrap().as_str())
+}
+
+/// State of a SID inside the current process's `TokenGroups`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupState {
+    /// SID is in TokenGroups and the `SE_GROUP_ENABLED` bit is set.
+    Enabled,
+    /// SID is in TokenGroups but marked deny-only
+    /// (`SE_GROUP_USE_FOR_DENY_ONLY`).
+    DenyOnly,
+    /// SID is in TokenGroups but neither enabled nor deny-only — caller
+    /// can decide whether to treat it as missing.
+    Present,
+    /// SID isn't in TokenGroups at all.
+    Absent,
+}
+
+/// Inspect the current process token to see how `target_sid` (string
+/// form) appears in `TokenGroups`. Used by the broker to verify that
+/// the user has logged out + back in after install (`Absent`) and to
+/// distinguish a fresh broker invocation (`Enabled`) from a stale token
+/// (`DenyOnly`).
+pub fn group_state_for_self(target_sid: &str) -> Result<GroupState> {
+    let target = psid_from_string(target_sid)?;
+    let state = group_state_inner(target);
+    free_psid(target);
+    state
+}
+
+fn group_state_inner(target: PSID) -> Result<GroupState> {
+    unsafe {
+        let mut tok = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut tok)
+            .context("OpenProcessToken")?;
+        let mut len = 0u32;
+        let _ = GetTokenInformation(tok, TokenGroups, None, 0, &mut len);
+        let mut buf = vec![0u8; len as usize];
+        let r = GetTokenInformation(
+            tok,
+            TokenGroups,
+            Some(buf.as_mut_ptr() as *mut c_void),
+            len,
+            &mut len,
+        );
+        let _ = CloseHandle(tok);
+        r.context("GetTokenInformation(TokenGroups)")?;
+        let tg = &*(buf.as_ptr() as *const TOKEN_GROUPS);
+        let arr = std::slice::from_raw_parts(
+            tg.Groups.as_ptr(),
+            tg.GroupCount as usize,
+        );
+        for g in arr {
+            if windows::Win32::Security::EqualSid(target, g.Sid).is_ok() {
+                let attrs = g.Attributes as i32;
+                if attrs & SE_GROUP_USE_FOR_DENY_ONLY != 0 {
+                    return Ok(GroupState::DenyOnly);
+                }
+                if attrs & SE_GROUP_ENABLED != 0 {
+                    return Ok(GroupState::Enabled);
+                }
+                return Ok(GroupState::Present);
+            }
+        }
+        Ok(GroupState::Absent)
+    }
 }
 
 #[cfg(test)]
@@ -180,5 +198,13 @@ mod tests {
         let s = psid_to_string(p).expect("to_string");
         assert_eq!(s, "S-1-1-0");
         free_psid(p);
+    }
+
+    #[test]
+    fn psid_lookup_local_users_group() {
+        // BUILTIN\Users is universally present; this also confirms
+        // `LookupAccountNameW(NULL, ...)` works in our shim.
+        let s = lookup_local_account_sid("BUILTIN\\Users").expect("BUILTIN\\Users");
+        assert_eq!(s, "S-1-5-32-545");
     }
 }

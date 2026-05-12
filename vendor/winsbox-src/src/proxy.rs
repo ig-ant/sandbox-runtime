@@ -1,13 +1,25 @@
 //! Loopback SOCKS5 proxy server. The broker runs this; the sandboxed
-//! child reaches it via `HTTP_PROXY=socks5h://127.0.0.1:<port>` etc.
+//! child reaches it via `HTTP_PROXY=socks5h://<secret>:x@127.0.0.1:<port>`
+//! etc.
 //!
-//! NO AUTH + CONNECT only. ATYP IPv4 / hostname / IPv6.
-//! Thread-per-connection. PID lookup is informational only (WFP is the
-//! security boundary).
+//! SOCKS5 username/password (RFC 1929) auth + CONNECT only. ATYP IPv4 /
+//! hostname / IPv6. The username carries the per-launch 32-byte secret
+//! (hex-encoded); password ignored. Defense in depth — even though the
+//! WFP filter shape pins egress to the proxy for sandbox children, the
+//! port is also reachable from other same-user processes, so rotate the
+//! secret per launch.
+//!
+//! Shutdown: the listener is set non-blocking and polls the shutdown
+//! flag every 100ms. (Phase 2's self-connect pattern unblocked
+//! `accept` but didn't reliably tear down on Windows TS-runtime; the
+//! poll loop is simpler.)
 
 use anyhow::{anyhow, Context, Result};
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{
+    IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream,
+    ToSocketAddrs,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -40,7 +52,9 @@ impl Dialer for DirectDialer {
     fn dial(&self, h: &Host<'_>, p: u16) -> io::Result<TcpStream> {
         let timeout = Duration::from_secs(30);
         match h {
-            Host::Ip(ip) => TcpStream::connect_timeout(&SocketAddr::new(*ip, p), timeout),
+            Host::Ip(ip) => {
+                TcpStream::connect_timeout(&SocketAddr::new(*ip, p), timeout)
+            }
             Host::Name(name) => {
                 let addrs = (*name, p).to_socket_addrs()?;
                 let mut last_err: Option<io::Error> = None;
@@ -50,7 +64,9 @@ impl Dialer for DirectDialer {
                         Err(e) => last_err = Some(e),
                     }
                 }
-                Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::AddrNotAvailable, "no addresses")))
+                Err(last_err.unwrap_or_else(|| {
+                    io::Error::new(io::ErrorKind::AddrNotAvailable, "no addresses")
+                }))
             }
         }
     }
@@ -63,7 +79,9 @@ pub struct UpstreamSocks5 {
     pub port: u16,
 }
 
-/// Running proxy handle. Drop joins the listener thread.
+/// Running proxy handle. Drop sets shutdown flag and joins the listener
+/// thread; the non-blocking poll inside the thread tears the listener
+/// down within ~100ms.
 pub struct Proxy {
     shutdown: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
@@ -74,58 +92,101 @@ pub struct Proxy {
 impl Drop for Proxy {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
-        // Trigger accept loop exit by connecting once to ourselves.
-        let _ = std::net::TcpStream::connect_timeout(
-            &SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), self.port),
-            Duration::from_millis(250),
-        );
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
     }
 }
 
+/// Generate a fresh 32-byte secret (64 hex chars). Defense-in-depth: a
+/// same-user process that finds the proxy port still has to know the
+/// secret to use it.
+pub fn generate_secret() -> String {
+    // Use the OS RNG: `BCryptGenRandom`-equivalent via std's hashing
+    // is not appropriate; stitch entropy from getrandom-ish API on
+    // Windows. We don't want to pull a dep, so use SystemFunction036
+    // (RtlGenRandom). Available on every supported Windows.
+    use windows::Win32::Security::Cryptography::{
+        BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+    };
+    let mut buf = [0u8; 32];
+    unsafe {
+        let _ = BCryptGenRandom(
+            None,
+            &mut buf,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        );
+    }
+    let mut s = String::with_capacity(64);
+    for b in &buf {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
 /// Start the SOCKS5 listener on `127.0.0.1:<port>` and return a handle
 /// the caller keeps alive for the lifetime of the sandboxed child.
-pub fn start(port: u16, dialer: Box<dyn Dialer>) -> Result<Proxy> {
+///
+/// `secret` is the SOCKS5 username (hex string) that the proxy will
+/// accept. If `None`, no auth is required (test/legacy mode).
+pub fn start(
+    port: u16,
+    dialer: Box<dyn Dialer>,
+    secret: Option<String>,
+) -> Result<Proxy> {
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
     let listener = TcpListener::bind(addr).with_context(|| {
         format!(
-            "TcpListener::bind({addr}); if WSAEADDRINUSE inspect `Get-NetTCPConnection -LocalPort {port}` and reinstall with --port"
+            "TcpListener::bind({addr}); if WSAEADDRINUSE inspect \
+             `Get-NetTCPConnection -LocalPort {port}` and reinstall with --port"
         )
     })?;
-    // Short timeout so we can periodically check shutdown.
-    listener.set_nonblocking(false).ok();
+    // Non-blocking so we can poll the shutdown flag.
+    listener.set_nonblocking(true).ok();
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_c = Arc::clone(&shutdown);
     let dialer: Arc<dyn Dialer> = Arc::from(dialer);
+    let secret_arc: Arc<Option<String>> = Arc::new(secret);
 
     let handle = std::thread::Builder::new()
         .name("winsbox-proxy-accept".to_string())
         .spawn(move || {
-            for incoming in listener.incoming() {
+            loop {
                 if shutdown_c.load(Ordering::SeqCst) {
                     break;
                 }
-                match incoming {
-                    Ok(client) => {
+                match listener.accept() {
+                    Ok((client, _addr)) => {
                         let dialer = Arc::clone(&dialer);
+                        let secret = Arc::clone(&secret_arc);
                         std::thread::spawn(move || {
-                            if let Err(e) = handle_client(client, dialer) {
+                            // Always restore blocking mode on the
+                            // accepted socket — non-blocking inherits
+                            // from the listener on some Windows builds.
+                            let _ = client.set_nonblocking(false);
+                            if let Err(e) = handle_client(client, dialer, secret) {
                                 eprintln!("[winsbox-proxy] client error: {e:#}");
                             }
                         });
                     }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
                     Err(e) => {
                         eprintln!("[winsbox-proxy] accept: {e}");
+                        std::thread::sleep(Duration::from_millis(100));
                     }
                 }
             }
         })
         .context("spawn proxy accept thread")?;
 
-    Ok(Proxy { shutdown, handle: Some(handle), port })
+    Ok(Proxy {
+        shutdown,
+        handle: Some(handle),
+        port,
+    })
 }
 
 fn read_exact(s: &mut TcpStream, n: usize) -> io::Result<Vec<u8>> {
@@ -134,7 +195,11 @@ fn read_exact(s: &mut TcpStream, n: usize) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-fn handle_client(mut client: TcpStream, dialer: Arc<dyn Dialer>) -> Result<()> {
+fn handle_client(
+    mut client: TcpStream,
+    dialer: Arc<dyn Dialer>,
+    expected_secret: Arc<Option<String>>,
+) -> Result<()> {
     client.set_read_timeout(Some(Duration::from_secs(30)))?;
     client.set_write_timeout(Some(Duration::from_secs(30)))?;
 
@@ -145,11 +210,38 @@ fn handle_client(mut client: TcpStream, dialer: Arc<dyn Dialer>) -> Result<()> {
     }
     let nm = hdr[1] as usize;
     let methods = read_exact(&mut client, nm)?;
-    if !methods.contains(&0x00) {
-        let _ = client.write_all(&[0x05, 0xFF]);
-        return Err(anyhow!("no NO-AUTH method offered"));
+
+    if expected_secret.is_some() {
+        // Require USER/PASS (0x02). Reject NO-AUTH.
+        if !methods.contains(&0x02) {
+            let _ = client.write_all(&[0x05, 0xFF]);
+            return Err(anyhow!("client did not offer USER/PASS auth"));
+        }
+        client.write_all(&[0x05, 0x02])?;
+        // RFC 1929 sub-negotiation:
+        //   [VER=0x01, ULEN, UNAME, PLEN, PASSWD]
+        let auth_hdr = read_exact(&mut client, 2)?;
+        if auth_hdr[0] != 0x01 {
+            return Err(anyhow!("bad sub-negotiation VER: {}", auth_hdr[0]));
+        }
+        let ulen = auth_hdr[1] as usize;
+        let uname = read_exact(&mut client, ulen)?;
+        let plen = read_exact(&mut client, 1)?[0] as usize;
+        let _passwd = read_exact(&mut client, plen)?;
+        let want = expected_secret.as_ref().as_ref().unwrap();
+        if uname != want.as_bytes() {
+            // STATUS=0x01 (failure).
+            let _ = client.write_all(&[0x01, 0x01]);
+            return Err(anyhow!("auth failed: bad username"));
+        }
+        client.write_all(&[0x01, 0x00])?;
+    } else {
+        if !methods.contains(&0x00) {
+            let _ = client.write_all(&[0x05, 0xFF]);
+            return Err(anyhow!("no NO-AUTH method offered"));
+        }
+        client.write_all(&[0x05, 0x00])?;
     }
-    client.write_all(&[0x05, 0x00])?;
 
     // Request: [VER, CMD, RSV, ATYP, ADDR, PORT]
     let req_hdr = read_exact(&mut client, 4)?;
@@ -157,34 +249,30 @@ fn handle_client(mut client: TcpStream, dialer: Arc<dyn Dialer>) -> Result<()> {
         return Err(anyhow!("bad SOCKS version on request"));
     }
     if req_hdr[1] != 0x01 {
-        // Command not supported.
-        let _ = client.write_all(&[0x05, 0x07, 0x00, 0x01, 0,0,0,0, 0,0]);
+        let _ = client.write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
         return Err(anyhow!("unsupported SOCKS cmd: {}", req_hdr[1]));
     }
     let atyp = req_hdr[3];
     let (host_owned, host_repr): (Vec<u8>, String) = match atyp {
         0x01 => {
-            // IPv4: 4 bytes.
             let a = read_exact(&mut client, 4)?;
             let ip = Ipv4Addr::new(a[0], a[1], a[2], a[3]);
             (a, ip.to_string())
         }
         0x03 => {
-            // DOMAINNAME: 1-byte length + N bytes.
             let l = read_exact(&mut client, 1)?[0] as usize;
             let n = read_exact(&mut client, l)?;
             let s = String::from_utf8_lossy(&n).to_string();
             (n, s)
         }
         0x04 => {
-            // IPv6: 16 bytes.
             let a = read_exact(&mut client, 16)?;
             let arr: [u8; 16] = a.as_slice().try_into().unwrap();
             let ip = Ipv6Addr::from(arr);
             (a, ip.to_string())
         }
         _ => {
-            let _ = client.write_all(&[0x05, 0x08, 0x00, 0x01, 0,0,0,0, 0,0]);
+            let _ = client.write_all(&[0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
             return Err(anyhow!("bad ATYP: {atyp}"));
         }
     };
@@ -203,7 +291,6 @@ fn handle_client(mut client: TcpStream, dialer: Arc<dyn Dialer>) -> Result<()> {
         _ => Host::Name(host_repr.as_str()),
     };
 
-    // PID lookup (informational).
     let pid = pid_for_connection(&client).unwrap_or(0);
     eprintln!(
         "[winsbox-proxy] accept pid={pid} dst={host_repr}:{port} via=direct"
@@ -213,14 +300,12 @@ fn handle_client(mut client: TcpStream, dialer: Arc<dyn Dialer>) -> Result<()> {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[winsbox-proxy] dial {host_repr}:{port} failed: {e}");
-            let _ = client.write_all(&[0x05, 0x05, 0x00, 0x01, 0,0,0,0, 0,0]);
+            let _ = client.write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
             return Err(anyhow!("dial: {e}"));
         }
     };
-    // Success reply with BND.ADDR=0.0.0.0:0.
-    client.write_all(&[0x05, 0x00, 0x00, 0x01, 0,0,0,0, 0,0])?;
+    client.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])?;
 
-    // Splice client <-> upstream.
     splice(client, upstream);
     Ok(())
 }
@@ -251,7 +336,8 @@ fn splice(client: TcpStream, upstream: TcpStream) {
 /// only; WFP is the actual security boundary.
 fn pid_for_connection(client: &TcpStream) -> Option<u32> {
     use windows::Win32::NetworkManagement::IpHelper::{
-        GetExtendedTcpTable, MIB_TCPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_CONNECTIONS,
+        GetExtendedTcpTable, MIB_TCPTABLE_OWNER_PID,
+        TCP_TABLE_OWNER_PID_CONNECTIONS,
     };
     use windows::Win32::Networking::WinSock::AF_INET;
     let local = client.local_addr().ok()?;
@@ -268,8 +354,12 @@ fn pid_for_connection(client: &TcpStream) -> Option<u32> {
     unsafe {
         let mut size: u32 = 0;
         let _ = GetExtendedTcpTable(
-            None, &mut size, false, AF_INET.0 as u32,
-            TCP_TABLE_OWNER_PID_CONNECTIONS, 0,
+            None,
+            &mut size,
+            false,
+            AF_INET.0 as u32,
+            TCP_TABLE_OWNER_PID_CONNECTIONS,
+            0,
         );
         if size == 0 {
             return None;
@@ -277,8 +367,11 @@ fn pid_for_connection(client: &TcpStream) -> Option<u32> {
         let mut buf = vec![0u8; size as usize];
         let rc = GetExtendedTcpTable(
             Some(buf.as_mut_ptr() as *mut std::ffi::c_void),
-            &mut size, false, AF_INET.0 as u32,
-            TCP_TABLE_OWNER_PID_CONNECTIONS, 0,
+            &mut size,
+            false,
+            AF_INET.0 as u32,
+            TCP_TABLE_OWNER_PID_CONNECTIONS,
+            0,
         );
         if rc != 0 {
             return None;
@@ -287,22 +380,17 @@ fn pid_for_connection(client: &TcpStream) -> Option<u32> {
         let n = table.dwNumEntries as usize;
         let rows = std::slice::from_raw_parts(table.table.as_ptr(), n);
         for r in rows {
-            // GetExtendedTcpTable stores ports in network byte order in
-            // the low 16 bits of the u32. Local/remote addresses are in
-            // network byte order (big-endian) inside a u32.
-            let r_local_port = u16::from_be_bytes([(r.dwLocalPort & 0xff) as u8, ((r.dwLocalPort >> 8) & 0xff) as u8]);
-            let r_remote_port = u16::from_be_bytes([(r.dwRemotePort & 0xff) as u8, ((r.dwRemotePort >> 8) & 0xff) as u8]);
-            // Compare both ends. The server-side socket sees:
-            //   local = (its listen addr, listen port)
-            //   peer  = (client ip, client ephemeral port)
-            // The GetExtendedTcpTable row whose local=server-local and
-            // remote=client-peer is the matching server-side row; the
-            // row with local=client-peer and remote=server-local is the
-            // client's row — that's what we want (the connecting PID).
+            let r_local_port = u16::from_be_bytes([
+                (r.dwLocalPort & 0xff) as u8,
+                ((r.dwLocalPort >> 8) & 0xff) as u8,
+            ]);
+            let r_remote_port = u16::from_be_bytes([
+                (r.dwRemotePort & 0xff) as u8,
+                ((r.dwRemotePort >> 8) & 0xff) as u8,
+            ]);
             let row_local_ip = Ipv4Addr::from(r.dwLocalAddr.to_le_bytes());
             let row_remote_ip = Ipv4Addr::from(r.dwRemoteAddr.to_le_bytes());
 
-            // Look for the client side: row_local=peer, row_remote=local.
             if row_local_ip == *peer_v4.ip()
                 && r_local_port == peer_v4.port()
                 && row_remote_ip == *local_v4.ip()
@@ -315,3 +403,23 @@ fn pid_for_connection(client: &TcpStream) -> Option<u32> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secret_is_64_hex_chars() {
+        let s = generate_secret();
+        assert_eq!(s.len(), 64);
+        assert!(s.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn secrets_differ_between_calls() {
+        let a = generate_secret();
+        let b = generate_secret();
+        // Probability of collision on 256 random bits is astronomically
+        // low; if this ever fires legitimately we have RNG problems.
+        assert_ne!(a, b);
+    }
+}
