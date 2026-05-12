@@ -2,7 +2,11 @@ name: Tests
 
 on:
   push:
-    branches: ['main']
+    branches:
+      - 'main'
+      # Run CI on push for the active Phase 4 work branch so we can
+      # iterate without opening a draft PR.
+      - 'winsbox-wfp-sid-denyonly'
   pull_request:
     branches: ['**']
 
