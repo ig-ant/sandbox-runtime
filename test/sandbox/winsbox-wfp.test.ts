@@ -450,8 +450,7 @@ d('winsbox WFP+SID matrix', () => {
     // resolver did NOT return a successful "address" record.
     const looksOk = r.status === 0 && /address/i.test(r.stdout)
     expect(looksOk).toBe(false)
-  }, // Bun's per-test default is 5s; our spawn timeout is 10s, so the
-  // outer wrapper has to be at least that long for the failure
+  }, // outer wrapper has to be at least that long for the failure // Bun's per-test default is 5s; our spawn timeout is 10s, so the
   // signal to surface as a real `expect` mismatch instead of a
   // framework kill.
   15_000)
@@ -561,29 +560,57 @@ d('winsbox WFP+SID matrix', () => {
 
   const msysAvailable = fileExists(MSYS_BASH)
   const gitBashAvailable = fileExists(GIT_BASH)
+  // Git-for-Windows ships the MSYS2 runtime (current Git on ARM64 uses
+  // `MSYSTEM=CLANGARM64`); cygwin path translation and the shared
+  // userland (curl/git/openssl, fork/exec, $HOME, /c/Users) all work
+  // there. So tests that don't need MSYS2-exclusive tools
+  // (pacman, wget) prefer the MSYS2 bash but transparently fall back
+  // to Git-bash. Tests that DO need MSYS2-only tools stay gated on
+  // `msysAvailable`.
+  const PRIMARY_BASH: string | undefined = msysAvailable
+    ? MSYS_BASH
+    : gitBashAvailable
+      ? GIT_BASH
+      : undefined
+  const PRIMARY_BASH_LABEL = msysAvailable
+    ? 'msys2'
+    : gitBashAvailable
+      ? 'git-bash'
+      : 'none'
+  const anyMsysFamilyBash = PRIMARY_BASH !== undefined
 
-  test.skipIf(!msysAvailable)('E1: msys2 bash curl example.com', () => {
+  test.skipIf(!anyMsysFamilyBash)(
+    `E1: ${PRIMARY_BASH_LABEL} bash curl example.com`,
+    () => {
+      if (preflightFailure) return
+      const r = runSboxed([
+        PRIMARY_BASH!,
+        '-c',
+        'curl -sS -o /dev/null -w "%{http_code}" https://example.com',
+      ])
+      expect(r.status).toBe(0)
+      expect(r.stdout.trim()).toBe('200')
+    },
+  )
+
+  test.skipIf(!anyMsysFamilyBash)(`E2: ${PRIMARY_BASH_LABEL} git clone`, () => {
     if (preflightFailure) return
     const r = runSboxed([
-      MSYS_BASH,
+      PRIMARY_BASH!,
       '-c',
-      'curl -sS -o /dev/null -w "%{http_code}" https://example.com',
+      'git ls-remote https://github.com/anthropic-experimental/sandbox-runtime | head -n3',
     ])
+    // `git ls-remote` orders HEAD first then refs/heads — checking
+    // for either covers both git versions / output orderings. The
+    // load-bearing assertion is the exit code + that we got something
+    // SHA1-looking back through the proxy.
     expect(r.status).toBe(0)
-    expect(r.stdout.trim()).toBe('200')
+    expect(r.stdout).toMatch(/HEAD|refs\/heads/)
+    expect(r.stdout).toMatch(/^[0-9a-f]{40}\b/m)
   })
 
-  test.skipIf(!msysAvailable)('E2: msys2 git clone', () => {
-    if (preflightFailure) return
-    const r = runSboxed([
-      MSYS_BASH,
-      '-c',
-      'git ls-remote https://github.com/anthropic-experimental/sandbox-runtime | head -n1',
-    ])
-    expect(r.status).toBe(0)
-    expect(r.stdout).toMatch(/refs\/heads/)
-  })
-
+  // E3 requires `wget`, which ships with MSYS2 but NOT Git-bash —
+  // keep this row strictly MSYS2-gated.
   test.skipIf(!msysAvailable)('E3: msys2 wget', () => {
     if (preflightFailure) return
     const r = runSboxed([
@@ -595,27 +622,39 @@ d('winsbox WFP+SID matrix', () => {
     expect(r.stdout.trim()).toBe('OK')
   })
 
-  // E4 — skipped per CI report (pacman mirrors are flaky in CI).
+  // E4 — skipped per CI report (pacman mirrors are flaky in CI). Also
+  // pacman is MSYS2-only, not in Git-bash.
   test.skip('E4: msys2 pacman -Sy (flaky mirrors in CI)', () => {})
 
-  test.skipIf(!msysAvailable)(
-    'E5: msys2 openssl s_client TLS handshake',
+  test.skipIf(!anyMsysFamilyBash)(
+    `E5: ${PRIMARY_BASH_LABEL} openssl s_client direct egress blocked`,
     () => {
+      // openssl s_client doesn't speak SOCKS5 natively — it takes
+      // either a raw `-connect <host:port>` (direct TCP) or
+      // `-proxy <host:port>` (HTTP CONNECT, not SOCKS). Our broker
+      // only exposes a SOCKS5 listener, so the direct connect must
+      // hit F3 BLOCK. This row exercises the security property
+      // (direct TLS egress denied), not proxy correctness — the
+      // latter is covered by E1's curl row.
       if (preflightFailure) return
       const r = runSboxed(
         [
-          MSYS_BASH,
+          PRIMARY_BASH!,
           '-c',
-          'echo | openssl s_client -connect example.com:443 -servername example.com 2>&1 | grep -E "Verify return code|CONNECTED"',
+          // Print whatever openssl says (stderr+stdout) so we can
+          // assert no successful handshake landed.
+          'echo | openssl s_client -connect example.com:443 -servername example.com 2>&1; echo "RC=$?"',
         ],
-        { timeoutMs: 20_000 },
+        { timeoutMs: 15_000 },
       )
-      // openssl exits 0 once the handshake closes cleanly; tolerate
-      // non-zero if grep finds nothing — checked by stdout regex.
-      expect(r.stdout).toMatch(/CONNECTED|Verify return code/)
+      // Successful handshake would contain BOTH "CONNECTED" (TCP up)
+      // and a TLS line; if WFP did its job neither should appear.
+      expect(r.stdout).not.toMatch(/Verify return code: 0/)
     },
   )
 
+  // E6 — Git-bash specifically (separate row even when MSYS2 is the
+  // primary bash above, so we cover both shells when present).
   test.skipIf(!gitBashAvailable)('E6: Git-for-Windows bash curl', () => {
     if (preflightFailure) return
     const r = runSboxed([
@@ -698,21 +737,31 @@ d('winsbox WFP+SID matrix', () => {
     expect(r.status).not.toBe(0)
   })
 
-  test.skipIf(!msysAvailable)('F6: cygwin paths resolve', () => {
-    const r = runSboxed([MSYS_BASH, '-c', 'ls /c/Users >/dev/null && echo OK'])
-    expect(r.status).toBe(0)
-    expect(r.stdout.trim()).toBe('OK')
-  })
+  test.skipIf(!anyMsysFamilyBash)(
+    `F6: ${PRIMARY_BASH_LABEL} cygwin paths resolve`,
+    () => {
+      const r = runSboxed([
+        PRIMARY_BASH!,
+        '-c',
+        'ls /c/Users >/dev/null && echo OK',
+      ])
+      expect(r.status).toBe(0)
+      expect(r.stdout.trim()).toBe('OK')
+    },
+  )
 
-  test.skipIf(!msysAvailable)('F7: msys2 home file round-trip', () => {
-    const r = runSboxed([
-      MSYS_BASH,
-      '-c',
-      'set -e; echo x > "$HOME/sb-roundtrip" && cat "$HOME/sb-roundtrip" && rm "$HOME/sb-roundtrip"',
-    ])
-    expect(r.status).toBe(0)
-    expect(r.stdout.trim()).toBe('x')
-  })
+  test.skipIf(!anyMsysFamilyBash)(
+    `F7: ${PRIMARY_BASH_LABEL} home file round-trip`,
+    () => {
+      const r = runSboxed([
+        PRIMARY_BASH!,
+        '-c',
+        'set -e; echo x > "$HOME/sb-roundtrip" && cat "$HOME/sb-roundtrip" && rm "$HOME/sb-roundtrip"',
+      ])
+      expect(r.status).toBe(0)
+      expect(r.stdout.trim()).toBe('x')
+    },
+  )
 
   test('F8: .ssh listing exits 0 and returns an integer (softened per CI report)', () => {
     const r = runSboxed([
@@ -756,8 +805,7 @@ d('winsbox WFP+SID matrix', () => {
       setTimeout(finish, 5000)
     })
     expect(child.killed || child.exitCode !== null).toBe(true)
-  }, // 1.5s startup + up to 5s exit-wait + taskkill — bun's default 5s
-  // per-test budget eats the wait. Give it 15s.
+  }, // per-test budget eats the wait. Give it 15s. // 1.5s startup + up to 5s exit-wait + taskkill — bun's default 5s
   15_000)
 
   test('G2: powershell ($PID) inside sandbox', () => {
