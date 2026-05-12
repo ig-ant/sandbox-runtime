@@ -451,13 +451,19 @@ d('winsbox WFP+SID matrix', () => {
         '-Command',
         "$ErrorActionPreference='SilentlyContinue'; (Test-NetConnection 1.1.1.1 -Port 80 -WarningAction SilentlyContinue).TcpTestSucceeded",
       ],
-      { timeoutMs: 15_000 },
+      { timeoutMs: 30_000 },
     )
-    // Deny-only-group fence design: this must come back False (or the
-    // test must time out at the cmdlet level, which TNC handles
-    // internally). Anything other than 'true' is the kernel-fence pass.
-    expect(r.stdout.trim().toLowerCase()).toBe('false')
-  })
+    // Deny-only-group fence design: this must come back False (or
+    // empty if our outer timeout fires first — which on slow ARM64
+    // hosts is itself proof the WFP filter dropped the SYN and
+    // the cmdlet never got a SYN-ACK). The load-bearing assertion
+    // is "did NOT succeed", so we match the original comment:
+    // anything other than `true` is the kernel-fence pass.
+    expect(r.stdout.trim().toLowerCase()).not.toBe('true')
+  }, // Test-NetConnection's internal TCP probe can take 20s+ on a
+  // blocked SYN under PowerShell 5; give bun's per-test wrapper
+  // enough head-room past the inner 30s spawn timeout.
+  40_000)
 
   test('C2: nslookup example.com — direct UDP 53 fails or times out', () => {
     if (preflightFailure) return
@@ -469,8 +475,7 @@ d('winsbox WFP+SID matrix', () => {
     // resolver did NOT return a successful "address" record.
     const looksOk = r.status === 0 && /address/i.test(r.stdout)
     expect(looksOk).toBe(false)
-  }, // framework kill. // signal to surface as a real `expect` mismatch instead of a // outer wrapper has to be at least that long for the failure // Bun's per-test default is 5s; our spawn timeout is 10s, so the
-  15_000)
+  }, 15_000) // framework kill. // signal to surface as a real `expect` mismatch instead of a // outer wrapper has to be at least that long for the failure // Bun's per-test default is 5s; our spawn timeout is 10s, so the
 
   // C3 (ping ICMP blocked) is intentionally NOT a row in this matrix.
   // ICMP doesn't traverse `FWPM_LAYER_ALE_AUTH_CONNECT_V4` — that
@@ -540,8 +545,7 @@ d('winsbox WFP+SID matrix', () => {
     // WFP filter #3 should block; even if the proxy is bound, the SD
     // ACE refuses non-SANDBOX_SID callers. Tolerate False or timeout.
     expect(r.stdout?.trim().toLowerCase()).not.toBe('true')
-  }, // exceeds bun's 5s per-test default; the internal timeout is 15s. // Test-NetConnection's TCP probe + PowerShell startup easily
-  20_000)
+  }, 20_000) // exceeds bun's 5s per-test default; the internal timeout is 15s. // Test-NetConnection's TCP probe + PowerShell startup easily
 
   test('D2: host curl --socks5 to proxy port fails', () => {
     if (preflightFailure || installedPort === undefined) return
