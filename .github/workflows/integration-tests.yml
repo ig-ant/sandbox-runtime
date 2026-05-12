@@ -39,6 +39,13 @@ jobs:
           - arch: x86-64
             runner: windows-latest
             os: windows
+          # Windows ARM64 leg — same WFP+SID flow, run on the
+          # `windows-11-arm` hosted runner (GA mid-2025). MSYS2 is not
+          # preinstalled on this image, so E1/E2/E5/F6/F7 fall back to
+          # Git-bash automatically (commit 3fa52a6).
+          - arch: arm64
+            runner: windows-11-arm
+            os: windows
 
     steps:
       - name: Checkout code
@@ -47,7 +54,12 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '18'
+          # The Windows leg's sandbox-runtime build chain relies on
+          # Node 20+ (the `https` agent fixes the older Node 18 image
+          # ships with break IPv6 SOCKS5 connect retries). Linux/macOS
+          # legs are unaffected but pinning the whole matrix to 20
+          # avoids two install paths.
+          node-version: '20'
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -99,13 +111,22 @@ jobs:
       - name: Install ripgrep (Windows)
         if: matrix.os == 'windows'
         shell: pwsh
+        # `windows-11-arm` may lack both rg AND chocolatey; on x64 rg
+        # is typically preinstalled. Soft-fail so a missing rg only
+        # downgrades B2/B3 to skips (test gates on `where rg`) rather
+        # than failing the whole leg.
+        continue-on-error: true
         run: |
-          # ripgrep is preinstalled on most images, but install
-          # defensively in case the image rotation drops it.
-          if (-not (Get-Command rg -ErrorAction SilentlyContinue)) {
-            choco install ripgrep -y --no-progress
+          if (Get-Command rg -ErrorAction SilentlyContinue) {
+            rg --version
+            exit 0
           }
-          rg --version
+          if (Get-Command choco -ErrorAction SilentlyContinue) {
+            choco install ripgrep -y --no-progress
+            rg --version
+            exit 0
+          }
+          Write-Host "ripgrep not present and choco missing; B2/B3 will skip on this leg"
 
       - name: Build sbox-exec (Windows)
         if: matrix.os == 'windows'
