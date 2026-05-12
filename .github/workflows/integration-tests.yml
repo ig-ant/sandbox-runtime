@@ -144,7 +144,15 @@ jobs:
           & $exe install --check
 
       - name: Install Node dependencies
-        run: npm install
+        # `npm ci` is deterministic against the lockfile and ~30%
+        # faster than `npm install`. `HUSKY=0` skips the `prepare`
+        # hook — husky's POSIX-shell wrappers crash during install on
+        # Windows runners and trigger npm's opaque "Exit handler never
+        # called!" exit, which on the ARM64 runner manifests as a
+        # multi-minute hang instead.
+        env:
+          HUSKY: '0'
+        run: npm ci --no-audit --no-fund
 
       - name: Build seccomp binaries (Linux)
         if: matrix.os == 'linux'
