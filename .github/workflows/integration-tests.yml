@@ -135,14 +135,6 @@ jobs:
         run: |
           cargo build --release --bin sbox-exec --bin probe_token
 
-      - name: Install WFP filters (Windows)
-        if: matrix.os == 'windows'
-        shell: pwsh
-        run: |
-          $exe = "vendor\winsbox-src\target\release\sbox-exec.exe"
-          & $exe install
-          & $exe install --check
-
       - name: Install Node dependencies
         # `npm ci` is deterministic against the lockfile and ~30%
         # faster than `npm install`. `HUSKY=0` skips the `prepare`
@@ -165,11 +157,41 @@ jobs:
         if: matrix.os != 'windows'
         run: npm test
 
+      # IMPORTANT: WFP filters MUST install AFTER `npm ci` and
+      # `npm run build`. `sbox-exec install` writes a deny-only-group
+      # fence that the runner's existing user-mode token can't pass
+      # (the new `winsbox-allowed` group is created post-login, so the
+      # runner's TokenGroups doesn't carry it at all → F3 BLOCK fires
+      # for every direct egress). Once filters are up, anything that
+      # needs the network — npm registry, GitHub for ls-remote, the
+      # actions/upload-artifact step's chunked upload — hangs until
+      # the runner cancels. So install RIGHT BEFORE the test step that
+      # actually exercises the filter, and tear down RIGHT AFTER.
+      - name: Install WFP filters (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $exe = "vendor\winsbox-src\target\release\sbox-exec.exe"
+          & $exe install
+          & $exe install --check
+
       - name: Run winsbox WFP+SID tests (Windows)
         if: matrix.os == 'windows'
         shell: pwsh
         env:
           SBOX_EXEC_PATH: ${{ github.workspace }}\vendor\winsbox-src\target\release\sbox-exec.exe
+          # On hosted runners the runner's existing logon session
+          # predates the `winsbox-allowed` group, so the broker's
+          # TokenGroups doesn't carry it. `WINSBOX_SKIP_GROUP_CHECK=1`
+          # demotes the absent-group precondition to a warning so the
+          # A/C/D/F/G/H rows can still run. The B/E network-egress
+          # rows are gated separately below.
+          WINSBOX_SKIP_GROUP_CHECK: '1'
+          # The same group-absent reality means the broker itself
+          # can't pass F1, so any test whose body needs broker→real-
+          # internet (B1/B2/B4/B5/E1/E2/E5/E6) will fail. Surface that
+          # to the test file so those rows skip rather than red-flag.
+          WINSBOX_CI_BROKER_HAS_NO_GROUP: '1'
         run: |
           bun test test/sandbox/winsbox-wfp.test.ts --timeout 60000
 
