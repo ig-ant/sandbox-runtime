@@ -777,12 +777,18 @@ d('winsbox WFP+SID matrix', () => {
   )
 
   test.skipIf(!anyMsysFamilyBash)(
-    `F7: ${PRIMARY_BASH_LABEL} home file round-trip`,
+    `F7: ${PRIMARY_BASH_LABEL} write+read+unlink file round-trip`,
     () => {
+      // Use `mktemp -d` instead of $HOME — GHA hosted runners run as
+      // `runneradmin` whose MSYS2 $HOME (/home/runneradmin) isn't
+      // created by default, so the original `echo x > "$HOME/..."`
+      // form failed at the redirect with no useful signal. mktemp -d
+      // gives us a known-good filesystem location in MSYS2-mapped
+      // /tmp and still exercises the underlying NTFS+ACL path.
       const r = runSboxed([
         PRIMARY_BASH!,
         '-c',
-        'set -e; echo x > "$HOME/sb-roundtrip" && cat "$HOME/sb-roundtrip" && rm "$HOME/sb-roundtrip"',
+        'set -e; d=$(mktemp -d); echo x > "$d/sb-roundtrip" && cat "$d/sb-roundtrip" && rm -rf "$d"',
       ])
       expect(r.status).toBe(0)
       expect(r.stdout.trim()).toBe('x')
