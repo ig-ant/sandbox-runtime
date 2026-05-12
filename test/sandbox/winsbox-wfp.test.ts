@@ -65,6 +65,19 @@ function getProbeTokenPath(): string {
 // once (the marker file at C:\ProgramData\winsbox\installed.json).
 const isCI = process.env.CI === 'true' || process.env.CI === '1'
 
+// On hosted CI runners the runner process's logon session predates
+// `sbox-exec install`, so the broker's TokenGroups doesn't carry
+// `winsbox-allowed`. F1 (PERMIT group-enabled) never fires for the
+// broker, which means the SOCKS5 proxy can't dial out to the real
+// internet on the sandbox child's behalf. Tests that need
+// broker→remote egress (B-rows, E1/E2/E5/E6 curl/git/openssl) get
+// gated on this flag and skipped in that environment.
+//   The fix is structural — the broker needs a refreshed token. A
+// future commit could spawn the test process via a Scheduled Task
+// to acquire one, but for v1 we accept reduced CI coverage. Locally
+// the rows still run after logout/login.
+const brokerHasNoGroup = process.env.WINSBOX_CI_BROKER_HAS_NO_GROUP === '1'
+
 /** The JS-API path goes through SandboxManager.initialize which runs
  * the shared `checkDependencies` step — that probes for `rg` even on
  * Windows. Until ripgrep is wired into the Windows toolchain bundle,
@@ -262,35 +275,38 @@ d('winsbox WFP+SID matrix', () => {
 
   // ─────────────────── Group B: egress flows through proxy ───────────────────
 
-  test('B1: system curl https://example.com — 200 via proxy', () => {
-    if (preflightFailure) {
-      // eslint-disable-next-line no-console
-      console.warn('[B1] skipping due to preflight failure')
-      return
-    }
-    if (!fileExists(CURL_EXE)) {
-      // eslint-disable-next-line no-console
-      console.warn('[B1] curl.exe not present on this host')
-      return
-    }
-    const r = runSboxed([
-      CURL_EXE,
-      '-sS',
-      '-o',
-      'NUL',
-      '-w',
-      '%{http_code}',
-      'https://example.com',
-    ])
-    expect(r.status).toBe(0)
-    expect(r.stdout.trim()).toBe('200')
-    // The proxy log on stderr should record the connect; tolerate
-    // alternate phrasing — checking for example.com is enough to
-    // prove the SOCKS path was taken.
-    expect(r.stderr).toMatch(/example\.com/)
-  })
+  test.skipIf(brokerHasNoGroup)(
+    'B1: system curl https://example.com — 200 via proxy',
+    () => {
+      if (preflightFailure) {
+        // eslint-disable-next-line no-console
+        console.warn('[B1] skipping due to preflight failure')
+        return
+      }
+      if (!fileExists(CURL_EXE)) {
+        // eslint-disable-next-line no-console
+        console.warn('[B1] curl.exe not present on this host')
+        return
+      }
+      const r = runSboxed([
+        CURL_EXE,
+        '-sS',
+        '-o',
+        'NUL',
+        '-w',
+        '%{http_code}',
+        'https://example.com',
+      ])
+      expect(r.status).toBe(0)
+      expect(r.stdout.trim()).toBe('200')
+      // The proxy log on stderr should record the connect; tolerate
+      // alternate phrasing — checking for example.com is enough to
+      // prove the SOCKS path was taken.
+      expect(r.stderr).toMatch(/example\.com/)
+    },
+  )
 
-  test.skipIf(!hasRipgrep)(
+  test.skipIf(!hasRipgrep || brokerHasNoGroup)(
     'B2: powershell Invoke-WebRequest example.com (JS-API)',
     async () => {
       if (preflightFailure) return
@@ -305,7 +321,7 @@ d('winsbox WFP+SID matrix', () => {
 
   // B3 / B4: github clone — load-bearing for real-world use but slow
   // and dependent on GitHub reachability. Skip locally; CI exercises.
-  test.skipIf(!isCI || !hasRipgrep)(
+  test.skipIf(!isCI || !hasRipgrep || brokerHasNoGroup)(
     'B3: cmd /c curl github.com via JS-API',
     async () => {
       const r = await runViaJsApi(
@@ -316,16 +332,19 @@ d('winsbox WFP+SID matrix', () => {
     },
   )
 
-  test.skipIf(!fileExists(GIT_EXE))('B4: git clone over proxy', () => {
-    if (preflightFailure) return
-    const r = runSboxed([
-      GIT_EXE,
-      'ls-remote',
-      'https://github.com/anthropic-experimental/sandbox-runtime',
-    ])
-    expect(r.status).toBe(0)
-    expect(r.stdout).toMatch(/refs\/heads/)
-  })
+  test.skipIf(!fileExists(GIT_EXE) || brokerHasNoGroup)(
+    'B4: git clone over proxy',
+    () => {
+      if (preflightFailure) return
+      const r = runSboxed([
+        GIT_EXE,
+        'ls-remote',
+        'https://github.com/anthropic-experimental/sandbox-runtime',
+      ])
+      expect(r.status).toBe(0)
+      expect(r.stdout).toMatch(/refs\/heads/)
+    },
+  )
 
   test.skipIf(!fileExists(NODE_EXE))(
     'B5: node https.get direct egress is blocked',
@@ -450,8 +469,7 @@ d('winsbox WFP+SID matrix', () => {
     // resolver did NOT return a successful "address" record.
     const looksOk = r.status === 0 && /address/i.test(r.stdout)
     expect(looksOk).toBe(false)
-  }, // outer wrapper has to be at least that long for the failure // Bun's per-test default is 5s; our spawn timeout is 10s, so the
-  // signal to surface as a real `expect` mismatch instead of a
+  }, // signal to surface as a real `expect` mismatch instead of a // outer wrapper has to be at least that long for the failure // Bun's per-test default is 5s; our spawn timeout is 10s, so the
   // framework kill.
   15_000)
 
@@ -523,7 +541,9 @@ d('winsbox WFP+SID matrix', () => {
     // WFP filter #3 should block; even if the proxy is bound, the SD
     // ACE refuses non-SANDBOX_SID callers. Tolerate False or timeout.
     expect(r.stdout?.trim().toLowerCase()).not.toBe('true')
-  })
+  }, // Test-NetConnection's TCP probe + PowerShell startup easily
+  // exceeds bun's 5s per-test default; the internal timeout is 15s.
+  20_000)
 
   test('D2: host curl --socks5 to proxy port fails', () => {
     if (preflightFailure || installedPort === undefined) return
@@ -545,7 +565,7 @@ d('winsbox WFP+SID matrix', () => {
       { encoding: 'utf-8', timeout: 10_000 },
     )
     expect(r.status).not.toBe(0)
-  })
+  }, 15_000)
 
   // D3 — DEFER. The "broker-as-host-user TCP client" check would
   // require an in-process test harness inside sbox-exec; punt to
@@ -579,7 +599,7 @@ d('winsbox WFP+SID matrix', () => {
       : 'none'
   const anyMsysFamilyBash = PRIMARY_BASH !== undefined
 
-  test.skipIf(!anyMsysFamilyBash)(
+  test.skipIf(!anyMsysFamilyBash || brokerHasNoGroup)(
     `E1: ${PRIMARY_BASH_LABEL} bash curl example.com`,
     () => {
       if (preflightFailure) return
@@ -593,25 +613,28 @@ d('winsbox WFP+SID matrix', () => {
     },
   )
 
-  test.skipIf(!anyMsysFamilyBash)(`E2: ${PRIMARY_BASH_LABEL} git clone`, () => {
-    if (preflightFailure) return
-    const r = runSboxed([
-      PRIMARY_BASH!,
-      '-c',
-      'git ls-remote https://github.com/anthropic-experimental/sandbox-runtime | head -n3',
-    ])
-    // `git ls-remote` orders HEAD first then refs/heads — checking
-    // for either covers both git versions / output orderings. The
-    // load-bearing assertion is the exit code + that we got something
-    // SHA1-looking back through the proxy.
-    expect(r.status).toBe(0)
-    expect(r.stdout).toMatch(/HEAD|refs\/heads/)
-    expect(r.stdout).toMatch(/^[0-9a-f]{40}\b/m)
-  })
+  test.skipIf(!anyMsysFamilyBash || brokerHasNoGroup)(
+    `E2: ${PRIMARY_BASH_LABEL} git clone`,
+    () => {
+      if (preflightFailure) return
+      const r = runSboxed([
+        PRIMARY_BASH!,
+        '-c',
+        'git ls-remote https://github.com/anthropic-experimental/sandbox-runtime | head -n3',
+      ])
+      // `git ls-remote` orders HEAD first then refs/heads — checking
+      // for either covers both git versions / output orderings. The
+      // load-bearing assertion is the exit code + that we got something
+      // SHA1-looking back through the proxy.
+      expect(r.status).toBe(0)
+      expect(r.stdout).toMatch(/HEAD|refs\/heads/)
+      expect(r.stdout).toMatch(/^[0-9a-f]{40}\b/m)
+    },
+  )
 
   // E3 requires `wget`, which ships with MSYS2 but NOT Git-bash —
   // keep this row strictly MSYS2-gated.
-  test.skipIf(!msysAvailable)('E3: msys2 wget', () => {
+  test.skipIf(!msysAvailable || brokerHasNoGroup)('E3: msys2 wget', () => {
     if (preflightFailure) return
     const r = runSboxed([
       MSYS_BASH,
@@ -655,16 +678,19 @@ d('winsbox WFP+SID matrix', () => {
 
   // E6 — Git-bash specifically (separate row even when MSYS2 is the
   // primary bash above, so we cover both shells when present).
-  test.skipIf(!gitBashAvailable)('E6: Git-for-Windows bash curl', () => {
-    if (preflightFailure) return
-    const r = runSboxed([
-      GIT_BASH,
-      '-c',
-      'curl -sS -o /dev/null -w "%{http_code}" https://example.com',
-    ])
-    expect(r.status).toBe(0)
-    expect(r.stdout.trim()).toBe('200')
-  })
+  test.skipIf(!gitBashAvailable || brokerHasNoGroup)(
+    'E6: Git-for-Windows bash curl',
+    () => {
+      if (preflightFailure) return
+      const r = runSboxed([
+        GIT_BASH,
+        '-c',
+        'curl -sS -o /dev/null -w "%{http_code}" https://example.com',
+      ])
+      expect(r.status).toBe(0)
+      expect(r.stdout.trim()).toBe('200')
+    },
+  )
 
   // ─────────────────── Group F: Filesystem unchanged ───────────────────
 
@@ -805,8 +831,7 @@ d('winsbox WFP+SID matrix', () => {
       setTimeout(finish, 5000)
     })
     expect(child.killed || child.exitCode !== null).toBe(true)
-  }, // per-test budget eats the wait. Give it 15s. // 1.5s startup + up to 5s exit-wait + taskkill — bun's default 5s
-  15_000)
+  }, 15_000) // per-test budget eats the wait. Give it 15s. // 1.5s startup + up to 5s exit-wait + taskkill — bun's default 5s
 
   test('G2: powershell ($PID) inside sandbox', () => {
     const r = runSboxed([POWERSHELL_EXE, '-NoProfile', '-Command', '$PID'])

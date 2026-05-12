@@ -176,14 +176,31 @@ pub fn run(pol: &Policy) -> Result<u32> {
     }
 
     // 3) Group must be enabled in our TokenGroups; if it's absent the
-    //    user hasn't logged out and back in yet.
+    //    user hasn't logged out and back in yet. Hosted CI runners
+    //    can't logout/login mid-job, so `WINSBOX_SKIP_GROUP_CHECK=1`
+    //    downgrades the Absent case to a warning. The broker will
+    //    still fail to *pass* its own outbound traffic through F1 in
+    //    that state (egress tests B* will be red on CI) but the
+    //    token-shape, deny-only-fence, and lifecycle rows can still
+    //    run end-to-end. Don't ship this in a non-CI broker.
+    let skip_group_check =
+        std::env::var_os("WINSBOX_SKIP_GROUP_CHECK").is_some();
     match sid::group_state_for_self(&marker.group_sid)? {
         GroupState::Enabled => {}
+        GroupState::Absent if skip_group_check => {
+            eprintln!(
+                "[sbox-exec] WARNING: winsbox-allowed group is absent from \
+                 the current token but WINSBOX_SKIP_GROUP_CHECK is set; \
+                 proceeding. Broker-side egress through the proxy will be \
+                 blocked by F3 until logout/login refreshes TokenGroups."
+            );
+        }
         GroupState::Absent => {
             return Err(anyhow!(
                 "winsbox-allowed group ({}) is not present in the current \
                  token. Log out and log back in to refresh TokenGroups, then \
-                 retry. (`sbox-exec install --verify` confirms.)",
+                 retry. (`sbox-exec install --verify` confirms.) Set \
+                 WINSBOX_SKIP_GROUP_CHECK=1 to bypass in CI.",
                 marker.group_sid
             ));
         }
