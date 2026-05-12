@@ -46,17 +46,21 @@ use windows::Win32::NetworkManagement::NetManagement::{
     LOCALGROUP_INFO_1, LOCALGROUP_MEMBERS_INFO_0,
 };
 use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
-    FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterAdd0, FwpmFilterDeleteByKey0,
+    FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterAdd0,
+    FwpmFilterCreateEnumHandle0, FwpmFilterDeleteByKey0,
+    FwpmFilterDestroyEnumHandle0, FwpmFilterEnum0, FwpmFreeMemory0,
     FwpmSubLayerAdd0, FwpmSubLayerDeleteByKey0, FwpmTransactionAbort0,
     FwpmTransactionBegin0, FwpmTransactionCommit0, FWPM_ACTION0, FWPM_ACTION0_0,
     FWPM_CONDITION_ALE_USER_ID, FWPM_CONDITION_IP_REMOTE_ADDRESS,
     FWPM_CONDITION_IP_REMOTE_PORT, FWPM_DISPLAY_DATA0, FWPM_FILTER0,
-    FWPM_FILTER_CONDITION0, FWPM_FILTER_FLAG_PERSISTENT,
-    FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_LAYER_ALE_AUTH_CONNECT_V6,
-    FWPM_SUBLAYER0, FWPM_SUBLAYER_FLAG_PERSISTENT, FWP_ACTION_BLOCK,
-    FWP_ACTION_PERMIT, FWP_BYTE_ARRAY16, FWP_BYTE_BLOB, FWP_CONDITION_VALUE0,
-    FWP_CONDITION_VALUE0_0, FWP_MATCH_EQUAL, FWP_SECURITY_DESCRIPTOR_TYPE,
-    FWP_UINT16, FWP_UINT32, FWP_VALUE0, FWP_VALUE0_0,
+    FWPM_FILTER_CONDITION0, FWPM_FILTER_ENUM_TEMPLATE0,
+    FWPM_FILTER_FLAG_PERSISTENT, FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+    FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWPM_SUBLAYER0,
+    FWPM_SUBLAYER_FLAG_PERSISTENT, FWP_ACTION_BLOCK, FWP_ACTION_PERMIT,
+    FWP_BYTE_ARRAY16, FWP_BYTE_BLOB, FWP_CONDITION_VALUE0,
+    FWP_CONDITION_VALUE0_0, FWP_FILTER_ENUM_OVERLAPPING, FWP_MATCH_EQUAL,
+    FWP_SECURITY_DESCRIPTOR_TYPE, FWP_UINT16, FWP_UINT32, FWP_VALUE0,
+    FWP_VALUE0_0,
 };
 use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows::Win32::Security::{
@@ -95,6 +99,14 @@ const FILTER_GUIDS: [GUID; 6] = [
     filter_guid(5),
     filter_guid(6),
 ];
+
+// Phase 2 sublayer GUID — the SANDBOX_SID restricting-array design's
+// persistent filters would race with our deny-only-group filters at
+// the cross-sublayer policy-arbitration step. We enumerate-and-delete
+// any filters under this GUID at install AND uninstall.
+// {a4f4e62c-3d8a-4f3a-9b9e-d2f5e8a17b41}
+const LEGACY_SUBLAYER_GUID: GUID =
+    GUID::from_u128(0xa4f4e62c_3d8a_4f3a_9b9e_d2f5e8a17b41);
 
 // WFP errors we want to swallow.
 const FWP_E_ALREADY_EXISTS: u32 = 0x80320009;
@@ -372,7 +384,11 @@ pub fn ensure_group_exists() -> Result<()> {
             &info as *const _ as *const u8,
             None,
         );
-        if rc != 0 && rc != NERR_GroupExists {
+        // ERROR_ALIAS_EXISTS (1379) is what SAM actually returns for an
+        // existing local group; NERR_GroupExists (2223) is the
+        // documented value some paths return. Treat both as idempotent.
+        const ERROR_ALIAS_EXISTS: u32 = 1379;
+        if rc != 0 && rc != NERR_GroupExists && rc != ERROR_ALIAS_EXISTS {
             return Err(anyhow!("NetLocalGroupAdd({GROUP_NAME}): {rc}"));
         }
         Ok(())
@@ -439,6 +455,119 @@ pub fn group_exists() -> Result<bool> {
 
 // ────────────────────── WFP install/uninstall ──────────────────────
 
+/// Enumerate every filter at `layer` and delete the ones whose
+/// `subLayerKey == target_sublayer`. Used to clean up stragglers from
+/// an older install (different sublayer GUID) and to make `install`
+/// idempotent against a stale-state machine. Idempotent and best-effort
+/// — partial failures inside the enum are logged, not propagated.
+fn delete_filters_in_sublayer(
+    engine: HANDLE,
+    target_sublayer: &GUID,
+    layers: &[GUID],
+) -> Result<usize> {
+    use windows::Win32::Foundation::HANDLE as F_HANDLE;
+    let mut total = 0usize;
+    for layer in layers {
+        let mut tmpl = FWPM_FILTER_ENUM_TEMPLATE0::default();
+        tmpl.layerKey = *layer;
+        tmpl.enumType = FWP_FILTER_ENUM_OVERLAPPING;
+        tmpl.actionMask = 0xFFFF_FFFF;
+        let mut h: F_HANDLE = F_HANDLE::default();
+        let rc = unsafe {
+            FwpmFilterCreateEnumHandle0(engine, Some(&tmpl), &mut h)
+        };
+        if rc != 0 {
+            eprintln!(
+                "[sbox-exec] cleanup: FwpmFilterCreateEnumHandle0(layer={layer:?}) \
+                 rc=0x{rc:08x} — skipping this layer"
+            );
+            continue;
+        }
+
+        loop {
+            let mut entries: *mut *mut FWPM_FILTER0 = std::ptr::null_mut();
+            let mut n: u32 = 0;
+            let rc = unsafe {
+                FwpmFilterEnum0(engine, h, 256, &mut entries, &mut n)
+            };
+            if rc != 0 {
+                eprintln!(
+                    "[sbox-exec] cleanup: FwpmFilterEnum0 rc=0x{rc:08x} — stopping"
+                );
+                break;
+            }
+            if n == 0 {
+                if !entries.is_null() {
+                    unsafe { FwpmFreeMemory0(&mut (entries as *mut _)) };
+                }
+                break;
+            }
+            let slice = unsafe {
+                std::slice::from_raw_parts(entries, n as usize)
+            };
+            for &fp in slice {
+                if fp.is_null() {
+                    continue;
+                }
+                let f = unsafe { &*fp };
+                if &f.subLayerKey == target_sublayer {
+                    let key = f.filterKey;
+                    let rc = unsafe { FwpmFilterDeleteByKey0(engine, &key) };
+                    if rc != 0 && rc != FWP_E_FILTER_NOT_FOUND {
+                        eprintln!(
+                            "[sbox-exec] cleanup: FwpmFilterDeleteByKey0({key:?}) \
+                             rc=0x{rc:08x}"
+                        );
+                    } else {
+                        total += 1;
+                    }
+                }
+            }
+            unsafe { FwpmFreeMemory0(&mut (entries as *mut _)) };
+            if (n as usize) < 256 {
+                break;
+            }
+        }
+
+        let rc = unsafe { FwpmFilterDestroyEnumHandle0(engine, h) };
+        if rc != 0 {
+            eprintln!(
+                "[sbox-exec] cleanup: FwpmFilterDestroyEnumHandle0 rc=0x{rc:08x}"
+            );
+        }
+    }
+    Ok(total)
+}
+
+/// Delete the legacy Phase 2 sublayer + any filters under it. Run
+/// inside the same transaction as the regular install/uninstall so
+/// committing the new state is atomic with retiring the old.
+fn purge_legacy_sublayer(engine: HANDLE) -> Result<()> {
+    let layers = [
+        FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+        FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+    ];
+    let removed = delete_filters_in_sublayer(engine, &LEGACY_SUBLAYER_GUID, &layers)?;
+    if removed > 0 {
+        eprintln!(
+            "[sbox-exec] purged {removed} filter(s) from legacy sublayer \
+             {LEGACY_SUBLAYER_GUID:?}"
+        );
+    }
+    let rc = unsafe { FwpmSubLayerDeleteByKey0(engine, &LEGACY_SUBLAYER_GUID) };
+    if rc == 0 {
+        eprintln!(
+            "[sbox-exec] removed legacy sublayer {LEGACY_SUBLAYER_GUID:?}"
+        );
+    } else if rc != FWP_E_FILTER_NOT_FOUND && rc != FWP_E_SUBLAYER_NOT_FOUND {
+        eprintln!(
+            "[sbox-exec] cleanup: FwpmSubLayerDeleteByKey0(legacy) \
+             rc=0x{rc:08x}"
+        );
+    }
+    Ok(())
+}
+
 /// Install the 6 persistent WFP filters keyed on `group_sid_str` and
 /// `user_sid_str`. `proxy_port` is the loopback port the sandbox child
 /// is permitted to reach.
@@ -457,6 +586,12 @@ pub fn install_filters(
     let rc = unsafe { FwpmTransactionBegin0(engine.as_handle(), 0) };
     if rc != 0 {
         return Err(anyhow!("FwpmTransactionBegin0 failed: 0x{rc:08x}"));
+    }
+
+    // First, retire any Phase 2 (SANDBOX_SID) stragglers so they don't
+    // race the new filters in policy arbitration.
+    if let Err(e) = purge_legacy_sublayer(engine.as_handle()) {
+        eprintln!("[sbox-exec] purge_legacy_sublayer (non-fatal): {e:#}");
     }
 
     let result: Result<()> = (|| {
@@ -627,6 +762,14 @@ pub fn uninstall_filters() -> Result<()> {
         if rc != 0 && rc != FWP_E_FILTER_NOT_FOUND && rc != FWP_E_SUBLAYER_NOT_FOUND
         {
             return Err(anyhow!("FwpmSubLayerDeleteByKey0 failed: 0x{rc:08x}"));
+        }
+
+        // Also retire any leftover Phase 2 (SANDBOX_SID) sublayer +
+        // filters. Non-fatal: best-effort, matches install_filters.
+        if let Err(e) = purge_legacy_sublayer(engine.as_handle()) {
+            eprintln!(
+                "[sbox-exec] purge_legacy_sublayer (non-fatal): {e:#}"
+            );
         }
         Ok(())
     })();
