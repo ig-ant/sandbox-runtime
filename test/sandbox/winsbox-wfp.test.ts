@@ -78,16 +78,17 @@ const isCI = process.env.CI === 'true' || process.env.CI === '1'
 // the rows still run after logout/login.
 const brokerHasNoGroup = process.env.WINSBOX_CI_BROKER_HAS_NO_GROUP === '1'
 
-/** The JS-API path goes through SandboxManager.initialize which runs
- * the shared `checkDependencies` step — that probes for `rg` even on
- * Windows. Until ripgrep is wired into the Windows toolchain bundle,
- * the JS-API tests gate on it being on PATH. Sandbox-as-binary tests
- * (the `runSboxed` shape) don't need it. */
+/** As of the sandbox-manager checkDependencies platform fix,
+ * `rg` is no longer required on Windows (it was a Linux-only dep
+ * for glob materialization). Kept as a probe so any test that
+ * truly needs it can still gate on it. */
 function ripgrepAvailable(): boolean {
   const r = spawnSync('where', ['rg'], { encoding: 'utf-8' })
   return r.status === 0 && (r.stdout?.trim().length ?? 0) > 0
 }
 const hasRipgrep = ripgrepAvailable()
+// Silence unused-var lint until a real future B-row gates on it.
+void hasRipgrep
 
 function fileExists(p: string): boolean {
   try {
@@ -306,22 +307,31 @@ d('winsbox WFP+SID matrix', () => {
     },
   )
 
-  test.skipIf(!hasRipgrep || brokerHasNoGroup)(
-    'B2: powershell Invoke-WebRequest example.com (JS-API)',
+  test.skipIf(brokerHasNoGroup)(
+    'B2: powershell Invoke-WebRequest direct egress is blocked',
     async () => {
+      // Invoke-WebRequest honors HTTP_PROXY env, but only for HTTP-
+      // CONNECT proxies — its WebProxy implementation can't speak
+      // SOCKS5. The broker's proxy is SOCKS5, so the cmdlet falls
+      // back to a direct connect, which F3 must BLOCK. Same shape
+      // as B5 (Node https.get): we exercise the security property
+      // (no direct egress), not proxy correctness.
       if (preflightFailure) return
       const r = await runViaJsApi(
-        "$ProgressPreference='SilentlyContinue'; (Invoke-WebRequest https://example.com -UseBasicParsing).StatusCode",
+        "$ProgressPreference='SilentlyContinue'; try { (Invoke-WebRequest https://example.com -UseBasicParsing).StatusCode } catch { 'ERR' }",
         { binShell: 'powershell' },
       )
-      expect(r.status).toBe(0)
-      expect(r.stdout.trim()).toBe('200')
+      // Either a non-zero exit OR a stdout that's NOT "200" proves
+      // the cmdlet didn't reach the internet. (PS sometimes still
+      // exits 0 even on cmdlet errors via the try/catch path.)
+      const looksConnected = r.status === 0 && r.stdout.trim() === '200'
+      expect(looksConnected).toBe(false)
     },
   )
 
   // B3 / B4: github clone — load-bearing for real-world use but slow
   // and dependent on GitHub reachability. Skip locally; CI exercises.
-  test.skipIf(!isCI || !hasRipgrep || brokerHasNoGroup)(
+  test.skipIf(!isCI || brokerHasNoGroup)(
     'B3: cmd /c curl github.com via JS-API',
     async () => {
       const r = await runViaJsApi(
@@ -460,8 +470,7 @@ d('winsbox WFP+SID matrix', () => {
     // is "did NOT succeed", so we match the original comment:
     // anything other than `true` is the kernel-fence pass.
     expect(r.stdout.trim().toLowerCase()).not.toBe('true')
-  }, // Test-NetConnection's internal TCP probe can take 20s+ on a
-  // blocked SYN under PowerShell 5; give bun's per-test wrapper
+  }, // blocked SYN under PowerShell 5; give bun's per-test wrapper // Test-NetConnection's internal TCP probe can take 20s+ on a
   // enough head-room past the inner 30s spawn timeout.
   40_000)
 

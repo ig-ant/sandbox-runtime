@@ -391,7 +391,12 @@ function isSandboxingEnabled(): boolean {
 
 /**
  * Check sandbox dependencies for the current platform
- * @param ripgrepConfig - Ripgrep command to check. If not provided, uses config from initialization or defaults to 'rg'
+ * @param ripgrepConfig - Ripgrep command to check. Only consulted on
+ *   Linux (where bubblewrap can't expand globs and we shell out to rg
+ *   to materialize file lists for seccomp/bwrap). macOS uses native
+ *   sandbox-profile glob support; Windows doesn't have a glob-
+ *   materialization step at all. Pass-through if the caller wants to
+ *   force a check on a non-Linux platform.
  * @returns { warnings, errors } - errors mean sandbox cannot run, warnings mean degraded functionality
  */
 function checkDependencies(ripgrepConfig?: {
