@@ -98,11 +98,57 @@ fn quote_arg(a: &str) -> String {
     out
 }
 
+/// Quote an argument using cmd.exe's `/s /c` convention: wrap in outer
+/// quotes (cmd's /s flag strips them), double any literal `"`, and
+/// preserve everything else verbatim. Backslash escaping isn't honored
+/// by cmd.exe's post-/c parser — that's the bug the CommandLineToArgvW
+/// reverse in `quote_arg` walks into when the target is cmd.exe.
+fn quote_arg_for_cmd(a: &str) -> String {
+    let mut out = String::with_capacity(a.len() + 4);
+    out.push('"');
+    for c in a.chars() {
+        if c == '"' {
+            out.push('"');
+            out.push('"');
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// True if `exe`'s file name is `cmd.exe` (case-insensitive). Used to
+/// switch the trailing-arg quoting strategy.
+fn target_is_cmd(exe: &std::path::Path) -> bool {
+    exe.file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.eq_ignore_ascii_case("cmd.exe"))
+        .unwrap_or(false)
+}
+
 fn build_cmdline(exe: &std::path::Path, args: &[String]) -> String {
+    // cmd.exe special-case: when invoked with `/c <cmd>` (or `/k`),
+    // the post-/c arg is parsed by cmd's OWN /s-stripping rules, not by
+    // CommandLineToArgvW. Use `quote_arg_for_cmd` for that single arg
+    // so callers like `cmd /c 'echo "hi"'` survive the round-trip.
+    let cmd_target = target_is_cmd(exe);
+    let cmd_split = if cmd_target {
+        args.iter().position(|a| {
+            matches!(a.to_ascii_lowercase().as_str(), "/c" | "/k" | "/r")
+        })
+    } else {
+        None
+    };
     let mut s = quote_arg(&exe.display().to_string());
-    for a in args {
+    for (i, a) in args.iter().enumerate() {
         s.push(' ');
-        s.push_str(&quote_arg(a));
+        if cmd_split.map(|p| i > p).unwrap_or(false) {
+            // Inside cmd.exe's post-/c command — cmd-style quoting.
+            s.push_str(&quote_arg_for_cmd(a));
+        } else {
+            s.push_str(&quote_arg(a));
+        }
     }
     s
 }
