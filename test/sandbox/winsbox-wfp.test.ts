@@ -469,8 +469,7 @@ d('winsbox WFP+SID matrix', () => {
     // resolver did NOT return a successful "address" record.
     const looksOk = r.status === 0 && /address/i.test(r.stdout)
     expect(looksOk).toBe(false)
-  }, // signal to surface as a real `expect` mismatch instead of a // outer wrapper has to be at least that long for the failure // Bun's per-test default is 5s; our spawn timeout is 10s, so the
-  // framework kill.
+  }, // framework kill. // signal to surface as a real `expect` mismatch instead of a // outer wrapper has to be at least that long for the failure // Bun's per-test default is 5s; our spawn timeout is 10s, so the
   15_000)
 
   // C3 (ping ICMP blocked) is intentionally NOT a row in this matrix.
@@ -541,8 +540,7 @@ d('winsbox WFP+SID matrix', () => {
     // WFP filter #3 should block; even if the proxy is bound, the SD
     // ACE refuses non-SANDBOX_SID callers. Tolerate False or timeout.
     expect(r.stdout?.trim().toLowerCase()).not.toBe('true')
-  }, // Test-NetConnection's TCP probe + PowerShell startup easily
-  // exceeds bun's 5s per-test default; the internal timeout is 15s.
+  }, // exceeds bun's 5s per-test default; the internal timeout is 15s. // Test-NetConnection's TCP probe + PowerShell startup easily
   20_000)
 
   test('D2: host curl --socks5 to proxy port fails', () => {
@@ -779,17 +777,22 @@ d('winsbox WFP+SID matrix', () => {
   test.skipIf(!anyMsysFamilyBash)(
     `F7: ${PRIMARY_BASH_LABEL} write+read+unlink file round-trip`,
     () => {
-      // Use `mktemp -d` instead of $HOME — GHA hosted runners run as
-      // `runneradmin` whose MSYS2 $HOME (/home/runneradmin) isn't
-      // created by default, so the original `echo x > "$HOME/..."`
-      // form failed at the redirect with no useful signal. mktemp -d
-      // gives us a known-good filesystem location in MSYS2-mapped
-      // /tmp and still exercises the underlying NTFS+ACL path.
+      // Use a cwd-relative temp dir. $HOME (original form) wasn't
+      // created for the `runneradmin` user. `mktemp -d` (next iter)
+      // landed in /tmp which doesn't always exist in MSYS2's hosted
+      // install. The broker inherits the bun test's working
+      // directory — which is the GHA workspace, always writable.
       const r = runSboxed([
         PRIMARY_BASH!,
         '-c',
-        'set -e; d=$(mktemp -d); echo x > "$d/sb-roundtrip" && cat "$d/sb-roundtrip" && rm -rf "$d"',
+        'set -e; d="sb-tmp-$$"; mkdir "$d"; echo x > "$d/sb-roundtrip" && cat "$d/sb-roundtrip" && rm -rf "$d"',
       ])
+      if (r.status !== 0) {
+        // eslint-disable-next-line no-console
+        console.error(
+          `[F7] status=${r.status} stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`,
+        )
+      }
       expect(r.status).toBe(0)
       expect(r.stdout.trim()).toBe('x')
     },
