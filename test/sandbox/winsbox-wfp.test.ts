@@ -24,7 +24,7 @@
  * On non-Windows platforms the entire describe block is skipped.
  */
 import { describe, test, expect, beforeAll, beforeEach } from 'bun:test'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import * as fs from 'node:fs'
 import * as net from 'node:net'
 import * as os from 'node:os'
@@ -1233,6 +1233,168 @@ d('winsbox WFP+SID matrix', () => {
       expect(result.stdout).toMatch(/READ_FAIL/)
       // Sandbox sees the broker's share-mode lock: SHARING_VIOLATION.
       expect(result.stdout).toMatch(/err=32|hr=0x80070020/)
+    } finally {
+      try {
+        fs.unlinkSync(tmpFile)
+      } catch {
+        /* ignore */
+      }
+    }
+  })
+
+  // Phase 5C: ACL fallback. When `CreateFileW(share=0)` returns
+  // SHARING_VIOLATION (because some other process holds the file with
+  // permissive sharing), the broker falls back to rewriting the file's
+  // DACL to a broker-only shape (winsbox-allowed + SYSTEM + Admins +
+  // OWNER_RIGHTS=0). The sandbox child then sees ACCESS_DENIED instead
+  // of SHARING_VIOLATION — that's the discriminator between J1 and J2.
+
+  test('J2: sandbox cannot read a file when broker fell back to ACL stamp', async () => {
+    if (preflightFailure) return
+    const probe = getProbeProcPath()
+    if (!fileExists(probe)) {
+      // eslint-disable-next-line no-console
+      console.warn(`[J2] probe_proc.exe not found at ${probe}; skipping`)
+      return
+    }
+    const tmpFile = path.join(
+      os.tmpdir(),
+      `winsbox-j2-${process.pid}-${Date.now()}.secret`,
+    )
+    fs.writeFileSync(tmpFile, 'j2-secret-data')
+
+    // Spawn the holder asynchronously; wait for HOLD_OK ack via
+    // stdout. The holder holds the file with FULL share (READ |
+    // WRITE | DELETE), so broker's CreateFileW(share=0) will trip
+    // SHARING_VIOLATION → ACL fallback.
+    const holder = spawn(probe, ['hold-file', tmpFile], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+    })
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const t = setTimeout(
+          () => reject(new Error('J2 holder did not print HOLD_OK in 5s')),
+          5000,
+        )
+        const cleanup = () => clearTimeout(t)
+        holder.stdout?.on('data', (chunk: Buffer) => {
+          if (chunk.toString().includes('HOLD_OK')) {
+            cleanup()
+            resolve()
+          }
+        })
+        holder.once('error', (e) => {
+          cleanup()
+          reject(e)
+        })
+        holder.once('exit', (code) => {
+          cleanup()
+          reject(new Error(`J2 holder exited early code=${code}`))
+        })
+      })
+
+      const result = runSboxedWithDenyRead(
+        [probe, 'read-file', tmpFile],
+        [tmpFile],
+      )
+      expect(result.status).not.toBe(0)
+      expect(result.stdout).toMatch(/READ_FAIL/)
+      // ACL path: sandbox sees ACCESS_DENIED (err=5 / hr=0x80070005),
+      // NOT sharing violation (err=32). This is the discriminator
+      // between J1 (share-mode) and J2 (ACL fallback).
+      expect(result.stdout).toMatch(/err=5|hr=0x80070005/)
+    } finally {
+      try {
+        holder.kill()
+      } catch {
+        /* ignore */
+      }
+      try {
+        fs.unlinkSync(tmpFile)
+      } catch {
+        /* ignore */
+      }
+    }
+  })
+
+  test('J3: DACL is restored after broker exit (ACL fallback path)', async () => {
+    if (preflightFailure) return
+    const probe = getProbeProcPath()
+    if (!fileExists(probe)) {
+      // eslint-disable-next-line no-console
+      console.warn(`[J3] probe_proc.exe not found at ${probe}; skipping`)
+      return
+    }
+    const tmpFile = path.join(
+      os.tmpdir(),
+      `winsbox-j3-${process.pid}-${Date.now()}.secret`,
+    )
+    fs.writeFileSync(tmpFile, 'j3-data')
+
+    // Capture original DACL as SDDL.
+    const before = spawnSync(
+      POWERSHELL_EXE,
+      [
+        '-NoProfile',
+        '-Command',
+        `(Get-Acl '${tmpFile}').Sddl`,
+      ],
+      { encoding: 'utf-8' },
+    ).stdout?.trim() ?? ''
+
+    const holder = spawn(probe, ['hold-file', tmpFile], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+    })
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const t = setTimeout(
+          () => reject(new Error('J3 holder did not print HOLD_OK in 5s')),
+          5000,
+        )
+        holder.stdout?.on('data', (chunk: Buffer) => {
+          if (chunk.toString().includes('HOLD_OK')) {
+            clearTimeout(t)
+            resolve()
+          }
+        })
+        holder.once('error', (e) => {
+          clearTimeout(t)
+          reject(e)
+        })
+        holder.once('exit', (code) => {
+          clearTimeout(t)
+          reject(new Error(`J3 holder exited early code=${code}`))
+        })
+      })
+
+      // Run a broker that ACL-stamps + exits.
+      runSboxedWithDenyRead([probe, 'read-file', tmpFile], [tmpFile])
+    } finally {
+      try {
+        holder.kill()
+      } catch {
+        /* ignore */
+      }
+    }
+
+    // Give the broker's Drop a chance to finish flushing the restore
+    // (small race: Drop runs but SetSecurityInfo is async-on-the-wire).
+    await new Promise((r) => setTimeout(r, 200))
+
+    const after = spawnSync(
+      POWERSHELL_EXE,
+      [
+        '-NoProfile',
+        '-Command',
+        `(Get-Acl '${tmpFile}').Sddl`,
+      ],
+      { encoding: 'utf-8' },
+    ).stdout?.trim() ?? ''
+
+    try {
+      expect(after).toBe(before)
     } finally {
       try {
         fs.unlinkSync(tmpFile)

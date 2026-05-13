@@ -18,6 +18,7 @@ mod policy;
 #[cfg(windows)] mod winsta;
 #[cfg(windows)] mod self_protect;
 #[cfg(windows)] mod share_mode;
+#[cfg(windows)] mod acl;
 mod lock_db;
 
 use clap::{Parser, Subcommand};
@@ -86,7 +87,22 @@ fn main() -> anyhow::Result<()> {
             let db_session: Option<(lock_db::LockDb, u32)> = if phase5_db_enabled {
                 match lock_db::LockDb::open() {
                     Ok(db) => {
-                        match db.crash_recovery_scan() {
+                        // Phase 5C: supply a closure that does the
+                        // check-then-restore dance for orphaned ACL
+                        // stamps from crashed-broker sessions.
+                        let restore = |path: &str,
+                                       orig: &[u8],
+                                       stamped: &[u8]|
+                         -> anyhow::Result<bool> {
+                            let p = std::path::PathBuf::from(path);
+                            let current = acl::capture_dacl_bytes(&p)?;
+                            if current != stamped {
+                                return Ok(false);
+                            }
+                            acl::restore_full_sd(&p, orig)?;
+                            Ok(true)
+                        };
+                        match db.crash_recovery_scan_with(restore) {
                             Ok(0) => {}
                             Ok(n) => eprintln!(
                                 "[sbox-exec] phase5: pruned {n} dead session(s) from state DB"

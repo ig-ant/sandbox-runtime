@@ -297,9 +297,10 @@ pub fn run(pol: &Policy, db: Option<&LockDb>) -> Result<u32> {
         db,
         &pol.fs_deny_read,
         std::process::id(),
+        &marker.group_sid,
     )
     .map_err(|e| anyhow::anyhow!(e))
-    .context("phase 5B share-mode acquire")?;
+    .context("phase 5B/5C FS-lock acquire")?;
 
     // 5) Job.
     let job = Job::new().context("Job::new")?;

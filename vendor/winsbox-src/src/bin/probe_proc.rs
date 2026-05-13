@@ -127,6 +127,14 @@ fn main() {
                 read_file(&args[2])
             }
         }
+        "hold-file" => {
+            if args.len() < 3 {
+                eprintln!("usage: probe_proc hold-file <path>");
+                2
+            } else {
+                hold_file(&args[2])
+            }
+        }
         other => {
             eprintln!("probe_proc: unknown subcommand: {other}");
             2
@@ -534,6 +542,62 @@ fn read_file(path: &str) -> i32 {
                     "READ_FAIL stage=open hr=0x{:08x} err={le}",
                     hr.0 as u32
                 );
+                1
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn hold_file(path: &str) -> i32 {
+    // Phase 5C (J2/J3): emulate a third-party app that has the file
+    // open with permissive sharing — broker's share-mode-0 attempt
+    // will fail with SHARING_VIOLATION, forcing ACL fallback.
+    //
+    // Print HOLD_OK as soon as the handle is open so the test wrapper
+    // knows we're ready, then block on a flush of stdout + sleep
+    // forever. Parent kills us with the SIGTERM equivalent (Node's
+    // ChildProcess.kill()) at end of test.
+    use std::io::Write;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GetLastError, HANDLE};
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let h = CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            GENERIC_READ.0,
+            // FULL share: READ | WRITE | DELETE. The broker's
+            // CreateFileW(share=0) call will still fail with
+            // SHARING_VIOLATION because we don't include "no share"
+            // bits — kernel's share-mode check is symmetric.
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            HANDLE::default(),
+        );
+        match h {
+            Ok(h) => {
+                println!("HOLD_OK pid={}", std::process::id());
+                let _ = std::io::stdout().flush();
+                // Sleep until killed.
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(60));
+                }
+                #[allow(unreachable_code)]
+                {
+                    let _ = CloseHandle(h);
+                    0
+                }
+            }
+            Err(e) => {
+                let hr = e.code();
+                let le = GetLastError().0;
+                println!("HOLD_FAIL hr=0x{:08x} err={le}", hr.0 as u32);
                 1
             }
         }

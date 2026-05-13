@@ -219,13 +219,173 @@ impl LockDb {
         Ok(n)
     }
 
+    /// Phase 5C: INSERT a row into `path_locks` of kind `acl_stamp` for
+    /// the current broker, optionally inserting / updating the
+    /// matching `acl_snapshots` row in the same transaction.
+    ///
+    /// `snapshot_if_new` is `Some(original_dacl_bytes, stamped_dacl_bytes)`
+    /// the first time a path is stamped (broker that actually wrote the
+    /// DACL must pass these); subsequent brokers picking up a
+    /// previously-stamped path pass `None` and just record their
+    /// holder row.
+    pub fn insert_acl_stamp_lock(
+        &self,
+        broker_pid: u32,
+        canonical_path: &str,
+        snapshot_if_new: Option<(&[u8], &[u8])>,
+    ) -> Result<()> {
+        let now = unix_epoch_seconds();
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .context("begin insert_acl_stamp_lock tx")?;
+        if let Some((orig, stamped)) = snapshot_if_new {
+            // INSERT OR IGNORE so a racing broker that beat us to the
+            // snapshot insert doesn't lose its row. The "real" check
+            // for whether we should stamp happens in the SELECT before
+            // calling this fn — this is the "and if anyone slipped in
+            // between, defer to them" safety net.
+            tx.execute(
+                "INSERT OR IGNORE INTO acl_snapshots
+                    (canonical_path, original_dacl, stamped_dacl,
+                     captured_by_broker_pid, captured_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    canonical_path,
+                    orig,
+                    stamped,
+                    broker_pid as i64,
+                    now
+                ],
+            )
+            .context("INSERT acl_snapshots")?;
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO path_locks
+                (canonical_path, broker_pid, kind, acquired_at)
+             VALUES (?1, ?2, 'acl_stamp', ?3)",
+            params![canonical_path, broker_pid as i64, now],
+        )
+        .context("INSERT path_locks(acl_stamp)")?;
+        tx.commit().context("commit insert_acl_stamp_lock tx")?;
+        Ok(())
+    }
+
+    /// Phase 5C: query whether an `acl_snapshots` row exists for the
+    /// given canonical_path. Used by `acquire_acl_stamp` to decide
+    /// whether to call `SetSecurityInfo` (no row → stamp) or just
+    /// add a holder row (row exists → reuse).
+    pub fn acl_snapshot_exists(&self, canonical_path: &str) -> Result<bool> {
+        let n: i64 = self
+            .conn
+            .query_row(
+                "SELECT count(*) FROM acl_snapshots WHERE canonical_path = ?1",
+                params![canonical_path],
+                |r| r.get(0),
+            )
+            .context("SELECT count acl_snapshots")?;
+        Ok(n > 0)
+    }
+
+    /// Phase 5C: SELECT the snapshot pair for a path. Returns
+    /// `(original_dacl, stamped_dacl)` — bytes blobs. Used by the
+    /// release path to compare against the current DACL before
+    /// restoring.
+    pub fn get_acl_snapshot(
+        &self,
+        canonical_path: &str,
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT original_dacl, stamped_dacl FROM acl_snapshots
+                 WHERE canonical_path = ?1",
+            )
+            .context("prepare SELECT acl_snapshots")?;
+        let mut rows = stmt
+            .query(params![canonical_path])
+            .context("query acl_snapshots")?;
+        if let Some(row) = rows.next().context("row acl_snapshots")? {
+            let orig: Vec<u8> = row.get(0).context("col original_dacl")?;
+            let stamped: Vec<u8> = row.get(1).context("col stamped_dacl")?;
+            Ok(Some((orig, stamped)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Phase 5C: DELETE one `acl_snapshots` row.
+    pub fn delete_acl_snapshot(&self, canonical_path: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM acl_snapshots WHERE canonical_path = ?1",
+                params![canonical_path],
+            )
+            .context("DELETE acl_snapshots")?;
+        Ok(())
+    }
+
+    /// Phase 5C release-step transaction: delete this broker's holder
+    /// row for `canonical_path` and return how many `acl_stamp` rows
+    /// remain on the same path *after* the delete. If the returned
+    /// count is 0, the caller is the last holder and should restore.
+    pub fn delete_my_acl_stamp_holder(
+        &self,
+        broker_pid: u32,
+        canonical_path: &str,
+    ) -> Result<i64> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .context("begin delete-acl-stamp-holder tx")?;
+        tx.execute(
+            "DELETE FROM path_locks
+             WHERE broker_pid = ?1
+               AND canonical_path = ?2
+               AND kind = 'acl_stamp'",
+            params![broker_pid as i64, canonical_path],
+        )
+        .context("DELETE path_locks(acl_stamp) for self")?;
+        let remaining: i64 = tx
+            .query_row(
+                "SELECT count(*) FROM path_locks
+                 WHERE canonical_path = ?1 AND kind = 'acl_stamp'",
+                params![canonical_path],
+                |r| r.get(0),
+            )
+            .context("count remaining acl_stamp holders")?;
+        tx.commit().context("commit delete-acl-stamp-holder tx")?;
+        Ok(remaining)
+    }
+
     /// Scan `proc_sessions` for dead PIDs and prune them + their
-    /// CASCADE-deleted `path_locks`. For orphaned ACL stamps we log a
-    /// warning and delete the row, but do NOT attempt to restore the
-    /// DACL — that's 5C's job.
+    /// CASCADE-deleted `path_locks`. For each path whose last
+    /// `acl_stamp` holder is being pruned, attempt a check-then-restore
+    /// of the original DACL via `acl_restore` (the closure) and
+    /// remove the `acl_snapshots` row afterwards.
+    ///
+    /// `acl_restore(canonical_path, original_dacl_bytes,
+    ///              stamped_dacl_bytes)` should return `Ok(true)` if
+    /// the restore landed cleanly, `Ok(false)` if the current DACL no
+    /// longer matched stamped (and we should NOT restore), or `Err`
+    /// for a GetNamedSecurityInfoW / SetNamedSecurityInfoW failure
+    /// (logged + treated as "leave it").
     ///
     /// Returns count of pruned sessions.
+    #[allow(dead_code)]
     pub fn crash_recovery_scan(&self) -> Result<u32> {
+        self.crash_recovery_scan_with(|_, _, _| Ok(false))
+    }
+
+    /// Like `crash_recovery_scan` but the caller supplies an
+    /// `acl_restore` callback. Phase 5C's `main.rs` plumbing passes a
+    /// closure that calls into `acl::restore_full_sd` after a current-
+    /// DACL match. Non-Windows / non-5C callers use the default scan
+    /// above which logs orphaned stamps and moves on.
+    pub fn crash_recovery_scan_with(
+        &self,
+        mut acl_restore: impl FnMut(&str, &[u8], &[u8]) -> Result<bool>,
+    ) -> Result<u32> {
         let mut stmt = self
             .conn
             .prepare("SELECT broker_pid, process_create_time FROM proc_sessions")
@@ -249,9 +409,10 @@ impl LockDb {
             return Ok(0);
         }
 
-        // Pre-prune: log orphaned acl_stamp rows so 5C's eventual
-        // restore-during-startup logic has visibility into what got
-        // missed.
+        // Pre-prune: collect orphaned acl_stamp paths per dead pid.
+        // For each path, after the CASCADE delete (below), if no
+        // other broker still holds it, attempt restore.
+        let mut orphan_paths: Vec<String> = Vec::new();
         for &pid_i in &dead {
             let mut s = self
                 .conn
@@ -264,11 +425,7 @@ impl LockDb {
                 .query_map(params![pid_i], |row| row.get::<_, String>(0))
                 .context("query_map orphan acl_stamp")?;
             for row in iter {
-                let path = row.context("row acl_stamp")?;
-                eprintln!(
-                    "[winsbox lock_db] WARNING: orphaned ACL stamp at {path} \
-                     from dead pid {pid_i}; DACL restore deferred to phase 5C"
-                );
+                orphan_paths.push(row.context("row acl_stamp")?);
             }
         }
 
@@ -285,6 +442,66 @@ impl LockDb {
             .context("DELETE dead proc_sessions")?;
         }
         tx.commit().context("commit crash-recovery tx")?;
+
+        // Phase 5C: for each orphan path, check whether ANY live
+        // acl_stamp holder remains after the CASCADE prune. If not,
+        // we own the cleanup — try restore (via caller's closure) and
+        // delete the acl_snapshots row regardless of restore outcome.
+        // Deduplicate paths to avoid double-restore attempts.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for path in orphan_paths {
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            let still_held: i64 = self
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM path_locks
+                     WHERE canonical_path = ?1 AND kind = 'acl_stamp'",
+                    params![&path],
+                    |r| r.get(0),
+                )
+                .context("count remaining acl_stamp holders post-prune")?;
+            if still_held > 0 {
+                // A live broker still holds an ACL stamp on this path
+                // — leave the snapshot alone; it'll Drop properly.
+                continue;
+            }
+            // Get the snapshot pair, dispatch to the restore callback,
+            // delete the snapshot row regardless of the outcome (we
+            // won't get another chance).
+            let snap = self.get_acl_snapshot(&path)?;
+            if let Some((orig, stamped)) = snap {
+                match acl_restore(&path, &orig, &stamped) {
+                    Ok(true) => {
+                        eprintln!(
+                            "[winsbox lock_db] crash recovery: restored DACL on {path}"
+                        );
+                    }
+                    Ok(false) => {
+                        eprintln!(
+                            "[winsbox lock_db] WARNING: crash recovery on {path}: \
+                             current DACL no longer matches stamped — leaving alone"
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[winsbox lock_db] WARNING: crash recovery DACL \
+                             restore on {path}: {e:#}"
+                        );
+                    }
+                }
+            } else {
+                // Path had an acl_stamp row but no acl_snapshots row.
+                // Shouldn't happen in normal operation, but if it does
+                // we have nothing to restore from — just log.
+                eprintln!(
+                    "[winsbox lock_db] WARNING: orphaned acl_stamp on {path} \
+                     but no acl_snapshots row; nothing to restore"
+                );
+            }
+            self.delete_acl_snapshot(&path)?;
+        }
         Ok(dead.len() as u32)
     }
 }
