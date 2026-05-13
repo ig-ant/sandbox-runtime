@@ -18,9 +18,10 @@
 //!                                              confirm the Layer-1 stack
 //!                                              actually reaches the child.
 //!   - `enum-windows`                         — `EnumWindows` (count desktop windows).
-//!   - `read-clipboard`                       — `OpenClipboard(NULL)`.
+//!   - `read-clipboard`                       — `OpenClipboard(NULL)` + `GetClipboardData`.
 //!   - `write-clipboard <text>`               — `OpenClipboard` + `SetClipboardData`.
-//!   - `global-atom-add <name>`               — `GlobalAddAtomW`.
+//!   - `global-atom-add <name>`               — `GlobalAddAtomW` (no delete; see fn note).
+//!   - `global-atom-find <name>`              — `GlobalFindAtomW` (host-side companion).
 //!   - `set-system-param`                     — `SystemParametersInfoW(SPI_SETMOUSESPEED)`.
 //!
 //! Each subcommand exits 0 on success, prints `<NAME>_OK` then `<NAME>_FAIL hr=0x<hex>` on failure.
@@ -66,6 +67,10 @@ fn main() {
         "global-atom-add" => {
             let name = args.get(2).cloned().unwrap_or_else(|| "wsbx".to_string());
             global_atom_add(&name)
+        }
+        "global-atom-find" => {
+            let name = args.get(2).cloned().unwrap_or_else(|| "wsbx".to_string());
+            global_atom_find(&name)
         }
         "set-system-param" => set_system_param(),
         other => {
@@ -244,21 +249,45 @@ fn enum_windows() -> i32 {
 #[cfg(windows)]
 fn read_clipboard() -> i32 {
     use windows::Win32::Foundation::{GetLastError, HWND};
-    use windows::Win32::System::DataExchange::{CloseClipboard, OpenClipboard};
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, GetClipboardData, OpenClipboard,
+    };
+    // CF_UNICODETEXT and CF_TEXT — try both because what's on the
+    // clipboard depends on the host. Either succeeding under
+    // JOB_OBJECT_UILIMIT_READCLIPBOARD == "the bit does not fire".
+    const CF_TEXT: u32 = 1;
+    const CF_UNICODETEXT: u32 = 13;
     unsafe {
-        let r = OpenClipboard(HWND::default());
-        match r {
-            Ok(()) => {
-                println!("READ_OK");
-                let _ = CloseClipboard();
-                0
-            }
-            Err(e) => {
-                let hr = e.code();
-                let le = GetLastError().0;
-                println!("READ_FAIL hr=0x{:08x} err={le}", hr.0 as u32);
-                1
-            }
+        if let Err(e) = OpenClipboard(HWND::default()) {
+            let hr = e.code();
+            let le = GetLastError().0;
+            println!(
+                "READ_FAIL stage=open hr=0x{:08x} err={le}",
+                hr.0 as u32
+            );
+            return 1;
+        }
+        // Per-bit semantics: JOB_OBJECT_UILIMIT_READCLIPBOARD blocks
+        // the actual data read, not OpenClipboard. So OpenClipboard
+        // may succeed; the bit fires at GetClipboardData time with
+        // ERROR_ACCESS_DENIED.
+        let h_uni = GetClipboardData(CF_UNICODETEXT);
+        let h_txt = GetClipboardData(CF_TEXT);
+        let _ = CloseClipboard();
+        // Either handle being valid (Ok with non-null inner) means
+        // the read succeeded → READ_OK. Both errors → READ_FAIL.
+        let ok = match (h_uni, h_txt) {
+            (Ok(h), _) if h.0 != std::ptr::null_mut() => true,
+            (_, Ok(h)) if h.0 != std::ptr::null_mut() => true,
+            _ => false,
+        };
+        if ok {
+            println!("READ_OK");
+            0
+        } else {
+            let le = GetLastError().0;
+            println!("READ_FAIL stage=get err={le}");
+            1
         }
     }
 }
@@ -323,8 +352,14 @@ fn write_clipboard(text: &str) -> i32 {
 #[cfg(windows)]
 fn global_atom_add(name: &str) -> i32 {
     use windows::Win32::Foundation::GetLastError;
-    use windows::Win32::System::DataExchange::{GlobalAddAtomW, GlobalDeleteAtom};
+    use windows::Win32::System::DataExchange::GlobalAddAtomW;
     use windows::core::PCWSTR;
+    // NOTE: under JOB_OBJECT_UILIMIT_GLOBALATOMS the kernel silently
+    // redirects this call to the job's private atom table — the call
+    // SUCCEEDS but writes to a per-job table not the global one. So
+    // `ADD_OK` alone does not prove the bit is off. Pair with
+    // `global-atom-find` from an ambient (host) process to assert the
+    // atom is NOT visible globally.
     unsafe {
         let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
         let r = GlobalAddAtomW(PCWSTR(wide.as_ptr()));
@@ -333,9 +368,32 @@ fn global_atom_add(name: &str) -> i32 {
             println!("ADD_FAIL hr=0x{:08x} err={le}", le);
             return 1;
         }
+        // Deliberately do NOT delete the atom here — H4 follows up
+        // with an ambient `global-atom-find` to assert the GLOBALATOMS
+        // bit silently re-scoped the add. The atom will be cleaned up
+        // by the kernel when the job (and thus the per-job atom table)
+        // is destroyed at child exit.
         println!("ADD_OK atom={r}");
-        let _ = GlobalDeleteAtom(r);
         0
+    }
+}
+
+#[cfg(windows)]
+fn global_atom_find(name: &str) -> i32 {
+    use windows::Win32::Foundation::GetLastError;
+    use windows::Win32::System::DataExchange::GlobalFindAtomW;
+    use windows::core::PCWSTR;
+    unsafe {
+        let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        let r = GlobalFindAtomW(PCWSTR(wide.as_ptr()));
+        if r == 0 {
+            let le = GetLastError().0;
+            println!("FIND_MISS err={le}");
+            1
+        } else {
+            println!("FIND_HIT atom={r}");
+            0
+        }
     }
 }
 

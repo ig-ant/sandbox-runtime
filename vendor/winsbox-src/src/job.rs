@@ -1,22 +1,28 @@
 // Cribbed from `winsbox-msys2-iter` branch, lowbox/AC paths removed.
-//! Job object wrapper. Used purely for KILL_ON_JOB_CLOSE process
-//! containment (so the sandboxed child tree dies with the broker).
+//! Job object wrapper.
 //!
-//! UI restrictions are intentionally NOT set for v1 — the WFP+SID
-//! design targets "max compat", and Cygwin/PowerShell exercise paths
-//! (clipboard, global atoms) that benefit from a normal Win32 session.
-//
-// TODO(phase2): revisit UI restrictions once the network sandbox is
-// working — they're free-ish containment if compat allows.
+//! Two roles:
+//!  1. `KILL_ON_JOB_CLOSE` process containment so the sandboxed child
+//!     tree dies with the broker.
+//!  2. Phase 4.5 v3 Layer 3: `JobObjectBasicUIRestrictions` UI lockdown
+//!     (clipboard, global atoms, system params, display, desktop,
+//!     exit-windows, and cross-job USER/GDI handle access).
+//!
+//! UI bits are listed individually (rather than `UILIMIT_ALL`) so the
+//! enforced surface is auditable from the call site.
 
 use anyhow::{Context, Result};
 use std::mem::{size_of, zeroed};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
-    JobObjectExtendedLimitInformation,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JobObjectBasicUIRestrictions, JobObjectExtendedLimitInformation,
+    JOBOBJECT_BASIC_UI_RESTRICTIONS, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOB_OBJECT_UILIMIT_DESKTOP, JOB_OBJECT_UILIMIT_DISPLAYSETTINGS,
+    JOB_OBJECT_UILIMIT_EXITWINDOWS, JOB_OBJECT_UILIMIT_GLOBALATOMS,
+    JOB_OBJECT_UILIMIT_HANDLES, JOB_OBJECT_UILIMIT_READCLIPBOARD,
+    JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS, JOB_OBJECT_UILIMIT_WRITECLIPBOARD,
 };
 
 pub struct Job(HANDLE);
@@ -35,11 +41,36 @@ impl Job {
                 size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
             ).context("SetInformationJobObject(KILL_ON_JOB_CLOSE)")?;
 
-            // TODO(phase2): revisit UI restrictions. Donor branch set:
-            //   JOB_OBJECT_UILIMIT_{DESKTOP,DISPLAYSETTINGS,EXITWINDOWS,
-            //   GLOBALATOMS,HANDLES,READCLIPBOARD,WRITECLIPBOARD,
-            //   SYSTEMPARAMETERS}
-            // Disabled for now — see module docstring.
+            // Phase 4.5 v3 Layer 3: basic UI restrictions. Must be set
+            // before `AssignProcessToJobObject` so the bits are in
+            // effect from the moment the suspended child is assigned
+            // (caller resumes the thread only after assign). The bits
+            // below are equivalent to JOB_OBJECT_UILIMIT_ALL but
+            // enumerated for auditability:
+            //   READCLIPBOARD     — block OpenClipboard for read
+            //   WRITECLIPBOARD    — block SetClipboardData
+            //   HANDLES           — block USER/GDI handles from outside the job
+            //   GLOBALATOMS       — block GlobalAddAtom (atom-table IPC)
+            //   SYSTEMPARAMETERS  — block SystemParametersInfoW(SPI_SET*)
+            //   DISPLAYSETTINGS   — block ChangeDisplaySettings
+            //   DESKTOP           — block SwitchDesktop/SetThreadDesktop
+            //   EXITWINDOWS       — block sandbox-initiated logoff/shutdown
+            let ui_bits = JOB_OBJECT_UILIMIT_READCLIPBOARD
+                | JOB_OBJECT_UILIMIT_WRITECLIPBOARD
+                | JOB_OBJECT_UILIMIT_HANDLES
+                | JOB_OBJECT_UILIMIT_GLOBALATOMS
+                | JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS
+                | JOB_OBJECT_UILIMIT_DISPLAYSETTINGS
+                | JOB_OBJECT_UILIMIT_DESKTOP
+                | JOB_OBJECT_UILIMIT_EXITWINDOWS;
+            let ui_info = JOBOBJECT_BASIC_UI_RESTRICTIONS {
+                UIRestrictionsClass: ui_bits,
+            };
+            SetInformationJobObject(
+                h, JobObjectBasicUIRestrictions,
+                &ui_info as *const _ as *const std::ffi::c_void,
+                size_of::<JOBOBJECT_BASIC_UI_RESTRICTIONS>() as u32,
+            ).context("SetInformationJobObject(BasicUIRestrictions)")?;
 
             Ok(Self(h))
         }

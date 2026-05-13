@@ -932,15 +932,102 @@ d('winsbox WFP+SID matrix', () => {
     () => {},
   )
 
-  // ─────────────────── Group H: Install lifecycle ───────────────────
+  // ─────────────────── Group H: UI restrictions (Layer 3) ───────────────────
+  //
+  // Phase 4.5 v3 Layer 3 sets `JobObjectBasicUIRestrictions` on the
+  // sandbox job with READCLIPBOARD | WRITECLIPBOARD | HANDLES |
+  // GLOBALATOMS | SYSTEMPARAMETERS | DISPLAYSETTINGS | DESKTOP |
+  // EXITWINDOWS. Each row exercises one of those bits via probe_proc.exe.
+  // (H1 reserved as a marker — empty slot in numbering; see install
+  // lifecycle below for H1.. wait, install lifecycle was relabeled
+  // Group I to free the H prefix.)
 
-  // H1–H4 need admin. CI hosted runners are admin-with-UAC-disabled
+  test('H2: sandbox cannot read clipboard data (JOB_OBJECT_UILIMIT_READCLIPBOARD)', () => {
+    // READCLIPBOARD semantics: the bit fires at GetClipboardData
+    // time (ERROR_ACCESS_DENIED), NOT at OpenClipboard. probe_proc's
+    // read-clipboard subcommand calls OpenClipboard + GetClipboardData
+    // and reports READ_FAIL stage=get when the data read is blocked.
+    if (preflightFailure) return
+    const probe = getProbeProcPath()
+    if (!fileExists(probe)) {
+      // eslint-disable-next-line no-console
+      console.warn(`[H2] probe_proc.exe not found at ${probe}; skipping`)
+      return
+    }
+    const r = runSboxed([probe, 'read-clipboard'])
+    expect(r.stdout).toMatch(/READ_FAIL/)
+    expect(r.status).not.toBe(0)
+  })
+
+  test('H3: sandbox cannot write clipboard (JOB_OBJECT_UILIMIT_WRITECLIPBOARD)', () => {
+    if (preflightFailure) return
+    const probe = getProbeProcPath()
+    if (!fileExists(probe)) {
+      // eslint-disable-next-line no-console
+      console.warn(`[H3] probe_proc.exe not found at ${probe}; skipping`)
+      return
+    }
+    const r = runSboxed([probe, 'write-clipboard', 'hello'])
+    expect(r.stdout).toMatch(/WRITE_FAIL/)
+    expect(r.status).not.toBe(0)
+  })
+
+  test('H4: sandbox global-atom-add re-scoped to per-job table (JOB_OBJECT_UILIMIT_GLOBALATOMS)', () => {
+    // GLOBALATOMS semantics: the call does NOT fail. The kernel
+    // silently redirects GlobalAddAtomW into the job's private atom
+    // table. So `ADD_FAIL` is NOT the right assertion. Instead:
+    //   1. Add atom `winsbox-h4-<random>` from inside the sandbox →
+    //      `ADD_OK` (call succeeds, but writes private table).
+    //   2. From the host (ambient process, outside the job), call
+    //      `GlobalFindAtomW("winsbox-h4-<random>")` → must return 0
+    //      (`FIND_MISS`) because the GLOBAL atom table never saw it.
+    // Failure to scope (i.e. FIND_HIT in the host) means the bit
+    // is off and the sandboxed add leaked to the global table.
+    if (preflightFailure) return
+    const probe = getProbeProcPath()
+    if (!fileExists(probe)) {
+      // eslint-disable-next-line no-console
+      console.warn(`[H4] probe_proc.exe not found at ${probe}; skipping`)
+      return
+    }
+    const atomName = `winsbox-h4-${Math.random().toString(36).slice(2, 10)}`
+    const sboxed = runSboxed([probe, 'global-atom-add', atomName])
+    // Inside the sandbox the add succeeds (per-job table).
+    expect(sboxed.stdout).toMatch(/ADD_OK atom=\d+/)
+    // From the host the atom must not exist in the global table.
+    const ambient = spawnSync(probe, ['global-atom-find', atomName], {
+      encoding: 'utf-8',
+      timeout: 5_000,
+    })
+    expect(ambient.stdout).toMatch(/FIND_MISS/)
+    expect(ambient.status).not.toBe(0)
+  })
+
+  test('H5: sandbox cannot set system parameters (JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS)', () => {
+    if (preflightFailure) return
+    const probe = getProbeProcPath()
+    if (!fileExists(probe)) {
+      // eslint-disable-next-line no-console
+      console.warn(`[H5] probe_proc.exe not found at ${probe}; skipping`)
+      return
+    }
+    const r = runSboxed([probe, 'set-system-param'])
+    expect(r.stdout).toMatch(/SPI_FAIL/)
+    expect(r.status).not.toBe(0)
+  })
+
+  // ─────────────────── Group I: Install lifecycle ───────────────────
+  //
+  // (Renamed from "Group H" when Layer 3 took the H prefix for UI
+  // restriction rows. I1–I5 mirror the prior H1–H5 install rows.)
+
+  // I1–I4 need admin. CI hosted runners are admin-with-UAC-disabled
   // (per ci-investigation.md), so they run there. Locally we mark them
   // todo — the user supervises the lifecycle separately.
   const runInstallLifecycle = isCI
 
   test.skipIf(!runInstallLifecycle)(
-    'H1: install --check (after CI fresh)',
+    'I1: install --check (after CI fresh)',
     () => {
       const exe = getSboxExecPath()
       const r = spawnSync(exe, ['install', '--check'], { encoding: 'utf-8' })
@@ -951,7 +1038,7 @@ d('winsbox WFP+SID matrix', () => {
   )
 
   test.skipIf(!runInstallLifecycle)(
-    'H2: install reports port + filters',
+    'I2: install reports port + filters',
     () => {
       const exe = getSboxExecPath()
       const r = spawnSync(exe, ['install'], { encoding: 'utf-8' })
@@ -965,25 +1052,25 @@ d('winsbox WFP+SID matrix', () => {
     },
   )
 
-  test.skipIf(!runInstallLifecycle)('H3: install --check after install', () => {
+  test.skipIf(!runInstallLifecycle)('I3: install --check after install', () => {
     const exe = getSboxExecPath()
     const r = spawnSync(exe, ['install', '--check'], { encoding: 'utf-8' })
     expect(r.status).toBe(0)
     expect(r.stdout).toMatch(/installed/i)
   })
 
-  // H4 is run by the workflow's `if: always()` cleanup step rather
+  // I4 is run by the workflow's `if: always()` cleanup step rather
   // than the test file, so it doesn't leave the runner in an
-  // ambiguous state if H3 fails. Mark todo to keep the row in the
+  // ambiguous state if I3 fails. Mark todo to keep the row in the
   // matrix index.
-  // TODO(winsbox-wfp): H4 runs as workflow `if: always()` cleanup, not here.
+  // TODO(winsbox-wfp): I4 runs as workflow `if: always()` cleanup, not here.
   test.todo(
-    'H4: install --remove cleans filters and marker (handled in workflow cleanup)',
+    'I4: install --remove cleans filters and marker (handled in workflow cleanup)',
     () => {},
   )
 
-  // H5 — reboot persistence isn't exercisable on ephemeral runners.
-  test.skip('H5: reboot persistence (not exercisable in CI)', () => {})
+  // I5 — reboot persistence isn't exercisable on ephemeral runners.
+  test.skip('I5: reboot persistence (not exercisable in CI)', () => {})
 })
 
 // Silence "no tests" warning on non-Windows by retaining an outer
