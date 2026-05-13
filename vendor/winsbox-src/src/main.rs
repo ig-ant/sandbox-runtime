@@ -17,6 +17,7 @@ mod policy;
 #[cfg(windows)] mod launch;
 #[cfg(windows)] mod winsta;
 #[cfg(windows)] mod self_protect;
+mod lock_db;
 
 use clap::{Parser, Subcommand};
 
@@ -71,6 +72,54 @@ fn main() -> anyhow::Result<()> {
                 );
             }
 
+            // Phase 5A: open the per-user state DB, run crash
+            // recovery, and register our session. Gated on
+            // WINSBOX_PHASE5_DB=0 (default ON). If open fails (disk
+            // full, perms), we log and continue without coordination
+            // — broker still works, just no cross-broker FS isolation
+            // coordination. Mark internally as "phase 5 degraded".
+            let phase5_db_enabled = !matches!(
+                std::env::var_os("WINSBOX_PHASE5_DB"),
+                Some(v) if v == "0"
+            );
+            let db_session: Option<(lock_db::LockDb, u32)> = if phase5_db_enabled {
+                match lock_db::LockDb::open() {
+                    Ok(db) => {
+                        match db.crash_recovery_scan() {
+                            Ok(0) => {}
+                            Ok(n) => eprintln!(
+                                "[sbox-exec] phase5: pruned {n} dead session(s) from state DB"
+                            ),
+                            Err(e) => eprintln!(
+                                "[sbox-exec] WARNING: crash_recovery_scan failed: {e:#}"
+                            ),
+                        }
+                        let pid = std::process::id();
+                        let pipe_name =
+                            format!(r"\\.\pipe\winsbox-broker-{pid}");
+                        match db.begin_session(pid, &pipe_name) {
+                            Ok(()) => Some((db, pid)),
+                            Err(e) => {
+                                eprintln!(
+                                    "[sbox-exec] WARNING: begin_session failed: {e:#} \
+                                     (phase 5 degraded)"
+                                );
+                                None
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[sbox-exec] WARNING: opening state DB failed: {e:#} \
+                             (phase 5 degraded)"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
             // Build a policy.
             let mut pol: policy::Policy = if cli.policy_stdin {
                 let mut buf = String::new();
@@ -98,7 +147,21 @@ fn main() -> anyhow::Result<()> {
                 return Err(anyhow!("policy.target_exe is empty"));
             }
 
-            let code = launch::run(&pol)?;
+            let run_result = launch::run(&pol);
+
+            // Phase 5A: graceful end-of-session, both on success and
+            // on error. CASCADE will also clean up any path_locks we
+            // held (none yet in 5A). On error we still try the
+            // cleanup before propagating.
+            if let Some((db, pid)) = &db_session {
+                if let Err(e) = db.end_session(*pid) {
+                    eprintln!(
+                        "[sbox-exec] WARNING: end_session failed: {e:#}"
+                    );
+                }
+            }
+
+            let code = run_result?;
             std::process::exit(code as i32);
         }
     }
