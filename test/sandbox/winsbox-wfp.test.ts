@@ -932,15 +932,40 @@ d('winsbox WFP+SID matrix', () => {
     () => {},
   )
 
-  // ─────────────────── Group H: UI restrictions (Layer 3) ───────────────────
+  // ─────────────────── Group H: UI restrictions (Layer 3+4) ───────────────────
   //
   // Phase 4.5 v3 Layer 3 sets `JobObjectBasicUIRestrictions` on the
   // sandbox job with READCLIPBOARD | WRITECLIPBOARD | HANDLES |
   // GLOBALATOMS | SYSTEMPARAMETERS | DISPLAYSETTINGS | DESKTOP |
   // EXITWINDOWS. Each row exercises one of those bits via probe_proc.exe.
-  // (H1 reserved as a marker — empty slot in numbering; see install
-  // lifecycle below for H1.. wait, install lifecycle was relabeled
-  // Group I to free the H prefix.)
+  // H1 (Layer 4) verifies the sandbox runs on its own non-interactive
+  // window station + desktop, so EnumWindows from inside the sandbox
+  // sees zero top-level windows.
+
+  test('H1: sandbox runs on a separate desktop (no interactive windows visible)', () => {
+    // Layer 4 spawns the child with STARTUPINFOW.lpDesktop pointing at
+    // `winsbox-sbox-winsta-{pid}\desk`, a freshly-created non-interactive
+    // window station + desktop. Top-level windows live per-desktop, so
+    // EnumWindows from inside the sandbox should return count=0.
+    // Ambient enumeration on the broker's WinSta0 returns dozens.
+    if (preflightFailure) return
+    const probe = getProbeProcPath()
+    if (!fileExists(probe)) {
+      // eslint-disable-next-line no-console
+      console.warn(`[H1] probe_proc.exe not found at ${probe}; skipping`)
+      return
+    }
+    const sboxed = runSboxed([probe, 'enum-windows'])
+    // EnumWindows on a freshly-created non-interactive desktop never
+    // fires its callback (no top-level windows exist), so the kernel
+    // returns BOOL=FALSE with GetLastError()=0. probe_proc reports
+    // this as ENUM_FAIL count=0 and exits 0 (treats "no windows
+    // enumerated" as success when count==0). Ambient EnumWindows on
+    // WinSta0\Default sees dozens of windows and prints ENUM_OK count=N.
+    // Either count=0 result is acceptable; the assertion is count=0.
+    expect(sboxed.stdout).toMatch(/ENUM_(OK|FAIL) count=0/)
+    expect(sboxed.status).toBe(0)
+  })
 
   test('H2: sandbox cannot read clipboard data (JOB_OBJECT_UILIMIT_READCLIPBOARD)', () => {
     // READCLIPBOARD semantics: the bit fires at GetClipboardData

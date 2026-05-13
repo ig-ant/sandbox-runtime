@@ -14,3 +14,4 @@ pub mod policy;
 #[cfg(windows)] pub mod proxy;
 #[cfg(windows)] pub mod install;
 #[cfg(windows)] pub mod launch;
+#[cfg(windows)] pub mod winsta;

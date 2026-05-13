@@ -61,6 +61,7 @@ use crate::policy::Policy;
 use crate::sid::{self, GroupState};
 use crate::token::{self, open_self_token, to_primary, LockdownSpec, IL_MEDIUM};
 use crate::util::{pcwstr, wstr};
+use crate::winsta::WinStaDesk;
 use crate::{proxy, wfp};
 
 fn build_env(pol: &Policy, proxy_port: u16, secret: &str) -> Vec<u16> {
@@ -446,9 +447,39 @@ pub fn run(pol: &Policy) -> Result<u32> {
         .context("UpdateProcThreadAttribute(HANDLE_LIST)")?;
     }
 
+    // Layer 4 (Phase 4.5 v3): non-interactive window station + desktop.
+    //
+    // Construct a per-broker-process WS named `winsbox-sbox-winsta-{pid}`
+    // with a single `desk` desktop, then point STARTUPINFOW.lpDesktop at
+    // it. The sandbox child attaches to this WS+desktop instead of the
+    // user's interactive WinSta0 and therefore can't enumerate / inject
+    // into top-level windows the user owns (and vice versa).
+    //
+    // Lifetime: `WinStaDesk` lives on this stack frame and is dropped
+    // after WaitForSingleObject returns. The kernel refcounts the WS by
+    // attached processes — keeping our handles open ensures the WS isn't
+    // reclaimed before the child attaches during CreateProcessAsUserW.
+    //
+    // Env gate `WINSBOX_WINSTA_SEPARATE` (default "1") allows quick
+    // bisection if a shell wrapper (cmd/PS/bash) starts mis-behaving
+    // on the isolated desktop. Set to "0" to revert to ambient WS.
+    let winsta_enabled = std::env::var_os("WINSBOX_WINSTA_SEPARATE")
+        .map(|v| v != *"0")
+        .unwrap_or(true);
+    let mut winsta_holder: Option<WinStaDesk> = if winsta_enabled {
+        Some(WinStaDesk::new().context("WinStaDesk::new (Layer 4)")?)
+    } else {
+        None
+    };
+
     let mut six: STARTUPINFOEXW = unsafe { zeroed() };
     six.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
     six.lpAttributeList = attr_list;
+    if let Some(ws) = winsta_holder.as_mut() {
+        // PWSTR is a *mut u16; the buffer lives inside `winsta_holder`
+        // which we keep alive past CreateProcessAsUserW.
+        six.StartupInfo.lpDesktop = PWSTR(ws.desktop_name_ptr());
+    }
     let mut pi: PROCESS_INFORMATION = unsafe { zeroed() };
 
     let cwd_pcwstr = cwd_w
@@ -523,5 +554,9 @@ pub fn run(pol: &Policy) -> Result<u32> {
     // belt-and-suspenders to keep the Vec scoped here.
     drop(attr_storage);
     drop(handle_list);
+    // Layer 4: drop the WS+desktop holder AFTER the child has exited.
+    // The kernel decrements the WS refcount as part of process tear-down;
+    // dropping here closes our last handles and releases the objects.
+    drop(winsta_holder);
     Ok(code)
 }

@@ -15,6 +15,7 @@ mod policy;
 #[cfg(windows)] mod proxy;
 #[cfg(windows)] mod install;
 #[cfg(windows)] mod launch;
+#[cfg(windows)] mod winsta;
 
 use clap::{Parser, Subcommand};
 
