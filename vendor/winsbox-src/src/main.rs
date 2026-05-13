@@ -17,6 +17,7 @@ mod policy;
 #[cfg(windows)] mod launch;
 #[cfg(windows)] mod winsta;
 #[cfg(windows)] mod self_protect;
+#[cfg(windows)] mod share_mode;
 mod lock_db;
 
 use clap::{Parser, Subcommand};
@@ -147,7 +148,10 @@ fn main() -> anyhow::Result<()> {
                 return Err(anyhow!("policy.target_exe is empty"));
             }
 
-            let run_result = launch::run(&pol);
+            let run_result = launch::run(
+                &pol,
+                db_session.as_ref().map(|(db, _)| db),
+            );
 
             // Phase 5A: graceful end-of-session, both on success and
             // on error. CASCADE will also clean up any path_locks we

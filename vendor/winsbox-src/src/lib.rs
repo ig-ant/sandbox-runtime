@@ -16,4 +16,5 @@ pub mod policy;
 #[cfg(windows)] pub mod launch;
 #[cfg(windows)] pub mod winsta;
 #[cfg(windows)] pub mod self_protect;
+#[cfg(windows)] pub mod share_mode;
 pub mod lock_db;

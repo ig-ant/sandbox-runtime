@@ -59,6 +59,8 @@ export function getSboxExecPath(): string {
   const candidates = [
     path.join(repoRoot(), 'vendor', 'winsbox-src', 'target', 'release', 'sbox-exec.exe'),
     path.join(repoRoot(), 'dist', 'vendor', 'winsbox', 'sbox-exec.exe'),
+    // Phase 5 worktree target dir (preferred on this branch).
+    path.join(home, '.cargo-target', 'winsbox-phase5', 'release', 'sbox-exec.exe'),
     path.join(home, '.cargo-target', 'winsbox-wfp-sid', 'release', 'sbox-exec.exe'),
   ]
   for (const c of candidates) {
@@ -178,13 +180,21 @@ function quoteWindowsArg(arg: string): string {
 export function wrapCommandWithSandboxWindows(
   p: WindowsSandboxParams,
 ): string {
+  // Phase 5B: `readConfig.denyOnly` is now enforced (per-path
+  // share-mode-0 lock acquired by the broker). The JS API still
+  // accepts the field for parity; we pass it through to sbox-exec via
+  // a policy JSON over stdin when wrapCommandWithSandboxWindows is
+  // used as a shell command string. (Direct `runSboxed`-style spawns
+  // can opt in by setting denyRead in `runSboxedWithDenyRead`.)
+  //
+  // `readConfig.allowWithinDeny` and `writeConfig.*` remain unenforced
+  // in v1 — they are accepted for API parity and logged.
   if (
     p.readConfig &&
-    (p.readConfig.denyOnly.length > 0 ||
-      (p.readConfig.allowWithinDeny ?? []).length > 0)
+    (p.readConfig.allowWithinDeny ?? []).length > 0
   ) {
     logForDebugging(
-      `[Sandbox Windows] readConfig present but FS restrictions are not enforced in WFP+SID v1; ignoring`,
+      `[Sandbox Windows] readConfig.allowWithinDeny present but \`allowWithinDeny\` is not enforced in WFP+SID v1; ignoring`,
       { level: 'warn' },
     )
   }
@@ -219,7 +229,32 @@ export function wrapCommandWithSandboxWindows(
     innerArgs = ['/d', '/s', '/c', p.command]
   }
 
-  const argv: string[] = [exe, '--', shellExe, ...innerArgs]
+  // Phase 5B: when `readConfig.denyOnly` is non-empty, write a policy
+  // JSON to a temp file and invoke `sbox-exec --policy <file> -- ...`.
+  // The broker reads it and acquires share-mode-0 locks on each path
+  // before spawning the child. Cleanup of the temp file is best-effort;
+  // the OS tmp dir handles long-tail garbage.
+  const denyRead = p.readConfig?.denyOnly ?? []
+  let policyFile: string | undefined
+  if (denyRead.length > 0) {
+    const tmpDir = os.tmpdir()
+    policyFile = path.join(
+      tmpDir,
+      `winsbox-policy-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`,
+    )
+    // `target_exe` is required by the policy schema even though we
+    // override it via trailing args. Use a placeholder; the broker
+    // overwrites it with `cli.target[0]` post-parse.
+    const policy = {
+      target_exe: shellExe,
+      fs_deny_read: denyRead,
+    }
+    fs.writeFileSync(policyFile, JSON.stringify(policy), { encoding: 'utf-8' })
+  }
+
+  const argv: string[] = policyFile
+    ? [exe, '--policy', policyFile, '--', shellExe, ...innerArgs]
+    : [exe, '--', shellExe, ...innerArgs]
   return argv.map(quoteWindowsArg).join(' ')
 }
 

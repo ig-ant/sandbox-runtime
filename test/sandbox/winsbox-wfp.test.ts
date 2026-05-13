@@ -27,6 +27,7 @@ import { describe, test, expect, beforeAll, beforeEach } from 'bun:test'
 import { spawnSync } from 'node:child_process'
 import * as fs from 'node:fs'
 import * as net from 'node:net'
+import * as os from 'node:os'
 import * as path from 'node:path'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import {
@@ -135,6 +136,60 @@ function runSboxed(
     stdout: r.stdout ?? '',
     stderr: r.stderr ?? '',
     signal: r.signal ?? null,
+  }
+}
+
+/**
+ * Phase 5B: spawn sbox-exec with a `fs_deny_read` list passed through
+ * the policy JSON. Writes a temp policy file, runs sbox-exec
+ * `--policy <file> -- <args>`, then deletes the temp file in `finally`.
+ *
+ * The Rust side reads `fs_deny_read`, acquires share-mode-0 locks on
+ * each path (broker-side, before CreateProcessAsUserW), and the kernel
+ * share-mode check then refuses any GENERIC_READ open from the sandbox
+ * child with ERROR_SHARING_VIOLATION (err=32 / hr=0x80070020).
+ */
+function runSboxedWithDenyRead(
+  args: string[],
+  denyRead: string[],
+  opts: { timeoutMs?: number } = {},
+): {
+  status: number | null
+  stdout: string
+  stderr: string
+  signal: string | null
+} {
+  const exe = getSboxExecPath()
+  const policyFile = path.join(
+    os.tmpdir(),
+    `winsbox-j1-policy-${process.pid}-${Date.now()}.json`,
+  )
+  // target_exe is required by the schema; the broker overwrites it
+  // with cli.target[0] post-parse. Use args[0] for clarity (same
+  // value either way).
+  const policy = {
+    target_exe: args[0],
+    fs_deny_read: denyRead,
+  }
+  fs.writeFileSync(policyFile, JSON.stringify(policy), { encoding: 'utf-8' })
+  try {
+    const r = spawnSync(exe, ['--policy', policyFile, '--', ...args], {
+      encoding: 'utf-8',
+      timeout: opts.timeoutMs ?? DEFAULT_SPAWN_TIMEOUT_MS,
+      windowsHide: true,
+    })
+    return {
+      status: r.status,
+      stdout: r.stdout ?? '',
+      stderr: r.stderr ?? '',
+      signal: r.signal ?? null,
+    }
+  } finally {
+    try {
+      fs.unlinkSync(policyFile)
+    } catch {
+      /* ignore */
+    }
   }
 }
 
@@ -1139,6 +1194,53 @@ d('winsbox WFP+SID matrix', () => {
 
   // I5 — reboot persistence isn't exercisable on ephemeral runners.
   test.skip('I5: reboot persistence (not exercisable in CI)', () => {})
+
+  // ─────────────────── Group J: FS deny-read (Phase 5) ───────────────────
+  //
+  // Phase 5B: per-broker share-mode-0 lock acquisition. The broker
+  // opens each `Policy.fs_deny_read` path with
+  // `CreateFileW(GENERIC_READ, FILE_SHARE_DELETE, OPEN_EXISTING)` —
+  // share-mode-0 except for FILE_SHARE_DELETE so the user can still
+  // `rm` the file outside the sandbox. Any later open from the
+  // sandbox child that requests GENERIC_READ trips the kernel's
+  // share-mode check and returns ERROR_SHARING_VIOLATION (err=32,
+  // hr=0x80070020).
+
+  test('J1: sandbox cannot read a file the broker share-mode-locked', () => {
+    if (preflightFailure) return
+    const probe = getProbeProcPath()
+    if (!fileExists(probe)) {
+      // eslint-disable-next-line no-console
+      console.warn(`[J1] probe_proc.exe not found at ${probe}; skipping`)
+      return
+    }
+    // Create a temp test file with known content. Keep it in tmpdir
+    // (not USERPROFILE) so a Drop-leak doesn't leave a long-lived
+    // unreadable-by-broker file in the user's home.
+    const tmpFile = path.join(
+      os.tmpdir(),
+      `winsbox-j1-${process.pid}-${Date.now()}.secret`,
+    )
+    fs.writeFileSync(tmpFile, 'top-secret-credential-data')
+    try {
+      const result = runSboxedWithDenyRead(
+        [probe, 'read-file', tmpFile],
+        [tmpFile],
+      )
+      // The probe should fail to open the file:
+      //   READ_FAIL stage=open hr=0x80070020 err=32
+      expect(result.status).not.toBe(0)
+      expect(result.stdout).toMatch(/READ_FAIL/)
+      // Sandbox sees the broker's share-mode lock: SHARING_VIOLATION.
+      expect(result.stdout).toMatch(/err=32|hr=0x80070020/)
+    } finally {
+      try {
+        fs.unlinkSync(tmpFile)
+      } catch {
+        /* ignore */
+      }
+    }
+  })
 })
 
 // Silence "no tests" warning on non-Windows by retaining an outer

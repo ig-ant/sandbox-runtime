@@ -178,6 +178,47 @@ impl LockDb {
         Ok(())
     }
 
+    /// Phase 5B: INSERT one `path_locks` row of kind `share_mode` for
+    /// the current broker. Caller is responsible for already holding
+    /// the underlying `HANDLE` open — this just records the bookkeeping
+    /// row so other brokers (5D) can find us.
+    pub fn insert_share_mode_lock(
+        &self,
+        broker_pid: u32,
+        canonical_path: &str,
+    ) -> Result<()> {
+        let now = unix_epoch_seconds();
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO path_locks
+                    (canonical_path, broker_pid, kind, acquired_at)
+                 VALUES (?1, ?2, 'share_mode', ?3)",
+                params![canonical_path, broker_pid as i64, now],
+            )
+            .context("INSERT path_locks(share_mode)")?;
+        Ok(())
+    }
+
+    /// Phase 5B: DELETE all of THIS broker's share-mode rows in one
+    /// transaction. Called from the `ShareModeLocks` RAII Drop. Closing
+    /// the underlying `HANDLE`s is the caller's responsibility — this
+    /// only removes the DB bookkeeping.
+    pub fn delete_my_share_mode_locks(&self, broker_pid: u32) -> Result<usize> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .context("begin delete-share-mode tx")?;
+        let n = tx
+            .execute(
+                "DELETE FROM path_locks
+                 WHERE broker_pid = ?1 AND kind = 'share_mode'",
+                params![broker_pid as i64],
+            )
+            .context("DELETE path_locks(share_mode)")?;
+        tx.commit().context("commit delete-share-mode tx")?;
+        Ok(n)
+    }
+
     /// Scan `proc_sessions` for dead PIDs and prune them + their
     /// CASCADE-deleted `path_locks`. For orphaned ACL stamps we log a
     /// warning and delete the row, but do NOT attempt to restore the

@@ -57,7 +57,9 @@ const PROC_MITIGATION_FONT_DISABLE_ALWAYS_ON: u64 = 0x0000_0001 << 48;
 const PROC_MITIGATION_CONTROL_FLOW_GUARD_ALWAYS_ON: u64 = 0x0000_0001 << 8;
 
 use crate::job::Job;
+use crate::lock_db::LockDb;
 use crate::policy::Policy;
+use crate::share_mode::ShareModeLocks;
 use crate::sid::{self, GroupState};
 use crate::token::{self, open_self_token, to_primary, LockdownSpec, IL_MEDIUM};
 use crate::util::{pcwstr, wstr};
@@ -204,7 +206,12 @@ fn build_cmdline(exe: &std::path::Path, args: &[String]) -> String {
 }
 
 /// Run a policy and return the child's exit code.
-pub fn run(pol: &Policy) -> Result<u32> {
+///
+/// `db` is the per-user state DB (Phase 5A). Passed `None` when the
+/// broker is in "phase 5 degraded" mode (DB open failed at startup);
+/// the share-mode locks still acquire HANDLEs, they just don't
+/// publish bookkeeping rows for 5D cross-broker discovery.
+pub fn run(pol: &Policy, db: Option<&LockDb>) -> Result<u32> {
     // 1) Marker must be present.
     let marker = wfp::read_install_marker()
         .context("wfp::read_install_marker")?
@@ -277,6 +284,22 @@ pub fn run(pol: &Policy) -> Result<u32> {
     let restricted = token::make_sandbox_token(self_tok, IL_MEDIUM, &spec)
         .context("make_sandbox_token")?;
     let primary = to_primary(restricted).context("to_primary")?;
+
+    // 4b) Phase 5B: acquire share-mode-0 locks on Policy.fs_deny_read.
+    //     The kernel's share-mode check then refuses any subsequent
+    //     GENERIC_READ open from the sandbox child (sharing violation).
+    //     `_share_locks` lives until the end of `run()` (after
+    //     WaitForSingleObject), and its Drop closes handles + removes
+    //     DB rows. Bind with `_` (not `_share_locks` → `_`) only if
+    //     `pol.fs_deny_read` is empty — the holder is still useful as a
+    //     "phase 5 active" sentinel for log-grepping.
+    let _share_locks = ShareModeLocks::acquire(
+        db,
+        &pol.fs_deny_read,
+        std::process::id(),
+    )
+    .map_err(|e| anyhow::anyhow!(e))
+    .context("phase 5B share-mode acquire")?;
 
     // 5) Job.
     let job = Job::new().context("Job::new")?;

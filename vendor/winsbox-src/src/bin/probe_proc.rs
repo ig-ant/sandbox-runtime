@@ -29,6 +29,11 @@
 //!   - `global-atom-add <name>`               — `GlobalAddAtomW` (no delete; see fn note).
 //!   - `global-atom-find <name>`              — `GlobalFindAtomW` (host-side companion).
 //!   - `set-system-param`                     — `SystemParametersInfoW(SPI_SETMOUSESPEED)`.
+//!   - `read-file <path>`                     — `CreateFileW(GENERIC_READ, FILE_SHARE_READ,
+//!                                              OPEN_EXISTING)` + ReadFile a few bytes.
+//!                                              Phase 5B (J1) uses this to assert the broker's
+//!                                              share-mode-0 lock causes the sandbox child's
+//!                                              read to fail with SHARING_VIOLATION (err=32).
 //!
 //! Each subcommand exits 0 on success, prints `<NAME>_OK` then `<NAME>_FAIL hr=0x<hex>` on failure.
 //! Used by the winsbox-wfp matrix to verify Phase 4.5 v3 layers actually
@@ -114,6 +119,14 @@ fn main() {
             global_atom_find(&name)
         }
         "set-system-param" => set_system_param(),
+        "read-file" => {
+            if args.len() < 3 {
+                eprintln!("usage: probe_proc read-file <path>");
+                2
+            } else {
+                read_file(&args[2])
+            }
+        }
         other => {
             eprintln!("probe_proc: unknown subcommand: {other}");
             2
@@ -463,6 +476,64 @@ fn set_system_param() -> i32 {
                 let hr = e.code();
                 let le = GetLastError().0;
                 println!("SPI_FAIL hr=0x{:08x} err={le}", hr.0 as u32);
+                1
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn read_file(path: &str) -> i32 {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GetLastError, HANDLE};
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, ReadFile, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ,
+        OPEN_EXISTING,
+    };
+    // Phase 5B (J1): the sandbox child must NOT be able to read a file
+    // that the broker share-mode-locked. We try the natural read shape
+    // — GENERIC_READ + FILE_SHARE_READ + OPEN_EXISTING — and expect
+    // ERROR_SHARING_VIOLATION (32) / hr=0x80070020.
+    let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let h = CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            GENERIC_READ.0,
+            FILE_SHARE_READ,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            HANDLE::default(),
+        );
+        match h {
+            Ok(h) => {
+                let mut buf = [0u8; 256];
+                let mut nread: u32 = 0;
+                let r = ReadFile(h, Some(&mut buf), Some(&mut nread), None);
+                let _ = CloseHandle(h);
+                match r {
+                    Ok(()) => {
+                        println!("READ_OK bytes={nread}");
+                        0
+                    }
+                    Err(e) => {
+                        let hr = e.code();
+                        let le = GetLastError().0;
+                        println!(
+                            "READ_FAIL stage=read hr=0x{:08x} err={le}",
+                            hr.0 as u32
+                        );
+                        1
+                    }
+                }
+            }
+            Err(e) => {
+                let hr = e.code();
+                let le = GetLastError().0;
+                println!(
+                    "READ_FAIL stage=open hr=0x{:08x} err={le}",
+                    hr.0 as u32
+                );
                 1
             }
         }
