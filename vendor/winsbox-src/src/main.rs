@@ -19,6 +19,7 @@ mod policy;
 #[cfg(windows)] mod self_protect;
 #[cfg(windows)] mod share_mode;
 #[cfg(windows)] mod acl;
+#[cfg(windows)] mod pipe_server;
 mod lock_db;
 
 use clap::{Parser, Subcommand};
@@ -84,6 +85,14 @@ fn main() -> anyhow::Result<()> {
                 std::env::var_os("WINSBOX_PHASE5_DB"),
                 Some(v) if v == "0"
             );
+            // Phase 5D: shared map between ShareModeLocks and the
+            // pipe-server thread. `Arc<Mutex<HashMap<canonical, HANDLE-
+            // as-usize>>>`; pipe_server::map_insert / map_remove keep
+            // these in sync with the broker's lock state.
+            let share_mode_map: pipe_server::ShareModeMap =
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::HashMap::new(),
+                ));
             let db_session: Option<(lock_db::LockDb, u32)> = if phase5_db_enabled {
                 match lock_db::LockDb::open() {
                     Ok(db) => {
@@ -115,7 +124,19 @@ fn main() -> anyhow::Result<()> {
                         let pipe_name =
                             format!(r"\\.\pipe\winsbox-broker-{pid}");
                         match db.begin_session(pid, &pipe_name) {
-                            Ok(()) => Some((db, pid)),
+                            Ok(()) => {
+                                // Phase 5D: spawn the pipe server
+                                // thread. Detached; broker process
+                                // exit kills it. The thread shares
+                                // `share_mode_map` so it can look up
+                                // source HANDLEs for cross-broker
+                                // DUP_HANDLE requests.
+                                let _ = pipe_server::spawn(
+                                    pipe_name.clone(),
+                                    share_mode_map.clone(),
+                                );
+                                Some((db, pid))
+                            }
                             Err(e) => {
                                 eprintln!(
                                     "[sbox-exec] WARNING: begin_session failed: {e:#} \
@@ -164,9 +185,17 @@ fn main() -> anyhow::Result<()> {
                 return Err(anyhow!("policy.target_exe is empty"));
             }
 
+            // Only pass the share-mode map through if a DB session was
+            // established (5D coordination requires both the DB rows
+            // and the pipe server thread).
             let run_result = launch::run(
                 &pol,
                 db_session.as_ref().map(|(db, _)| db),
+                if db_session.is_some() {
+                    Some(share_mode_map.clone())
+                } else {
+                    None
+                },
             );
 
             // Phase 5A: graceful end-of-session, both on success and

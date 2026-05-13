@@ -49,6 +49,7 @@ windows = { version = "0.58", features = [
   "Win32_NetworkManagement_NetManagement",
   "Win32_System_SystemInformation",
   "Win32_System_Rpc",
+  "Win32_System_Pipes",
   "Win32_System_Memory",
   "Win32_System_LibraryLoader",
   "Win32_System_SystemServices",

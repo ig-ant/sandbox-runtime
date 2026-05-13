@@ -18,4 +18,5 @@ pub mod policy;
 #[cfg(windows)] pub mod self_protect;
 #[cfg(windows)] pub mod share_mode;
 #[cfg(windows)] pub mod acl;
+#[cfg(windows)] pub mod pipe_server;
 pub mod lock_db;

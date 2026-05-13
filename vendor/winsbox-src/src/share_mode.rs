@@ -45,6 +45,7 @@ use windows::Win32::Storage::FileSystem::{
 
 use crate::acl;
 use crate::lock_db::LockDb;
+use crate::pipe_server::{self, ShareModeMap};
 use crate::util::wstr;
 
 /// Structured failure for a per-path acquire attempt.
@@ -165,6 +166,12 @@ pub struct ShareModeLocks<'a> {
     db: Option<&'a LockDb>,
     broker_pid: u32,
     held: Vec<HeldEntry>,
+    /// Phase 5D: shared map indexed by `canonical_path → HANDLE-as-usize`,
+    /// populated for `HeldEntry::ShareMode` rows. The pipe-server thread
+    /// reads through this map to look up source handles for
+    /// `DuplicateHandle` calls. `None` if 5D coordination is disabled
+    /// (e.g. degraded mode with no DB).
+    map: Option<ShareModeMap>,
 }
 
 impl<'a> ShareModeLocks<'a> {
@@ -181,11 +188,17 @@ impl<'a> ShareModeLocks<'a> {
     /// required by the ACL fallback path. Pass an empty string in
     /// share-mode-only callers (Phase 5C ACL fallback will surface a
     /// configuration error if it's needed).
+    ///
+    /// `map` is the optional pipe-server shared map. When present, the
+    /// 5D DUP_HANDLE-via-pipe coordination is engaged before the ACL
+    /// fallback. When `None` (degraded mode), share-mode hits jump
+    /// straight to ACL.
     pub fn acquire(
         db: Option<&'a LockDb>,
         paths: &[PathBuf],
         broker_pid: u32,
         allowed_sid: &str,
+        map: Option<ShareModeMap>,
     ) -> Result<Self, LockError> {
         // Two-stage: process paths one at a time, accumulating into a
         // partial holder. If anything fails mid-way, the partial
@@ -195,6 +208,7 @@ impl<'a> ShareModeLocks<'a> {
             db,
             broker_pid,
             held: Vec::new(),
+            map,
         };
 
         for p in paths {
@@ -209,6 +223,9 @@ impl<'a> ShareModeLocks<'a> {
                             });
                         }
                     }
+                    if let Some(m) = &locks.map {
+                        pipe_server::map_insert(m, &canonical, handle);
+                    }
                     locks.held.push(HeldEntry::ShareMode { handle, canonical });
                 }
                 Ok(None) => {
@@ -218,9 +235,50 @@ impl<'a> ShareModeLocks<'a> {
                     );
                 }
                 Err(LockError::SharingViolation { path }) => {
-                    // Phase 5C: another process has the file open with
-                    // incompatible share mode. Best-effort Restart-
-                    // Manager-derived diagnostic, then ACL-stamp.
+                    // Phase 5D: before ACL fallback, look up the
+                    // share-mode holder in the state DB and try a
+                    // cross-broker DUP_HANDLE RPC.
+                    if let Some(db) = locks.db {
+                        match try_dup_via_pipe(db, &path) {
+                            Ok(Some((handle, canonical))) => {
+                                if let Err(e) = db
+                                    .insert_share_mode_lock(broker_pid, &canonical)
+                                {
+                                    unsafe { let _ = CloseHandle(handle); }
+                                    return Err(LockError::Db {
+                                        path: path.clone(),
+                                        err: e,
+                                    });
+                                }
+                                if let Some(m) = &locks.map {
+                                    pipe_server::map_insert(
+                                        m, &canonical, handle,
+                                    );
+                                }
+                                locks.held.push(HeldEntry::ShareMode {
+                                    handle,
+                                    canonical,
+                                });
+                                eprintln!(
+                                    "winsbox: phase 5D DUP_HANDLE success for {}",
+                                    path.display()
+                                );
+                                continue;
+                            }
+                            Ok(None) => {
+                                // No holder, or holder declined / was
+                                // unreachable. Fall through to ACL.
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "winsbox: phase 5D DUP_HANDLE attempt \
+                                     failed for {} ({e:#}); falling back to ACL",
+                                    path.display()
+                                );
+                            }
+                        }
+                    }
+                    // ACL fallback (Phase 5C). Diagnostic first.
                     let holders = restart_manager_holders(&path);
                     eprintln!(
                         "winsbox: share-mode acquisition failed for {}, \
@@ -279,14 +337,19 @@ impl<'a> ShareModeLocks<'a> {
 
 impl<'a> Drop for ShareModeLocks<'a> {
     fn drop(&mut self) {
-        // Walk every held entry. ShareMode: close handle. AclStamp:
-        // delete our row, possibly restore DACL.
+        // Walk every held entry. ShareMode: clear map entry, close
+        // handle. AclStamp: delete our row, possibly restore DACL.
         let mut acl_paths: Vec<String> = Vec::new();
         for entry in self.held.drain(..) {
             match entry {
-                HeldEntry::ShareMode { handle, .. } => unsafe {
-                    let _ = CloseHandle(handle);
-                },
+                HeldEntry::ShareMode { handle, canonical } => {
+                    if let Some(m) = &self.map {
+                        pipe_server::map_remove(m, &canonical);
+                    }
+                    unsafe { let _ = CloseHandle(handle); }
+                    // Suppress unused-warning when map is None.
+                    let _ = canonical;
+                }
                 HeldEntry::AclStamp { canonical } => {
                     acl_paths.push(canonical);
                 }
@@ -312,6 +375,97 @@ impl<'a> Drop for ShareModeLocks<'a> {
     }
 }
 
+/// Phase 5D: ask another broker for a duplicate HANDLE on `path`. On
+/// success, returns the duplicated handle plus the canonical path
+/// string the source broker reported. On any failure, returns
+/// `Ok(None)` so the caller falls back to ACL.
+///
+/// Failure cases that result in `Ok(None)`:
+///   - No `share_mode` holder registered in `proc_sessions` for this
+///     path. (E.g. all peers fell back to ACL.)
+///   - Holder PID is dead or recycled.
+///   - Pipe connection fails.
+///   - Remote replied `ok: false` (no such lock; race; etc.).
+fn try_dup_via_pipe(
+    db: &LockDb,
+    path: &Path,
+) -> anyhow::Result<Option<(HANDLE, String)>> {
+    // 1) We need the canonical path to query the DB. The 3rd-party
+    //    holder may have the file open with FILE_SHARE_DELETE only
+    //    (that's what our OWN broker peers do — they share-mode-0
+    //    everything except DELETE). So `canonicalize_permissive` —
+    //    which opens with GENERIC_READ + full sharing — would itself
+    //    trip SHARING_VIOLATION.
+    //
+    //    Use `canonicalize_zero_access` instead: CreateFileW with
+    //    `dwDesiredAccess=0`. Per MSDN this query-only open bypasses
+    //    sharing checks (you're not requesting any access mode for
+    //    the kernel to refuse). We still get a valid HANDLE good
+    //    enough for `GetFinalPathNameByHandleW`.
+    let canonical = canonicalize_zero_access(path)
+        .map_err(|e| anyhow::anyhow!("canonicalize for pipe dup: {e:#}"))?;
+
+    // 2) DB lookup: who's the original share-mode holder?
+    let holder = db
+        .find_share_mode_holder(&canonical)
+        .map_err(|e| anyhow::anyhow!("find_share_mode_holder: {e:#}"))?;
+    let (pid, pipe_name, recorded_create) = match holder {
+        Some(h) => h,
+        None => return Ok(None),
+    };
+
+    // 3) Liveness + recycle guard: OpenProcess(PROCESS_QUERY_LIMITED_-
+    //    INFORMATION) + GetProcessTimes(creation) match.
+    if !verify_broker_alive(pid, recorded_create) {
+        eprintln!(
+            "[winsbox phase5D] holder pid {pid} is dead or recycled; \
+             skipping DUP_HANDLE attempt"
+        );
+        return Ok(None);
+    }
+
+    // 4) RPC for the duplicated handle.
+    match crate::pipe_server::request_dup_handle(&pipe_name, &canonical) {
+        Ok(Some(h)) => Ok(Some((h, canonical))),
+        Ok(None) => Ok(None),
+        Err(e) => {
+            eprintln!(
+                "[winsbox phase5D] pipe RPC to pid {pid} failed: {e:#}"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Open `pid` for PROCESS_QUERY_LIMITED_INFORMATION and check that
+/// GetProcessTimes(creation) equals the recorded value. Returns true
+/// only if both succeed and times match.
+fn verify_broker_alive(pid: u32, recorded_create_time: i64) -> bool {
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) };
+    let h = match h {
+        Ok(h) if !h.is_invalid() => h,
+        _ => return false,
+    };
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    let ok = unsafe {
+        GetProcessTimes(h, &mut creation, &mut exit, &mut kernel, &mut user)
+    };
+    unsafe { let _ = CloseHandle(h); }
+    if ok.is_err() {
+        return false;
+    }
+    let actual = (((creation.dwHighDateTime as u64) << 32)
+        | (creation.dwLowDateTime as u64)) as i64;
+    actual == recorded_create_time
+}
+
 /// Phase 5C: stamp `path` with our broker-only DACL and persist the
 /// snapshot. Returns the canonical path string (used as the DB key
 /// and as the AclStamp::canonical field).
@@ -330,11 +484,11 @@ fn acquire_acl_stamp(
     broker_pid: u32,
     allowed_sid: &str,
 ) -> anyhow::Result<String> {
-    // 1) Canonicalize via a permissive (READ+WRITE+DELETE share) open.
-    //    This won't conflict with the third-party holder that caused
-    //    our SHARING_VIOLATION (they hold some share mode that allows
-    //    at least READ — otherwise nobody else could even open it).
-    let canonical = canonicalize_permissive(path)?;
+    // 1) Canonicalize via a zero-access open. This bypasses the
+    //    kernel's share-mode check entirely (we're not requesting any
+    //    access right), so it succeeds even when the holder is another
+    //    broker that opened with FILE_SHARE_DELETE only.
+    let canonical = canonicalize_zero_access(path)?;
 
     // 2) Existing snapshot? If so, skip the write and just record our
     //    holder row.
@@ -401,14 +555,17 @@ fn release_acl_stamp(
     Ok(())
 }
 
-/// Best-effort canonicalization. Open with maximum sharing so we
-/// don't conflict with whichever process has the file open.
-fn canonicalize_permissive(path: &Path) -> anyhow::Result<String> {
+/// Canonicalize via a query-only open (`dwDesiredAccess=0`). Bypasses
+/// the kernel's share-mode check entirely — used by the 5D pipe-dup
+/// path where the other broker holds the file with `FILE_SHARE_DELETE`
+/// only, so any non-zero access request would itself trip
+/// SHARING_VIOLATION.
+fn canonicalize_zero_access(path: &Path) -> anyhow::Result<String> {
     let w = wstr(&path.display().to_string());
     let h = unsafe {
         CreateFileW(
             PCWSTR(w.as_ptr()),
-            GENERIC_READ.0,
+            0,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             None,
             OPEN_EXISTING,
@@ -420,7 +577,7 @@ fn canonicalize_permissive(path: &Path) -> anyhow::Result<String> {
         Ok(h) => h,
         Err(e) => {
             return Err(anyhow::Error::new(e)
-                .context(format!("permissive open for canonicalize: {}", path.display())));
+                .context(format!("zero-access open for canonicalize: {}", path.display())));
         }
     };
     let mut buf = [0u16; 512];

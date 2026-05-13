@@ -1403,6 +1403,158 @@ d('winsbox WFP+SID matrix', () => {
       }
     }
   })
+
+  // Phase 5D: cross-broker DUP_HANDLE handoff. Broker A holds a
+  // share-mode-0 lock on `secret`. Broker B's CreateFileW(share=0)
+  // would normally trip SHARING_VIOLATION and fall back to ACL —
+  // but with 5D wired up, B first consults the DB, finds A's
+  // pipe_name, RPCs `\\.\pipe\winsbox-broker-{A_pid}` for a
+  // DUP_HANDLE, and stashes the returned handle in its own share-
+  // mode map. B's sandbox child then sees SHARING_VIOLATION (err=32),
+  // NOT ACCESS_DENIED (err=5) — that's the discriminator that proves
+  // DUP_HANDLE actually fired (vs ACL fallback).
+  //
+  // Helper layout: holder broker A runs `probe_proc hold-file <bystander>`
+  // with `fs_deny_read=[secret]`. A's broker grabs the share-mode lock
+  // on `secret`, then spawns the sandbox child, which blocks in
+  // hold-file holding `bystander`. Once HOLD_OK is observed, broker A
+  // is fully up — DB row written, pipe server listening. Broker B then
+  // synchronously tries to read `secret`; we assert err=32.
+  test('J4a: second broker reuses first broker share-mode lock via DUP_HANDLE', async () => {
+    if (preflightFailure) return
+    const probe = getProbeProcPath()
+    if (!fileExists(probe)) {
+      // eslint-disable-next-line no-console
+      console.warn(`[J4a] probe_proc.exe not found at ${probe}; skipping`)
+      return
+    }
+    const secret = path.join(
+      os.tmpdir(),
+      `winsbox-j4a-${process.pid}-${Date.now()}.secret`,
+    )
+    const bystander = path.join(
+      os.tmpdir(),
+      `winsbox-j4a-${process.pid}-${Date.now()}.bystander`,
+    )
+    fs.writeFileSync(secret, 'cross-broker-secret')
+    fs.writeFileSync(bystander, 'bystander')
+
+    // Broker A: spawn detached with a long-running hold-file inside.
+    // Use a JSON policy file with fs_deny_read=[secret] so the broker
+    // grabs a share-mode-0 lock on secret. The sandbox child holds
+    // `bystander` (not the locked file) so it stays alive until we
+    // kill the broker.
+    const exe = getSboxExecPath()
+    const policyFile = path.join(
+      os.tmpdir(),
+      `winsbox-j4a-policy-${process.pid}-${Date.now()}.json`,
+    )
+    fs.writeFileSync(
+      policyFile,
+      JSON.stringify({ target_exe: probe, fs_deny_read: [secret] }),
+      { encoding: 'utf-8' },
+    )
+    // Use an alternate proxy port for broker A so it doesn't collide
+    // with broker B's bind on the installed port (60080 by default).
+    // The override is launch.rs's WINSBOX_PROXY_PORT_OVERRIDE; doesn't
+    // affect the HTTP_PROXY env handed to the child, but broker A's
+    // hold-file child doesn't exercise egress.
+    const brokerA = spawn(
+      exe,
+      ['--policy', policyFile, '--', probe, 'hold-file', bystander],
+      {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+        env: { ...process.env, WINSBOX_PROXY_PORT_OVERRIDE: '0' },
+      },
+    )
+    try {
+      // Wait for HOLD_OK on broker A's stdout. By the time the
+      // sandbox child has hit hold-file, broker A's share-mode lock
+      // is in place and the pipe server is serving.
+      await new Promise<void>((resolve, reject) => {
+        const t = setTimeout(
+          () => reject(new Error('J4a broker A did not print HOLD_OK in 10s')),
+          10000,
+        )
+        const buf: string[] = []
+        brokerA.stdout?.on('data', (chunk: Buffer) => {
+          buf.push(chunk.toString())
+          if (buf.join('').includes('HOLD_OK')) {
+            clearTimeout(t)
+            resolve()
+          }
+        })
+        brokerA.once('error', (e) => {
+          clearTimeout(t)
+          reject(e)
+        })
+        brokerA.once('exit', (code) => {
+          clearTimeout(t)
+          reject(new Error(`J4a broker A exited early code=${code}`))
+        })
+      })
+
+      // Broker B: try to read the secret. Its broker SHOULD hit
+      // SHARING_VIOLATION on its own share-mode-0 open, find A in
+      // the DB, RPC over the pipe, get a DUP_HANDLE, register it in
+      // B's own share-mode map, then spawn the child. The child
+      // CreateFileW sees B's share-mode lock and reports
+      // SHARING_VIOLATION (err=32).
+      const result = runSboxedWithDenyRead(
+        [probe, 'read-file', secret],
+        [secret],
+        { timeoutMs: 15_000 },
+      )
+      if (result.status === 0 || !/READ_FAIL/.test(result.stdout)) {
+        // eslint-disable-next-line no-console
+        console.error(
+          `[J4a] unexpected broker B result: status=${result.status} ` +
+            `signal=${result.signal}\nSTDOUT:\n${result.stdout}\nSTDERR:\n${result.stderr}`,
+        )
+      }
+      expect(result.status).not.toBe(0)
+      expect(result.stdout).toMatch(/READ_FAIL/)
+      // Critical assertion: err=32 (SHARING_VIOLATION) proves the
+      // DUP_HANDLE path fired. err=5 (ACCESS_DENIED) would mean
+      // broker B fell back to ACL — the bug we're guarding against.
+      expect(result.stdout).toMatch(/err=32|hr=0x80070020/)
+    } finally {
+      try {
+        brokerA.kill()
+      } catch {
+        /* ignore */
+      }
+      // Broker A was killed via TerminateProcess; its RAII Drop never
+      // ran, so its proc_sessions / path_locks rows are still in the
+      // state DB. Trigger one more sbox-exec invocation to drive
+      // `crash_recovery_scan_with` and prune the orphan rows.
+      await new Promise((r) => setTimeout(r, 200))
+      try {
+        spawnSync(getSboxExecPath(), ['--', WHOAMI_EXE, '/user'], {
+          timeout: 5_000,
+          windowsHide: true,
+        })
+      } catch { /* ignore */ }
+      try { fs.unlinkSync(policyFile) } catch { /* ignore */ }
+      try { fs.unlinkSync(secret) } catch { /* ignore */ }
+      try { fs.unlinkSync(bystander) } catch { /* ignore */ }
+    }
+  })
+
+  // Phase 5D: J4b (ACL-stamp refcount across two brokers) is deferred.
+  // The natural shape — two brokers both holding bystanders so both
+  // are running while we observe the DACL state — requires killing
+  // the brokers to advance the refcount. Node's `child.kill()` on
+  // Windows maps to `TerminateProcess`, which bypasses our RAII Drop
+  // path; the DACL doesn't get restored on the kill itself, only on
+  // a future broker's startup via `crash_recovery_scan`. Driving the
+  // cleanup needs a 3rd broker spawn, which inflates the test
+  // footprint past what the discriminator buys. The refcount codepath
+  // itself is exercised in production by 5C's J3 (single-broker
+  // stamp+restore round-trip) and the lock_db unit tests covering
+  // `delete_my_acl_stamp_holder`. TODO future commit: drive the
+  // refcount via a 3rd broker triggering crash_recovery_scan.
 })
 
 // Silence "no tests" warning on non-Windows by retaining an outer

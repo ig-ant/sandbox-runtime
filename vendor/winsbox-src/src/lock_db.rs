@@ -271,6 +271,47 @@ impl LockDb {
         Ok(())
     }
 
+    /// Phase 5D: find the broker currently holding `canonical_path` as
+    /// `kind='share_mode'`. Returns `(broker_pid, pipe_name,
+    /// process_create_time)` for the oldest holder, or `None` if no
+    /// holder is registered.
+    ///
+    /// We prefer the oldest holder so that, in any multi-hop DUP_HANDLE
+    /// chain, future arrivals always route to the original source.
+    /// (In the v1 broker pair this only ever returns broker A; the
+    /// query stays correct if/when we extend to N brokers.)
+    pub fn find_share_mode_holder(
+        &self,
+        canonical_path: &str,
+    ) -> Result<Option<(u32, String, i64)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT proc_sessions.broker_pid, \
+                        proc_sessions.pipe_name, \
+                        proc_sessions.process_create_time \
+                 FROM path_locks \
+                 JOIN proc_sessions \
+                   ON proc_sessions.broker_pid = path_locks.broker_pid \
+                 WHERE path_locks.canonical_path = ?1 \
+                   AND path_locks.kind = 'share_mode' \
+                 ORDER BY path_locks.acquired_at ASC \
+                 LIMIT 1",
+            )
+            .context("prepare find_share_mode_holder")?;
+        let mut rows = stmt
+            .query(params![canonical_path])
+            .context("query find_share_mode_holder")?;
+        if let Some(row) = rows.next().context("row find_share_mode_holder")? {
+            let pid_i: i64 = row.get(0).context("col broker_pid")?;
+            let pipe: String = row.get(1).context("col pipe_name")?;
+            let ct: i64 = row.get(2).context("col process_create_time")?;
+            Ok(Some((pid_i as u32, pipe, ct)))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Phase 5C: query whether an `acl_snapshots` row exists for the
     /// given canonical_path. Used by `acquire_acl_stamp` to decide
     /// whether to call `SetSecurityInfo` (no row → stamp) or just

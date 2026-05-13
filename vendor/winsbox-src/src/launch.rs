@@ -58,6 +58,7 @@ const PROC_MITIGATION_CONTROL_FLOW_GUARD_ALWAYS_ON: u64 = 0x0000_0001 << 8;
 
 use crate::job::Job;
 use crate::lock_db::LockDb;
+use crate::pipe_server::ShareModeMap;
 use crate::policy::Policy;
 use crate::share_mode::ShareModeLocks;
 use crate::sid::{self, GroupState};
@@ -211,7 +212,14 @@ fn build_cmdline(exe: &std::path::Path, args: &[String]) -> String {
 /// broker is in "phase 5 degraded" mode (DB open failed at startup);
 /// the share-mode locks still acquire HANDLEs, they just don't
 /// publish bookkeeping rows for 5D cross-broker discovery.
-pub fn run(pol: &Policy, db: Option<&LockDb>) -> Result<u32> {
+///
+/// `share_mode_map` is the pipe-server's shared handle map (Phase 5D).
+/// `None` in degraded mode.
+pub fn run(
+    pol: &Policy,
+    db: Option<&LockDb>,
+    share_mode_map: Option<ShareModeMap>,
+) -> Result<u32> {
     // 1) Marker must be present.
     let marker = wfp::read_install_marker()
         .context("wfp::read_install_marker")?
@@ -298,9 +306,10 @@ pub fn run(pol: &Policy, db: Option<&LockDb>) -> Result<u32> {
         &pol.fs_deny_read,
         std::process::id(),
         &marker.group_sid,
+        share_mode_map,
     )
     .map_err(|e| anyhow::anyhow!(e))
-    .context("phase 5B/5C FS-lock acquire")?;
+    .context("phase 5B/5C/5D FS-lock acquire")?;
 
     // 5) Job.
     let job = Job::new().context("Job::new")?;
@@ -540,9 +549,18 @@ pub fn run(pol: &Policy, db: Option<&LockDb>) -> Result<u32> {
     // 11) Assign to job.
     job.assign(pi.hProcess).context("AssignProcessToJobObject")?;
 
-    // 12) Start proxy with the per-launch secret.
+    // 12) Start proxy with the per-launch secret. `WINSBOX_PROXY_PORT_-
+    //      OVERRIDE` (test-only) lets a second broker bind a different
+    //      ephemeral port so Phase 5D's J4a can run two brokers in
+    //      parallel. The override doesn't update the marker, so the
+    //      sandbox child still gets HTTP_PROXY pointing at the
+    //      original port — fine for tests that don't exercise egress.
+    let proxy_port = std::env::var("WINSBOX_PROXY_PORT_OVERRIDE")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(marker.port);
     let _proxy = proxy::start(
-        marker.port,
+        proxy_port,
         Box::new(proxy::DirectDialer),
         Some(secret),
     )
