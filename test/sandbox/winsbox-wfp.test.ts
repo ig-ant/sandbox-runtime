@@ -901,6 +901,37 @@ d('winsbox WFP+SID matrix', () => {
     expect(sboxed.stdout).toMatch(/MITQ ep_disable=true/)
   })
 
+  // G7: Phase 4.5 v3 — Layer 2 (PROC_THREAD_ATTRIBUTE_HANDLE_LIST).
+  //
+  // With Layer 2 in place, the broker passes `bInheritHandles=TRUE`
+  // plus an explicit handle whitelist containing only its three std
+  // handles (STDIN/STDOUT/STDERR). Any OTHER inheritable handle the
+  // broker holds at spawn time — e.g. an event the broker creates
+  // with `bInheritHandle=TRUE` in its SECURITY_ATTRIBUTES, or a
+  // named pipe handle — must NOT propagate into the child.
+  //
+  // A direct assertion of this requires a probe binary that:
+  //   1) reads a HANDLE value from an env var (the broker's
+  //      pre-spawn `CreateEventW` handle, stringified as a hex int),
+  //   2) calls `DuplicateHandle(GetCurrentProcess(), <child-side
+  //      copy>, ...)` and verifies it returns ERROR_INVALID_HANDLE.
+  //
+  // That requires (a) a test-only path through the broker to
+  // construct the broker-side event with `bInheritHandle=TRUE` and
+  // (b) extending probe_proc.exe with a `verify-handle-absent`
+  // subcommand. Both are mechanical but out of scope for Layer 2.
+  // The matrix-as-evidence argument: with `bInheritHandles=FALSE`
+  // (pre-Layer-2), the rest of the matrix passed; with
+  // `bInheritHandles=TRUE` + whitelist, the matrix STILL passes
+  // identically — meaning Layer 2 is at minimum non-regressive, and
+  // by construction it implements the documented kernel behavior.
+  // TODO(winsbox-wfp): G7 needs a probe-side helper and a broker
+  // test path; defer to a follow-up.
+  test.todo(
+    'G7: broker-side inheritable event NOT visible to sandbox child',
+    () => {},
+  )
+
   // ─────────────────── Group H: Install lifecycle ───────────────────
 
   // H1–H4 need admin. CI hosted runners are admin-with-UAC-disabled
