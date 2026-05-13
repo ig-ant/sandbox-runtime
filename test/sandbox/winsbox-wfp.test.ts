@@ -873,6 +873,49 @@ d('winsbox WFP+SID matrix', () => {
   // TODO(winsbox-wfp): G3 needs a custom helper binary; skip in TS for now.
   test.todo('G3: CREATE_BREAKAWAY_FROM_JOB child remains in job', () => {})
 
+  // G4 + G6: Phase 4.5 v3 Layer 5 — broker self-DACL.
+  //
+  // Before spawning the sandbox child the broker rewrites its own
+  // process kernel-object DACL to:
+  //   ALLOW (winsbox-allowed, PROCESS_ALL_ACCESS)
+  //   ALLOW (LocalSystem,    PROCESS_ALL_ACCESS)
+  //   ALLOW (BUILTIN\Admins, PROCESS_ALL_ACCESS)
+  // with PROTECTED_DACL_SECURITY_INFORMATION so the inherited
+  // user-SID grant is stripped. The sandbox child has all three
+  // SIDs deny-only / absent on its token → no ALLOW matches →
+  // OpenProcess against the broker returns ERROR_ACCESS_DENIED.
+  //
+  // probe_proc reads `WINSBOX_BROKER_PID` (set by launch.rs) so we
+  // don't have to thread the broker PID through CLI quoting.
+
+  test('G4: sandbox cannot OpenProcess(broker, PROCESS_VM_READ) — Layer 5 broker self-DACL', () => {
+    if (preflightFailure) return
+    const probe = getProbeProcPath()
+    if (!fileExists(probe)) {
+      // eslint-disable-next-line no-console
+      console.warn(`[G4] probe_proc.exe not found at ${probe}; skipping`)
+      return
+    }
+    // PROCESS_VM_READ = 0x0010.
+    const sboxed = runSboxed([probe, 'open-process-via-env', '0x10'])
+    expect(sboxed.stdout).toMatch(/OPEN_FAIL/)
+    expect(sboxed.status).not.toBe(0)
+  })
+
+  test('G6: sandbox cannot OpenProcess(broker, VM_WRITE|CREATE_THREAD) — Layer 5 broker self-DACL', () => {
+    if (preflightFailure) return
+    const probe = getProbeProcPath()
+    if (!fileExists(probe)) {
+      // eslint-disable-next-line no-console
+      console.warn(`[G6] probe_proc.exe not found at ${probe}; skipping`)
+      return
+    }
+    // PROCESS_VM_WRITE = 0x0020, PROCESS_CREATE_THREAD = 0x0002 ⇒ 0x22.
+    const sboxed = runSboxed([probe, 'open-process-via-env', '0x22'])
+    expect(sboxed.stdout).toMatch(/OPEN_FAIL/)
+    expect(sboxed.status).not.toBe(0)
+  })
+
   // Phase 4.5 v3 — Layer 1 (mitigation-policy stack).
   //
   // The cleanest test of the EXTENSION_POINT_DISABLE / CFG / Image-Load

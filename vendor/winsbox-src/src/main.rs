@@ -16,6 +16,7 @@ mod policy;
 #[cfg(windows)] mod install;
 #[cfg(windows)] mod launch;
 #[cfg(windows)] mod winsta;
+#[cfg(windows)] mod self_protect;
 
 use clap::{Parser, Subcommand};
 
@@ -59,6 +60,17 @@ fn main() -> anyhow::Result<()> {
         Some(Cmd::Install { remove: true, keep_group, .. }) => install::remove(keep_group),
         Some(Cmd::Install { port, .. }) => install::install(port),
         None => {
+            // Phase 4.5 v3 Layer 5: rewrite the broker's own process
+            // DACL before any sandbox child is spawned. Gated on
+            // WINSBOX_BROKER_PROTECT=0 for diagnostic harnesses. We
+            // do this BEFORE loading the policy so policy-load errors
+            // can't leak an unprotected broker window.
+            if let Err(e) = self_protect::install_broker_dacl() {
+                eprintln!(
+                    "[sbox-exec] WARNING: install_broker_dacl failed: {e:#}"
+                );
+            }
+
             // Build a policy.
             let mut pol: policy::Policy = if cli.policy_stdin {
                 let mut buf = String::new();

@@ -1,5 +1,11 @@
 //! `probe_proc` — Phase 4.5 v3 helper. Exercises one of:
 //!   - `open-process <pid> <access-mask-hex>` — `OpenProcess(mask, FALSE, pid)`.
+//!     `<pid>` may be the literal string `"broker"` to read the PID
+//!     from the `WINSBOX_BROKER_PID` env var (set by launch.rs).
+//!   - `open-process-via-env <access-mask-hex>` — same as above but
+//!     always reads PID from `WINSBOX_BROKER_PID`. Used by Layer 5
+//!     tests (G4, G6) so the broker PID doesn't need to traverse CLI
+//!     quoting layers.
 //!   - `set-windows-hook`                     — `SetWindowsHookExW(WH_GETMESSAGE,
 //!                                              hmod=&self_image, threadid=0)`.
 //!                                              Global hook *requires* DLL
@@ -47,13 +53,48 @@ fn main() {
                 eprintln!("usage: probe_proc open-process <pid> <access-mask-hex>");
                 2
             } else {
-                let pid: u32 = args[2].parse().unwrap_or(0);
+                // PID may be the literal "broker" → resolve from env.
+                let pid_opt: Option<u32> = if args[2].eq_ignore_ascii_case("broker") {
+                    std::env::var("WINSBOX_BROKER_PID")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                } else {
+                    args[2].parse().ok()
+                };
                 let mask: u32 = u32::from_str_radix(
                     args[3].trim_start_matches("0x").trim_start_matches("0X"),
                     16,
                 )
                 .unwrap_or(0);
-                open_process(pid, mask)
+                match pid_opt {
+                    Some(pid) => open_process(pid, mask),
+                    None => {
+                        println!("OPEN_FAIL no-broker-pid-in-env");
+                        1
+                    }
+                }
+            }
+        }
+        "open-process-via-env" => {
+            if args.len() < 3 {
+                eprintln!("usage: probe_proc open-process-via-env <access-mask-hex>");
+                2
+            } else {
+                let pid_opt: Option<u32> = std::env::var("WINSBOX_BROKER_PID")
+                    .ok()
+                    .and_then(|s| s.parse().ok());
+                let mask: u32 = u32::from_str_radix(
+                    args[2].trim_start_matches("0x").trim_start_matches("0X"),
+                    16,
+                )
+                .unwrap_or(0);
+                match pid_opt {
+                    Some(pid) => open_process(pid, mask),
+                    None => {
+                        println!("OPEN_FAIL no-broker-pid-in-env");
+                        1
+                    }
+                }
             }
         }
         "set-windows-hook" => set_windows_hook(),
