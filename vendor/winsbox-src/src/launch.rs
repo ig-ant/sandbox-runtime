@@ -10,10 +10,47 @@ use std::mem::{size_of, zeroed};
 use windows::core::PWSTR;
 use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
 use windows::Win32::System::Threading::{
-    CreateProcessAsUserW, GetExitCodeProcess, ResumeThread, WaitForSingleObject,
-    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, INFINITE, PROCESS_INFORMATION,
-    STARTUPINFOW,
+    CreateProcessAsUserW, DeleteProcThreadAttributeList, GetExitCodeProcess,
+    InitializeProcThreadAttributeList, ResumeThread, UpdateProcThreadAttribute,
+    WaitForSingleObject, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
+    EXTENDED_STARTUPINFO_PRESENT, INFINITE, LPPROC_THREAD_ATTRIBUTE_LIST,
+    PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, PROCESS_INFORMATION,
+    STARTUPINFOEXW, STARTUPINFOW,
 };
+
+// Process Creation Mitigation Policy bits (winnt.h). The windows-0.58
+// crate exposes `PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY` but not the
+// per-bit DWORD64 values — they're preprocessor macros in winnt.h, so
+// we redefine them here. Encoding: each policy occupies a 4-bit slot
+// in the u64; `..._ALWAYS_ON` flips the low bit of its slot.
+//
+// Layer 1 (Phase 4.5 v3): defense-in-depth mitigations that don't
+// break Node/Python JIT (no ACG, no Microsoft-signed-only).
+//
+// `EXTENSION_POINT_DISABLE_ALWAYS_ON` — bit 32. Blocks legacy AppInit /
+// IME / Winsock LSP DLLs from injecting into the child. Also blocks
+// SetWindowsHookEx (covered by G5).
+const PROC_MITIGATION_EXTENSION_POINT_DISABLE_ALWAYS_ON: u64 = 0x0000_0001 << 32;
+// `IMAGE_LOAD_NO_REMOTE_ALWAYS_ON` — bit 52. Refuses LoadLibrary from
+// UNC / network paths. The sandbox child should never DLL-load over
+// SMB; this closes that path.
+const PROC_MITIGATION_IMAGE_LOAD_NO_REMOTE_ALWAYS_ON: u64 = 0x0000_0001 << 52;
+// `IMAGE_LOAD_NO_LOW_LABEL_ALWAYS_ON` — bit 56. Refuses LoadLibrary
+// from any image whose mandatory label is Low IL. Stops a Low-IL
+// attacker (e.g. another sandbox) from planting a DLL the child loads.
+const PROC_MITIGATION_IMAGE_LOAD_NO_LOW_LABEL_ALWAYS_ON: u64 = 0x0000_0001 << 56;
+// `IMAGE_LOAD_PREFER_SYSTEM32_ALWAYS_ON` — bit 60. Resolves DLL search
+// order to System32 before the application directory. Defends against
+// DLL-planting in the cwd / user-writable dirs.
+const PROC_MITIGATION_IMAGE_LOAD_PREFER_SYSTEM32_ALWAYS_ON: u64 = 0x0000_0001 << 60;
+// `FONT_DISABLE_ALWAYS_ON` — bit 48. Blocks GDI from loading non-system
+// fonts (a historic kernel-font parser RCE surface). Sandbox children
+// run terminal / network workloads — no need for custom fonts.
+const PROC_MITIGATION_FONT_DISABLE_ALWAYS_ON: u64 = 0x0000_0001 << 48;
+// `CONTROL_FLOW_GUARD_ALWAYS_ON` — bit 8. Enforces CFG indirect-call
+// checks for the child, even if the EXE wasn't CFG-instrumented at
+// link time. Cheap if the binary already supports it.
+const PROC_MITIGATION_CONTROL_FLOW_GUARD_ALWAYS_ON: u64 = 0x0000_0001 << 8;
 
 use crate::job::Job;
 use crate::policy::Policy;
@@ -42,6 +79,14 @@ fn build_env(pol: &Policy, proxy_port: u16, secret: &str) -> Vec<u16> {
     env.insert("https_proxy".into(), proxy_url.clone());
     env.insert("all_proxy".into(), proxy_url.clone());
     env.insert("no_proxy".into(), String::new());
+
+    // Surface the broker PID to the sandboxed child. Used by
+    // `probe_proc.exe open-process <broker_pid>` test rows to verify
+    // the broker-self-protection DACL actually blocks (Layer 5).
+    env.insert(
+        "WINSBOX_BROKER_PID".into(),
+        std::process::id().to_string(),
+    );
 
     for (k, v) in &pol.env_extra {
         env.insert(k.clone(), v.clone());
@@ -250,8 +295,66 @@ pub fn run(pol: &Policy) -> Result<u32> {
     // 10) Application name = target_exe.
     let app_w = wstr(&pol.target_exe.display().to_string());
 
-    let mut si: STARTUPINFOW = unsafe { zeroed() };
-    si.cb = size_of::<STARTUPINFOW>() as u32;
+    // 10a) Build the PROC_THREAD_ATTRIBUTE_LIST with our mitigation
+    //      policy bits. Layer 1 sets exactly one attribute; later
+    //      layers (handle-list, etc.) add to this list.
+    //
+    // The attribute list is opaque (`LPPROC_THREAD_ATTRIBUTE_LIST`).
+    // Allocate via the standard two-call pattern: probe for size, then
+    // initialize into a pinned buffer. The buffer must outlive
+    // CreateProcessAsUserW *and* the kernel's read of the policy DWORD64
+    // (which happens during process creation, synchronously). The
+    // `_attr_storage` Vec + `mitigation_policy` u64 below both live to
+    // the end of the function — fine.
+    const ATTR_COUNT: u32 = 1;
+    // Selected for compat with msys2/cygwin's `dofork`. The two bits we
+    // CANNOT enable without regressing E2/F6/F7 are:
+    //   - `IMAGE_LOAD_PREFER_SYSTEM32_ALWAYS_ON` — flips DLL search-order
+    //     so System32 wins over the EXE's directory. Breaks the
+    //     cygwin1.dll / msys-2.0.dll resolution model.
+    //   - `CONTROL_FLOW_GUARD_ALWAYS_ON` — forces CFG indirect-call
+    //     checks even when the EXE wasn't built with `/guard:cf`. Stock
+    //     mingw-built `bash.exe` (Git-for-Windows) isn't CFG-enabled, so
+    //     `bash -c '...'` dies inside `dofork` with `STATUS_STACK_BUFFER_
+    //     OVERRUN`-style fallout. We accept the residual CFG miss; it's
+    //     a defense-in-depth nicety, not a primary boundary.
+    let mitigation_policy: u64 = PROC_MITIGATION_EXTENSION_POINT_DISABLE_ALWAYS_ON
+        | PROC_MITIGATION_IMAGE_LOAD_NO_REMOTE_ALWAYS_ON
+        | PROC_MITIGATION_IMAGE_LOAD_NO_LOW_LABEL_ALWAYS_ON
+        | PROC_MITIGATION_FONT_DISABLE_ALWAYS_ON;
+
+    let mut attr_size: usize = 0;
+    unsafe {
+        // Probe call: returns ERROR_INSUFFICIENT_BUFFER + writes size.
+        // We use the windows-rs wrapper which converts BOOL!=TRUE to
+        // an Err — ignore the result, we only want `attr_size`.
+        let _ = InitializeProcThreadAttributeList(
+            LPPROC_THREAD_ATTRIBUTE_LIST(std::ptr::null_mut()),
+            ATTR_COUNT,
+            0,
+            &mut attr_size,
+        );
+    }
+    let mut attr_storage: Vec<u8> = vec![0u8; attr_size];
+    let attr_list = LPPROC_THREAD_ATTRIBUTE_LIST(attr_storage.as_mut_ptr() as *mut c_void);
+    unsafe {
+        InitializeProcThreadAttributeList(attr_list, ATTR_COUNT, 0, &mut attr_size)
+            .context("InitializeProcThreadAttributeList")?;
+        UpdateProcThreadAttribute(
+            attr_list,
+            0,
+            PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY as usize,
+            Some(&mitigation_policy as *const u64 as *const c_void),
+            size_of::<u64>(),
+            None,
+            None,
+        )
+        .context("UpdateProcThreadAttribute(MITIGATION_POLICY)")?;
+    }
+
+    let mut six: STARTUPINFOEXW = unsafe { zeroed() };
+    six.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+    six.lpAttributeList = attr_list;
     let mut pi: PROCESS_INFORMATION = unsafe { zeroed() };
 
     let cwd_pcwstr = cwd_w
@@ -267,10 +370,14 @@ pub fn run(pol: &Policy) -> Result<u32> {
             None,
             None,
             false,
-            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
             Some(env.as_mut_ptr() as *const c_void),
             cwd_pcwstr,
-            &si,
+            // Pass the embedded STARTUPINFOW pointer; with
+            // EXTENDED_STARTUPINFO_PRESENT the kernel reads past it to
+            // recover the lpAttributeList. STARTUPINFOEXW is
+            // layout-compatible (StartupInfo is first member).
+            &six.StartupInfo as *const STARTUPINFOW,
             &mut pi,
         )
         .with_context(|| {
@@ -308,6 +415,11 @@ pub fn run(pol: &Policy) -> Result<u32> {
         let _ = CloseHandle(primary);
         let _ = CloseHandle(restricted);
         let _ = CloseHandle(self_tok);
+        // Tear down the attribute list. Safe to call after the child
+        // is created — kernel snapshots the policy at CreateProcess time.
+        DeleteProcThreadAttributeList(attr_list);
     }
+    // Keep attr_storage alive until after DeleteProcThreadAttributeList.
+    drop(attr_storage);
     Ok(code)
 }

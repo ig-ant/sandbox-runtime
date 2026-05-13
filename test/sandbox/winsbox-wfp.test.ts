@@ -60,6 +60,12 @@ function getProbeTokenPath(): string {
   return path.join(path.dirname(sbox), 'probe_token.exe')
 }
 
+// Phase 4.5 v3 process-primitive probe.
+function getProbeProcPath(): string {
+  const sbox = getSboxExecPath()
+  return path.join(path.dirname(sbox), 'probe_proc.exe')
+}
+
 // In CI we treat the env as admin and uninstalled-before-first-test;
 // locally we expect the user to have already done `sbox-exec install`
 // once (the marker file at C:\ProgramData\winsbox\installed.json).
@@ -866,6 +872,34 @@ d('winsbox WFP+SID matrix', () => {
   // Mark todo so the requirement isn't forgotten.
   // TODO(winsbox-wfp): G3 needs a custom helper binary; skip in TS for now.
   test.todo('G3: CREATE_BREAKAWAY_FROM_JOB child remains in job', () => {})
+
+  // Phase 4.5 v3 — Layer 1 (mitigation-policy stack).
+  //
+  // The cleanest test of the EXTENSION_POINT_DISABLE / CFG / Image-Load
+  // mitigation bits is `GetProcessMitigationPolicy` on the child itself.
+  // Testing via observable side effects (SetWindowsHookEx, LoadLibrary
+  // from UNC) is unreliable: both ambient and sandbox calls to
+  // `SetWindowsHookExW(WH_GETMESSAGE, EXE_hmod, 0)` fail with
+  // ERROR_HOOK_NEEDS_HMOD (1428) — the mitigation never gets to fire
+  // because the EXE-as-hook-DLL check happens earlier in user mode.
+  test('G5: process-mitigation policy applied to sandbox child', () => {
+    if (preflightFailure) return
+    const probe = getProbeProcPath()
+    if (!fileExists(probe)) {
+      // eslint-disable-next-line no-console
+      console.warn(`[G5] probe_proc.exe not found at ${probe}; skipping`)
+      return
+    }
+    const ambient = spawnSync(probe, ['mitigation-query'], {
+      encoding: 'utf-8',
+      timeout: 5_000,
+    })
+    const sboxed = runSboxed([probe, 'mitigation-query'])
+    // Ambient: no policy. Sandboxed: at least EXTENSION_POINT_DISABLE
+    // is on (canary of the whole stack).
+    expect(ambient.stdout).toMatch(/MITQ ep_disable=false/)
+    expect(sboxed.stdout).toMatch(/MITQ ep_disable=true/)
+  })
 
   // ─────────────────── Group H: Install lifecycle ───────────────────
 
