@@ -786,7 +786,13 @@ function buildSandboxCommand(
   const socatCommands = [
     `${socat} TCP-LISTEN:3128,fork,reuseaddr UNIX-CONNECT:${httpSocketPath} >/dev/null 2>&1 &`,
     `${socat} TCP-LISTEN:1080,fork,reuseaddr UNIX-CONNECT:${socksSocketPath} >/dev/null 2>&1 &`,
-    'trap "kill %1 %2 2>/dev/null; exit" EXIT',
+    // Capture the user command's status before `kill` (which resets $? to 0
+    // on success) so the trap re-exits with it. POSIX says a bare `exit`
+    // inside a trap uses the pre-trap $?, and bash/dash honour that, but
+    // zsh does not — it uses the last command run inside the trap. Without
+    // the explicit capture a non-zero user command reports status 0 when
+    // binShell is zsh.
+    'trap "rc=\\$?; kill %1 %2 2>/dev/null; exit \\$rc" EXIT',
   ]
 
   // apply-seccomp runs after socat so socat can still create Unix sockets.
